@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.4.0 LANGUAGES CXX)
+project(cproxy VERSION 0.5.0 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -40,6 +40,7 @@ configure_file(
 
 # --- Core library (config + proxy) so it can be unit-tested apart from main() --
 add_library(cproxy_core STATIC
+  src/breaker.cpp
   src/config.cpp
   src/dotenv.cpp
   src/log.cpp
@@ -70,3 +71,7 @@ add_test(NAME secret_codec_test COMMAND secret_codec_test)
 add_executable(proxy_test tests/proxy_test.cpp)
 target_link_libraries(proxy_test PRIVATE cproxy_core)
 add_test(NAME proxy_test COMMAND proxy_test)
+
+add_executable(breaker_test tests/breaker_test.cpp)
+target_link_libraries(breaker_test PRIVATE cproxy_core)
+add_test(NAME breaker_test COMMAND breaker_test)

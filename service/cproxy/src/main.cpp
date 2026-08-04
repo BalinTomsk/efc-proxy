@@ -70,12 +70,17 @@ int main() {
         "{{\"service\":\"cproxy\",\"version\":\"{}\",\"msg\":\"starting\","
         "\"listen\":\"{}:{}\",\"route_prefix\":\"{}\",\"docapi_upstream\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
+        "\"breaker\":\"{}\",\"retry\":{},"
         "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.auth_required() ? "true" : "false",
         cfg.allowed_methods.empty() ? "ALL" : "restricted",
         cfg.log_dir.empty() ? "(stdout only)" : cfg.log_dir,
         (dotenv_path != nullptr && *dotenv_path != '\0') ? dotenv_path : "(none)",
+        cfg.breaker_threshold > 0
+            ? std::format("{} fails / {}ms", cfg.breaker_threshold, cfg.breaker_cooldown_ms)
+            : std::string("disabled"),
+        cfg.upstream_retry,
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
     if (!server.listen(cfg.listen_addr, cfg.listen_port)) {
