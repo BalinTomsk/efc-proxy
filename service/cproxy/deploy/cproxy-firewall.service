@@ -1,0 +1,15 @@
+# cproxy-firewall.service - reapply the cproxy access allowlist after every boot (iptables rules are not persistent).
+# Install: copy to /etc/systemd/system/, copy cproxy-firewall.sh to /usr/local/sbin/ (chmod 0755),
+# create /usr/local/etc/cproxy-firewall.allow, then: systemctl daemon-reload && systemctl enable --now cproxy-firewall
+[Unit]
+Description=cproxy access allowlist (DOCKER-USER)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cproxy-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

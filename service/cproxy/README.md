@@ -109,6 +109,25 @@ docapi stays private (not bound to `0.0.0.0`; `10.112.32.3:8080` refuses from th
 The docapi dual-bind is baked into that service's `update-docapi` skill so future docapi deploys keep it.
 See `CLAUDE.md` → Deployment for the run command and lock-down options.
 
+## Access control & hardened run config (`deploy/`)
+
+The public edge is **allowlist-only**: `deploy/cproxy-firewall.sh` fills the `DOCKER-USER` iptables
+chain — the one chain Docker-published ports actually honor (ufw/`INPUT` is bypassed by Docker's NAT) —
+so that only the callers listed in `/usr/local/etc/cproxy-firewall.allow` (one IP/CIDR per line; see
+`deploy/cproxy-firewall.allow.example`) reach the published port. Everyone else is dropped; replies to
+container-initiated outbound stay open; the VPC interface and SSH are untouched, so applying it can
+never lock out administration. A missing allow file **fails closed** (drop-all). IPv6 is closed too.
+`deploy/cproxy-firewall.service` (systemd oneshot, `After=docker.service`) reapplies the rules on every
+boot. Real deploy addresses live only in the host-side allow file, never in git.
+
+One gotcha the allowlist surfaced: on shared hosting the frontend's **outbound egress IP can differ
+from its A record** — verify it with a temporary server-side probe page (fetch an IP-echo service +
+cproxy `/health`) before trusting DNS.
+
+The container itself runs from `deploy/compose.yml` (kept at `/opt/cproxy/compose.yml` on the host):
+image **pinned by digest**, `read_only` rootfs, `cap_drop: ALL`, `no-new-privileges`, restart policy,
+and the log/secret bind mounts — replacing the previous hand-typed `docker run`.
+
 ## Tests
 
 `ctest` runs `config_test` — framework-free assertions over config parsing (defaults, overrides,
