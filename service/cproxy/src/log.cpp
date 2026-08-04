@@ -138,4 +138,12 @@ void log_line(const std::string& msg) {
                         std::chrono::floor<std::chrono::seconds>(now), json_escape(msg)));
 }
 
+void log_request(const std::string& msg, const std::string& ip, const std::string& reqid) {
+    const auto now = std::chrono::system_clock::now();
+    log_raw(std::format(
+        "{{\"ts\":\"{:%FT%TZ}\",\"service\":\"cproxy\",\"msg\":\"{}\",\"ip\":\"{}\",\"reqid\":\"{}\"}}",
+        std::chrono::floor<std::chrono::seconds>(now), json_escape(msg), json_escape(ip),
+        json_escape(reqid)));
+}
+
 }  // namespace cproxy

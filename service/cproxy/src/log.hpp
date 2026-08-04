@@ -20,6 +20,9 @@ void init_logging(const std::string& dir, int max_history = 7);
 /** Emits `{"ts":...,"service":"cproxy","msg":"<escaped msg>"}` to console + file. */
 void log_line(const std::string& msg);
 
+/** Request-scoped line: adds the client IP and the request correlation id as separate JSON fields. */
+void log_request(const std::string& msg, const std::string& ip, const std::string& reqid);
+
 /** Writes a pre-built JSON line verbatim (plus newline) to console + file. */
 void log_raw(const std::string& json_line);
 

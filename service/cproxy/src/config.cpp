@@ -60,6 +60,7 @@ Config load_config(const EnvLookup& env) {
     cfg.api_key = get_str(env, "CPROXY_API_KEY", cfg.api_key);
     cfg.connect_timeout_ms = get_int(env, "CPROXY_CONNECT_TIMEOUT_MS", cfg.connect_timeout_ms);
     cfg.read_timeout_ms = get_int(env, "CPROXY_READ_TIMEOUT_MS", cfg.read_timeout_ms);
+    cfg.max_payload_bytes = get_int(env, "CPROXY_MAX_PAYLOAD_BYTES", cfg.max_payload_bytes);
     cfg.log_max_history = get_int(env, "CPROXY_LOG_MAX_HISTORY", cfg.log_max_history);
     cfg.external_admin = get_str(env, "EXTERNAL_ADMIN", cfg.external_admin);
     cfg.external_frontend = get_str(env, "EXTERNAL_FRONTEND", cfg.external_frontend);
@@ -81,6 +82,23 @@ Config load_config(const EnvLookup& env) {
         }
     }
     return cfg;
+}
+
+std::vector<std::string> validate_config(const Config& cfg) {
+    std::vector<std::string> errors;
+    if (cfg.listen_port < 1 || cfg.listen_port > 65535)
+        errors.push_back("CPROXY_LISTEN_PORT must be 1-65535");
+    if (cfg.connect_timeout_ms <= 0)
+        errors.push_back("CPROXY_CONNECT_TIMEOUT_MS must be positive");
+    if (cfg.read_timeout_ms <= 0)
+        errors.push_back("CPROXY_READ_TIMEOUT_MS must be positive");
+    if (cfg.max_payload_bytes <= 0)
+        errors.push_back("CPROXY_MAX_PAYLOAD_BYTES must be positive");
+    if (cfg.route_prefix.empty() || cfg.route_prefix.front() != '/')
+        errors.push_back("CPROXY_ROUTE_PREFIX must start with '/'");
+    if (cfg.docapi_upstream.rfind("http://", 0) != 0 && cfg.docapi_upstream.rfind("https://", 0) != 0)
+        errors.push_back("CPROXY_DOCAPI_UPSTREAM must be scheme://host[:port] with http or https");
+    return errors;
 }
 
 }  // namespace cproxy

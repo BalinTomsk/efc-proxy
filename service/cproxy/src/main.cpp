@@ -43,6 +43,19 @@ int main() {
     }
 
     const cproxy::Config cfg = cproxy::load_config(cproxy::make_env_lookup(dotenv));
+
+    // Fail fast on nonsense config (port 0, negative timeout, prefix without '/') instead of
+    // limping into listen() with values that can only misbehave.
+    if (const auto errors = cproxy::validate_config(cfg); !errors.empty()) {
+        for (const auto& e : errors) {
+            std::cerr << std::format("{{\"service\":\"cproxy\",\"level\":\"FATAL\","
+                                     "\"msg\":\"invalid config: {}\"}}",
+                                     e)
+                      << std::endl;
+        }
+        return 1;
+    }
+
     cproxy::init_logging(cfg.log_dir, cfg.log_max_history);
 
     httplib::Server server;
