@@ -31,6 +31,16 @@ void defaults_apply_when_env_is_empty() {
     assert(c.method_allowed("POST"));  // empty allow-list => all methods
     assert(c.log_dir == "logs");
     assert(c.log_max_history == 7);
+    assert(c.external_admin.empty());
+    assert(c.external_frontend.empty());
+}
+
+void external_values_are_read_from_the_env_lookup() {
+    // In production these arrive decrypted from the dotenv; here the lookup supplies them directly.
+    Config c = load_config(make_env({{"EXTERNAL_ADMIN", "203.0.113.7"},
+                                     {"EXTERNAL_FRONTEND", "example.test"}}));
+    assert(c.external_admin == "203.0.113.7");
+    assert(c.external_frontend == "example.test");
 }
 
 void logging_env_is_read_including_empty_dir() {
@@ -71,6 +81,7 @@ int main() {
     overrides_are_read_and_methods_restricted();
     malformed_int_falls_back_and_all_keyword_means_unrestricted();
     logging_env_is_read_including_empty_dir();
+    external_values_are_read_from_the_env_lookup();
     std::cout << "config_test: all assertions passed\n";
     return 0;
 }

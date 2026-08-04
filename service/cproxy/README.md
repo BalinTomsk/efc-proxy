@@ -52,9 +52,32 @@ Same functionality as the sibling `waterservice`: structured **JSON** lines to *
 the log directory is a   bind-mounted at `/var/log/cproxy`, so logs survive
 container redeploys and reboots.
 
+## Encrypted config
+
+cproxy can read an extra dotenv file (`CPROXY_DOTENV_PATH`) and decrypt individually-encrypted values
+in it, using the **same scheme as the platform's `secret/Protect-Env.ps1` and the Java `SecretCodec`**
+(docapi/waterservice): **AES-256-GCM**, values stored as `enc:v1:<base64url(nonce ‖ ciphertext ‖ tag)>`
+with the variable name bound in as AAD. The 32-byte master key comes from `FF_MASTER_KEY_FILE`
+(hex/base64). A real process environment variable always overrides a dotenv value; an `enc:v1:` value
+with a missing/wrong key is a **fatal startup error** (never a silent pass-through).
+
+`EXTERNAL_ADMIN` and `EXTERNAL_FRONTEND` are carried this way. Edit the plaintext in
+`secret/plaintext.env`, then:
+
+```powershell
+./secret/Protect-Env.ps1 -GenerateKey   # once, creates secret/master.key
+./secret/Protect-Env.ps1                 # encrypt plaintext.env -> secret/.env
+./secret/Protect-Env.ps1 -Verify         # confirm round-trip (prints no secret values)
+```
+
+In production the encrypted `.env` and the `master.key` live on the mounted volume and are bind-mounted
+into the container read-only; secret values are **masked in logs** (only their presence is recorded).
+`secret/.env`, `secret/master.key`, and `secret/plaintext.env` are gitignored — never committed.
+
 ## Build & run (local)
 
-Requires CMake ≥ 3.20 and a C++23 compiler (GCC 13+/Clang 16+). cpp-httplib is fetched automatically.
+Requires CMake ≥ 3.20, a C++23 compiler (GCC 13+/Clang 16+), and OpenSSL dev headers (`libssl-dev`;
+libcrypto powers the secret codec). cpp-httplib is fetched automatically.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

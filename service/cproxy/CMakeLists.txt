@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.2.0 LANGUAGES CXX)
+project(cproxy VERSION 0.3.0 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -28,6 +28,9 @@ FetchContent_MakeAvailable(httplib)
 
 find_package(Threads REQUIRED)
 
+# OpenSSL libcrypto — AES-256-GCM for decrypting enc:v1: config values (SecretCodec-compatible).
+find_package(OpenSSL REQUIRED)
+
 # Project version is surfaced by GET /health, generated into a header from PROJECT_VERSION.
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/src/version.hpp.in
@@ -38,14 +41,16 @@ configure_file(
 # --- Core library (config + proxy) so it can be unit-tested apart from main() --
 add_library(cproxy_core STATIC
   src/config.cpp
+  src/dotenv.cpp
   src/log.cpp
   src/proxy.cpp
+  src/secret_codec.cpp
 )
 target_include_directories(cproxy_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
-target_link_libraries(cproxy_core PUBLIC httplib::httplib Threads::Threads)
+target_link_libraries(cproxy_core PUBLIC httplib::httplib Threads::Threads OpenSSL::Crypto)
 target_compile_options(cproxy_core PRIVATE -Wall -Wextra)
 
 # --- Service executable -------------------------------------------------------
@@ -57,3 +62,7 @@ enable_testing()
 add_executable(config_test tests/config_test.cpp)
 target_link_libraries(config_test PRIVATE cproxy_core)
 add_test(NAME config_test COMMAND config_test)
+
+add_executable(secret_codec_test tests/secret_codec_test.cpp)
+target_link_libraries(secret_codec_test PRIVATE cproxy_core)
+add_test(NAME secret_codec_test COMMAND secret_codec_test)
