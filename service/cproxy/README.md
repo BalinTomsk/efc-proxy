@@ -18,7 +18,9 @@ frontend.service ──HTTP──►  cproxy (10.12.22.225)  ──HTTP──►
 
 | Path | Behaviour |
 |------|-----------|
-| `GET /health` | local liveness JSON `{ status, service, version }` — never forwarded |
+| `GET /health` | local liveness JSON `{ status, service, version }` — never forwarded, never upstream-dependent |
+| `GET /health/ready` | readiness — `503` while the upstream circuit breaker is open |
+| `GET /metrics` | Prometheus text counters (requests by status, upstream latency, failures, breaker state) |
 | `<CPROXY_ROUTE_PREFIX>…` (default `/api/`) | reverse-proxied to the docapi upstream |
 | anything else | `404` |
 
@@ -27,6 +29,15 @@ trip), headers (minus hop-by-hop and inbound `X-Forwarded-*`/`X-Request-Id`, whi
 itself), and body; adds `X-Forwarded-For` / `-Host` / `-Proto`; and maps an unreachable or slow
 upstream to a clean `502`. Two optional edge guards: an **API key** (`X-API-Key`, compared in
 constant time) and a **method allow-list** (e.g. GET-only).
+
+Reliability: upstream connections are **pooled per worker thread** with keep-alive (rather than a
+fresh TCP connect per request), a transport failure on an idempotent request is **retried once**
+(mainly to hide a pooled connection the upstream closed while idle), and a **consecutive-failure
+circuit breaker** stops dialing a dead upstream after `CPROXY_BREAKER_THRESHOLD` failures — during
+an outage requests get an immediate `502 upstream_unavailable` instead of each paying the full
+connect timeout and holding a worker thread. After the cooldown one probe is allowed through;
+success closes the breaker. HTTP error statuses from a *reachable* upstream are the upstream's
+answer, not transport failures, and never trip it.
 
 Edge hardening: any target with a `..` path segment (plain or percent-encoded) is rejected with
 `400` before it can reach an upstream that might normalize it out of the route prefix; request
@@ -49,6 +60,9 @@ probing is visible.
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
 | `CPROXY_MAX_PAYLOAD_BYTES` | `1048576` | request bodies above this are rejected with `413` |
+| `CPROXY_BREAKER_THRESHOLD` | `5` | consecutive upstream failures before failing fast (`0` disables) |
+| `CPROXY_BREAKER_COOLDOWN_MS` | `5000` | how long the breaker stays open before allowing one probe |
+| `CPROXY_UPSTREAM_RETRY` | `1` | retry idempotent requests once on a transport failure (`0` disables) |
 | `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `""` = console-only |
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
 

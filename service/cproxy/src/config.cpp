@@ -61,6 +61,9 @@ Config load_config(const EnvLookup& env) {
     cfg.connect_timeout_ms = get_int(env, "CPROXY_CONNECT_TIMEOUT_MS", cfg.connect_timeout_ms);
     cfg.read_timeout_ms = get_int(env, "CPROXY_READ_TIMEOUT_MS", cfg.read_timeout_ms);
     cfg.max_payload_bytes = get_int(env, "CPROXY_MAX_PAYLOAD_BYTES", cfg.max_payload_bytes);
+    cfg.breaker_threshold = get_int(env, "CPROXY_BREAKER_THRESHOLD", cfg.breaker_threshold);
+    cfg.breaker_cooldown_ms = get_int(env, "CPROXY_BREAKER_COOLDOWN_MS", cfg.breaker_cooldown_ms);
+    cfg.upstream_retry = get_int(env, "CPROXY_UPSTREAM_RETRY", cfg.upstream_retry);
     cfg.log_max_history = get_int(env, "CPROXY_LOG_MAX_HISTORY", cfg.log_max_history);
     cfg.external_admin = get_str(env, "EXTERNAL_ADMIN", cfg.external_admin);
     cfg.external_frontend = get_str(env, "EXTERNAL_FRONTEND", cfg.external_frontend);
@@ -94,6 +97,12 @@ std::vector<std::string> validate_config(const Config& cfg) {
         errors.push_back("CPROXY_READ_TIMEOUT_MS must be positive");
     if (cfg.max_payload_bytes <= 0)
         errors.push_back("CPROXY_MAX_PAYLOAD_BYTES must be positive");
+    if (cfg.breaker_threshold < 0)
+        errors.push_back("CPROXY_BREAKER_THRESHOLD must be >= 0 (0 disables the breaker)");
+    if (cfg.breaker_cooldown_ms < 0)
+        errors.push_back("CPROXY_BREAKER_COOLDOWN_MS must be >= 0");
+    if (cfg.upstream_retry < 0)
+        errors.push_back("CPROXY_UPSTREAM_RETRY must be >= 0 (0 disables retries)");
     if (cfg.route_prefix.empty() || cfg.route_prefix.front() != '/')
         errors.push_back("CPROXY_ROUTE_PREFIX must start with '/'");
     if (cfg.docapi_upstream.rfind("http://", 0) != 0 && cfg.docapi_upstream.rfind("https://", 0) != 0)

@@ -1,7 +1,10 @@
 // Integration tests: real HTTP through install_routes() against an in-process fake upstream.
 // Framework-free like config_test; registered with CTest (also executed inside the Docker build).
 #include "check.hpp"
+#include <chrono>
 #include <iostream>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -219,6 +222,108 @@ void upstream_down_is_502_and_unknown_path_is_404() {
     CHECK(nf->body.find("not_found") != std::string::npos);
 }
 
+void ready_reports_upstream_state_and_breaker_fails_fast() {
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:1";  // nothing listens there
+    cfg.connect_timeout_ms = 300;
+    cfg.breaker_threshold = 2;
+    cfg.breaker_cooldown_ms = 60000;  // long enough that the test never leaves the open state
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_read_timeout(5, 0);
+
+    // Healthy on arrival: liveness and readiness both green before anything has failed.
+    auto live = cli.Get("/health");
+    CHECK(live && live->status == 200);
+    auto ready0 = cli.Get("/health/ready");
+    CHECK(ready0 && ready0->status == 200);
+    CHECK(ready0->body.find("\"upstream\":\"closed\"") != std::string::npos);
+
+    // Two transport failures trip the breaker.
+    for (int i = 0; i < 2; ++i) {
+        auto r = cli.Get("/api/thing");
+        CHECK(r && r->status == 502);
+    }
+
+    // Now it must fail fast: no connect attempt, so the response beats the connect timeout easily.
+    const auto started = std::chrono::steady_clock::now();
+    auto fast = cli.Get("/api/thing");
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - started)
+                          .count();
+    CHECK(fast && fast->status == 502);
+    CHECK(fast->body.find("upstream_unavailable") != std::string::npos);
+    CHECK(took < 200);  // the 300ms connect timeout was never paid
+
+    // Readiness flips to 503 while the breaker is open; liveness stays 200 (the proxy is alive).
+    auto ready1 = cli.Get("/health/ready");
+    CHECK(ready1 && ready1->status == 503);
+    CHECK(ready1->body.find("\"upstream\":\"open\"") != std::string::npos);
+    auto live1 = cli.Get("/health");
+    CHECK(live1 && live1->status == 200);
+}
+
+void metrics_expose_counters() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    CHECK(cli.Get("/api/one"));
+    CHECK(cli.Get("/api/two"));
+    cli.Get("/nope");  // a 404 must be counted too
+
+    auto m = cli.Get("/metrics");
+    CHECK(m && m->status == 200);
+    CHECK(m->body.find("cproxy_requests_total{status=\"200\"} 2") != std::string::npos);
+    CHECK(m->body.find("cproxy_requests_total{status=\"404\"} 1") != std::string::npos);
+    CHECK(m->body.find("cproxy_upstream_latency_ms_count 2") != std::string::npos);
+    CHECK(m->body.find("cproxy_breaker_state 0") != std::string::npos);
+    // Metrics must not be forwarded upstream, and must not count themselves as proxied traffic.
+    CHECK(m->body.find("upstream:/metrics") == std::string::npos);
+}
+
+void upstream_connection_is_reused_across_requests() {
+    TestServer up;
+    // Count distinct upstream TCP connections: httplib gives each accepted socket its own
+    // remote port, so a reused keep-alive connection shows the SAME port for every request.
+    std::set<std::string> peers;
+    std::mutex peers_mu;
+    up.server.Get(R"(/.*)", [&](const httplib::Request& req, httplib::Response& res) {
+        {
+            std::lock_guard<std::mutex> lock(peers_mu);
+            peers.insert(std::to_string(req.remote_port));
+        }
+        res.set_content("ok", "text/plain");
+    });
+    up.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    // One client => one proxy worker thread => one pooled upstream connection for all 5 requests.
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_keep_alive(true);
+    for (int i = 0; i < 5; ++i) {
+        auto r = cli.Get("/api/thing");
+        CHECK(r && r->status == 200);
+    }
+    std::lock_guard<std::mutex> lock(peers_mu);
+    CHECK(peers.size() == 1);  // pre-0.5.0 this was 5 - a fresh connection per request
+}
+
 }  // namespace
 
 int main() {
@@ -230,6 +335,9 @@ int main() {
     oversized_body_is_rejected();
     request_bodies_are_forwarded();
     upstream_down_is_502_and_unknown_path_is_404();
+    ready_reports_upstream_state_and_breaker_fails_fast();
+    metrics_expose_counters();
+    upstream_connection_is_reused_across_requests();
     std::cout << "proxy_test: all assertions passed\n";
     return 0;
 }

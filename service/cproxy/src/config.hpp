@@ -23,6 +23,9 @@ namespace cproxy {
  * | CPROXY_CONNECT_TIMEOUT_MS   | 3000                          | upstream connect timeout                  |
  * | CPROXY_READ_TIMEOUT_MS      | 10000                         | upstream read timeout                     |
  * | CPROXY_MAX_PAYLOAD_BYTES    | 1048576 (1 MiB)               | request bodies above this are rejected 413|
+ * | CPROXY_BREAKER_THRESHOLD    | 5 (0 = disabled)              | consecutive upstream failures to open     |
+ * | CPROXY_BREAKER_COOLDOWN_MS  | 5000                          | fail-fast window before a probe is allowed |
+ * | CPROXY_UPSTREAM_RETRY       | 1 (0 = off)                   | retry idempotent requests once on transport failure |
  * | CPROXY_LOG_DIR              | logs                          | rolling-log directory ("" = stdout only)  |
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
  */
@@ -38,6 +41,11 @@ struct Config {
     int connect_timeout_ms = 3000;
     int read_timeout_ms = 10000;
     int max_payload_bytes = 1 * 1024 * 1024;  // GET-only JSON API: nobody legitimately sends more
+    int breaker_threshold = 5;                // consecutive upstream failures before failing fast
+    int breaker_cooldown_ms = 5000;           // how long the breaker stays open before probing
+    // A pooled keep-alive connection can be closed by the upstream while idle, so the first send
+    // on it fails through no fault of the request; one retry hides that. Idempotent methods only.
+    int upstream_retry = 1;
     std::string log_dir = "logs";  // "" => console only; the Docker image sets an absolute path
     int log_max_history = 7;       // days of rolled log files to keep
 
