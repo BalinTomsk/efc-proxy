@@ -88,15 +88,9 @@ Testing/
 ############################
 # Application secrets
 ############################
-# The whole secret/ directory is local-only (waterservice.secret, .env, master.key, ghcr.token, ...)
-# — except Protect-Env.ps1, the .env encryptor, which contains no credentials and has to survive a
-# fresh clone for the encrypted .env to be regeneratable.
-#
-# Written as `secret/*`, not `secret/`: git does not descend into an excluded *directory*, so a
-# negation can never re-include a file when the directory itself is excluded. Excluding the contents
-# instead leaves the negation below able to take effect.
+# The whole secret/ directory is local-only and never committed: .env, master.key, plaintext.env,
+# ghcr.token, Protect-Env.ps1 (the .env encryptor), SSH keys, etc.
 secret/*
-!secret/Protect-Env.ps1
 
 # Keys and certificates — never commit private key material.
 # Covers service/docs/ssh.key and anything similar dropped alongside the docs.

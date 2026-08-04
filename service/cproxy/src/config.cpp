@@ -61,6 +61,8 @@ Config load_config(const EnvLookup& env) {
     cfg.connect_timeout_ms = get_int(env, "CPROXY_CONNECT_TIMEOUT_MS", cfg.connect_timeout_ms);
     cfg.read_timeout_ms = get_int(env, "CPROXY_READ_TIMEOUT_MS", cfg.read_timeout_ms);
     cfg.log_max_history = get_int(env, "CPROXY_LOG_MAX_HISTORY", cfg.log_max_history);
+    cfg.external_admin = get_str(env, "EXTERNAL_ADMIN", cfg.external_admin);
+    cfg.external_frontend = get_str(env, "EXTERNAL_FRONTEND", cfg.external_frontend);
 
     // log_dir is special: an explicitly-set but EMPTY value means "console only", so it is read
     // directly rather than via get_str (which would substitute the default for an empty value).

@@ -38,6 +38,11 @@ struct Config {
     std::string log_dir = "logs";  // "" => console only; the Docker image sets an absolute path
     int log_max_history = 7;       // days of rolled log files to keep
 
+    // Values typically supplied via an encrypted dotenv on the volume (EXTERNAL_ADMIN / EXTERNAL_FRONTEND);
+    // decrypted at load time. Empty when not configured.
+    std::string external_admin;     // e.g. an admin source IP (secret)
+    std::string external_frontend;  // e.g. the frontend host
+
     /** Case-insensitive method allow-list check. Empty allow-list => everything permitted. */
     bool method_allowed(const std::string& method) const;
 
