@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.3.0 LANGUAGES CXX)
+project(cproxy VERSION 0.4.0 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -66,3 +66,7 @@ add_test(NAME config_test COMMAND config_test)
 add_executable(secret_codec_test tests/secret_codec_test.cpp)
 target_link_libraries(secret_codec_test PRIVATE cproxy_core)
 add_test(NAME secret_codec_test COMMAND secret_codec_test)
+
+add_executable(proxy_test tests/proxy_test.cpp)
+target_link_libraries(proxy_test PRIVATE cproxy_core)
+add_test(NAME proxy_test COMMAND proxy_test)

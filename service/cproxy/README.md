@@ -22,9 +22,19 @@ frontend.service ──HTTP──►  cproxy (10.12.22.225)  ──HTTP──►
 | `<CPROXY_ROUTE_PREFIX>…` (default `/api/`) | reverse-proxied to the docapi upstream |
 | anything else | `404` |
 
-Forwarding preserves the method, path + query string, headers (minus hop-by-hop), and body; adds
-`X-Forwarded-For` / `-Host` / `-Proto`; and maps an unreachable or slow upstream to a clean `502`.
-Two optional edge guards: an **API key** (`X-API-Key`) and a **method allow-list** (e.g. GET-only).
+Forwarding preserves the method, the **raw** request target (exact bytes — no decode/re-encode round
+trip), headers (minus hop-by-hop and inbound `X-Forwarded-*`/`X-Request-Id`, which the proxy sets
+itself), and body; adds `X-Forwarded-For` / `-Host` / `-Proto`; and maps an unreachable or slow
+upstream to a clean `502`. Two optional edge guards: an **API key** (`X-API-Key`, compared in
+constant time) and a **method allow-list** (e.g. GET-only).
+
+Edge hardening: any target with a `..` path segment (plain or percent-encoded) is rejected with
+`400` before it can reach an upstream that might normalize it out of the route prefix; request
+bodies above `CPROXY_MAX_PAYLOAD_BYTES` are cut off with `413`; malformed startup config is a fatal
+error (fail fast). Every request carries an **`X-Request-Id`** — a well-formed caller-supplied id is
+preserved, anything else is re-minted — propagated to the upstream, echoed in the response, and
+logged (`reqid`) together with the client IP (`ip`), including on unmatched-path `404`s so scanner
+probing is visible.
 
 ## Configuration (environment variables)
 
@@ -38,6 +48,7 @@ Two optional edge guards: an **API key** (`X-API-Key`) and a **method allow-list
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
+| `CPROXY_MAX_PAYLOAD_BYTES` | `1048576` | request bodies above this are rejected with `413` |
 | `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `""` = console-only |
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
 
