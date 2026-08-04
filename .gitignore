@@ -67,3 +67,55 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+### VS Code ###
+.vscode/
+.vs
+
+### Mac OS ###
+.DS_Store
+
+############################
+# Claude Code local settings (may contain machine-local allow-lists / secrets)
+############################
+**/.claude/settings.local.json
+
+############################
+# Claude Code project skills (local tooling, not part of the service)
+############################
+**/.claude/skills/
+
+############################
+# Application secrets
+############################
+# The whole secret/ directory is local-only (waterservice.secret, .env, master.key, ghcr.token, ...)
+# — except Protect-Env.ps1, the .env encryptor, which contains no credentials and has to survive a
+# fresh clone for the encrypted .env to be regeneratable.
+#
+# Written as `secret/*`, not `secret/`: git does not descend into an excluded *directory*, so a
+# negation can never re-include a file when the directory itself is excluded. Excluding the contents
+# instead leaves the negation below able to take effect.
+secret/*
+!secret/Protect-Env.ps1
+
+# Keys and certificates — never commit private key material.
+# Covers service/docs/ssh.key and anything similar dropped alongside the docs.
+*.key
+*.pem
+*.p12
+*.pfx
+*.ppk
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+
+application.yml
+.env
+config.ini
+
+service/cproxy/docs/*.*
+service/cproxy/CLAUDE.md
+
+Skills/*
+docs/*

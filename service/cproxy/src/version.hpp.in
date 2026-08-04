@@ -1,0 +1,5 @@
+#pragma once
+
+// Generated from version.hpp.in by CMake (configure_file). The single source of truth
+// for the version is the project() VERSION in CMakeLists.txt.
+#define CPROXY_VERSION "@PROJECT_VERSION@"
