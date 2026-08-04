@@ -1,0 +1,24 @@
+# cproxy production run config (replaces the hand-typed docker run). Lives at /opt/cproxy/compose.yml
+# on the droplet; redeploy = docker compose -f /opt/cproxy/compose.yml up -d
+# Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
+services:
+  cproxy:
+    image: ghcr.io/balintomsk/cproxy@sha256:883f0c40a633b701b77b6ae6eb2f4005888df37fb01076de5b7c4a948b2f913f  # 0.3.0 pinned by digest
+    container_name: cproxy
+    restart: unless-stopped
+    ports:
+      - "80:8080"                                        # public edge; inbound restricted by cproxy-firewall.service (DOCKER-USER allowlist)
+    environment:
+      CPROXY_DOCAPI_UPSTREAM: http://10.118.0.3:8080     # docapi over the DO VPC (private, not on the public internet)
+      CPROXY_ROUTE_PREFIX: /api/
+      CPROXY_ALLOWED_METHODS: GET                        # write surface stays 405
+      CPROXY_DOTENV_PATH: /etc/cproxy/.env
+      FF_MASTER_KEY_FILE: /etc/cproxy/master.key
+    volumes:
+      - /mnt/volume_cnode/cproxy/.env:/etc/cproxy/.env:ro
+      - /mnt/volume_cnode/cproxy/master.key:/etc/cproxy/master.key:ro
+      - /mnt/volume_cnode/cproxy/logs:/var/log/cproxy    # rolling logs persist on volume-cnode
+    read_only: true                                      # binary writes only to the log bind mount
+    cap_drop: [ALL]                                      # binds unprivileged 8080 in-container; needs no capabilities
+    security_opt:
+      - no-new-privileges:true

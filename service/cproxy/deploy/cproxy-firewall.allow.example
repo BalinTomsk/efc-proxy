@@ -1,0 +1,7 @@
+# cproxy-firewall.allow - callers allowed to reach the published cproxy port. One IPv4 or CIDR per line.
+# Copy to /usr/local/etc/cproxy-firewall.allow on the droplet and put the REAL addresses there
+# (real deploy IPs are never committed - see AGENTS.md). Rerun cproxy-firewall.sh after every edit.
+203.0.113.10        # EXTERNAL_ADMIN - admin/office egress IP
+203.0.113.20        # EXTERNAL_FRONTEND - frontend site A record (inbound IP)
+203.0.113.21        # EXTERNAL_FRONTEND - frontend server OUTBOUND egress IP (shared hosting may egress
+                    # from a different address than the A record - verify with a server-side probe page)
