@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include "mcrypter.hpp"
 
 namespace cproxy {
 
@@ -91,14 +92,14 @@ const std::optional<Bytes>& master_key() {
     static std::optional<Bytes> key;
     std::call_once(once, [] {
         std::optional<std::string> material;
-        if (auto path = getenv_opt("FF_MASTER_KEY_FILE")) {
+        if (auto path = getenv_opt(_HIDD("FF_MASTER_KEY_FILE"))) {
             std::ifstream f(*path, std::ios::binary);
             if (!f) throw std::runtime_error("Could not read the master key file at " + *path +
                                              " (from FF_MASTER_KEY_FILE).");
             std::ostringstream ss;
             ss << f.rdbuf();
             material = ss.str();
-        } else if (auto inline_key = getenv_opt("FF_MASTER_KEY")) {
+        } else if (auto inline_key = getenv_opt(_HIDD("FF_MASTER_KEY"))) {
             material = *inline_key;
         }
         if (!material) {
