@@ -123,9 +123,10 @@ docker run -d --name cproxy -p 127.0.0.1:8080:8080 \
 Multi-stage build (Debian trixie → trixie-slim); the unit tests run **inside** the build, so a broken
 build never ships. Runs as non-root uid 10001; `HEALTHCHECK` hits `/health`.
 
-## Deployed (2026-08-04)
+## Deployed (2026-08-24)
 
-Live at **`http://10.12.22.225/`** (`ghcr.io/balintomsk/cproxy:0.2.0`, port 80, GET-only, logs on the
+Live at **`http://10.12.22.225/`** (`ghcr.io/balintomsk/cproxy:0.5.1`, deployed via `docker compose`
+with the image pinned by digest, port 80 behind an allowlist firewall, GET-only, logs on the
 `volume-cnode` DO volume at `/mnt/volume_cnode/cproxy/logs`). Reachability
 is wired over the VPC : both VPS share `eth1` `10.112.0.0/20`, docapi is published
 on `10.112.32.3:8080` (VPC) in addition to `127.0.0.1:8080`, and `CPROXY_DOCAPI_UPSTREAM=http://10.112.32.3:8080`.
