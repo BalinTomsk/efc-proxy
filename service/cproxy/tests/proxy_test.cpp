@@ -204,6 +204,33 @@ void request_bodies_are_forwarded() {
     CHECK(r->body == "got:hello-body");  // a pre-routing proxy would forward an EMPTY body
 }
 
+// Regression: is_unforwardable() drops Content-Type on purpose for the RESPONSE side (the upstream's
+// own header is used there instead), but the outbound REQUEST is a raw httplib::Request built by
+// hand, not via Client::Post/Patch — nothing else sets Content-Type on it. Before this test existed,
+// a JSON body crossed the proxy as text/plain and tripped `consumes = APPLICATION_JSON_VALUE` on any
+// Spring write endpoint (found live: docapi's PATCH /river/fish/{guid} 500'd through cproxy on its
+// first real deploy while working fine called directly).
+void content_type_is_forwarded() {
+    // POST, not PATCH: PATCH also requires the day-key gate (see day_key_store_test.cpp), which is
+    // irrelevant to what this test is checking and would need its own SQLite fixture to pass.
+    TestServer up;
+    up.server.Post(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(req.get_header_value("Content-Type"), "text/plain");
+    });
+    up.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto r = cli.Post("/api/river/fish/x", "[]", "application/json");
+    CHECK(r && r->status == 200);
+    CHECK(r->body == "application/json");  // the upstream must see it, not a default/missing value
+}
+
 void upstream_down_is_502_and_unknown_path_is_404() {
     Config cfg;
     cfg.docapi_upstream = "http://127.0.0.1:1";  // nothing listens there
@@ -334,6 +361,7 @@ int main() {
     api_key_and_method_guards();
     oversized_body_is_rejected();
     request_bodies_are_forwarded();
+    content_type_is_forwarded();
     upstream_down_is_502_and_unknown_path_is_404();
     ready_reports_upstream_state_and_breaker_fails_fast();
     metrics_expose_counters();

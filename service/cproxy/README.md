@@ -57,6 +57,7 @@ probing is visible.
 | `CPROXY_ROUTE_PREFIX` | `/api/` | path prefix forwarded to docapi |
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
+| `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db gating PATCH; empty ⇒ PATCH always `500` |
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
 | `CPROXY_MAX_PAYLOAD_BYTES` | `1048576` | request bodies above this are rejected with `413` |
@@ -123,14 +124,17 @@ docker run -d --name cproxy -p 127.0.0.1:8080:8080 \
 Multi-stage build (Debian trixie → trixie-slim); the unit tests run **inside** the build, so a broken
 build never ships. Runs as non-root uid 10001; `HEALTHCHECK` hits `/health`.
 
-## Deployed (2026-08-24)
+## Deployed (2026-08-25)
 
-Live at **`http://10.12.22.225/`** (`ghcr.io/balintomsk/cproxy:0.5.1`, deployed via `docker compose`
-with the image pinned by digest, port 80 behind an allowlist firewall, GET-only, logs on the
+Live at **`http://10.12.22.225/`** (`ghcr.io/balintomsk/cproxy:0.6.1`, deployed via `docker compose`
+with the image pinned by digest, port 80 behind an allowlist firewall, logs on the
 `volume-cnode` DO volume at `/mnt/volume_cnode/cproxy/logs`). Reachability
 is wired over the VPC : both VPS share `eth1` `10.112.0.0/20`, docapi is published
 on `10.112.32.3:8080` (VPC) in addition to `127.0.0.1:8080`, and `CPROXY_DOCAPI_UPSTREAM=http://10.112.32.3:8080`.
-docapi stays private (not bound to `0.0.0.0`; `10.112.32.3:8080` refuses from the internet).  
+docapi stays private (not bound to `0.0.0.0`; `10.112.32.3:8080` refuses from the internet).
+
+**Allowed methods: `GET` and `PATCH`** (was GET-only through 0.5.1) — PATCH is admitted only for the
+day-key-gated write surface (see "Day-key store" above); every other write verb still 405s.
 
 The docapi dual-bind is baked into that service's `update-docapi` skill so future docapi deploys keep it.
 See `CLAUDE.md` → Deployment for the run command and lock-down options.
@@ -154,8 +158,21 @@ The container itself runs from `deploy/compose.yml` (kept at `/opt/cproxy/compos
 image **pinned by digest**, `read_only` rootfs, `cap_drop: ALL`, `no-new-privileges`, restart policy,
 and the log/secret bind mounts — replacing the previous hand-typed `docker run`.
 
+### Day-key store (the write surface's credential)
+
+`PATCH` requests (today, just `river/fish/{guid}`) are gated by a **second, independent** control on
+top of `CPROXY_API_KEY`/`CPROXY_ALLOWED_METHODS`: a per-day rotating GUID read from a small read-only
+SQLite database at `CPROXY_DAYKEY_DB` (`day_keys(day_of_year, guid)`, exactly 365 rows). A caller
+sends the current UTC day's GUID in `X-Day-Guid` (a ±1-day window is accepted); a wrong or missing
+value answers a plain `500`, never `401` — the failure looks identical to an ordinary server error to
+anyone probing it. The database is generated out-of-band (never from source) and deployed like any
+other secret — see `secret/daykeys.sqlite` (gitignored) and `CLAUDE.md` → "Day-key store" for the
+full design and deploy path.
+
 ## Tests
 
-`ctest` runs `config_test` — framework-free assertions over config parsing (defaults, overrides,
-method allow-list, malformed-value fallback). Proxy behaviour is verified by running the container
-against a reachable echo upstream (see `docs/specification.md`).
+`ctest` runs five suites: `config_test` (config parsing — defaults, overrides, method allow-list,
+malformed-value fallback), `secret_codec_test`, `proxy_test`, `breaker_test`, and
+`day_key_store_test` (the yesterday/today/tomorrow window, both directions of the year boundary, the
+leap-day-366 clamp, and the fail-loud-on-a-bad-database cases). Proxy behaviour is also verified by
+running the container against a reachable echo upstream (see `docs/specification.md`).

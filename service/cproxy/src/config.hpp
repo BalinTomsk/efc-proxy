@@ -28,6 +28,7 @@ namespace cproxy {
  * | CPROXY_UPSTREAM_RETRY       | 1 (0 = off)                   | retry idempotent requests once on transport failure |
  * | CPROXY_LOG_DIR              | logs                          | rolling-log directory ("" = stdout only)  |
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
+ * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; PATCH always 500s while empty |
  */
 struct Config {
     std::string listen_addr = "0.0.0.0";
@@ -48,6 +49,10 @@ struct Config {
     int upstream_retry = 1;
     std::string log_dir = "logs";  // "" => console only; the Docker image sets an absolute path
     int log_max_history = 7;       // days of rolled log files to keep
+
+    // Path to the day-key SQLite database (see DayKeyStore). Empty means day-key auth is not
+    // configured, so every PATCH request fails closed with 500 regardless of CPROXY_ALLOWED_METHODS.
+    std::string daykey_db_path;
 
     // Values typically supplied via an encrypted dotenv on the volume (EXTERNAL_ADMIN / EXTERNAL_FRONTEND);
     // decrypted at load time. Empty when not configured.

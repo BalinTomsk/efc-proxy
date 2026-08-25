@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:304428638ecd307bc0e6bcc1684bae8304a5ebecf59b96c7fe5b1f59068d4fb0  # 0.5.1 pinned by digest
+    image: ghcr.io/balintomsk/cproxy@sha256:1d3621568162c2b95a00cbcad38337f0b7f04890f6100ef13413013aa496905a  # 0.6.1 pinned by digest
     container_name: cproxy
     restart: unless-stopped
     ports:
@@ -11,12 +11,14 @@ services:
     environment:
       CPROXY_DOCAPI_UPSTREAM: http://10.118.0.3:8080     # docapi over the DO VPC (private, not on the public internet)
       CPROXY_ROUTE_PREFIX: /api/
-      CPROXY_ALLOWED_METHODS: GET                        # write surface stays 405
+      CPROXY_ALLOWED_METHODS: GET,PATCH                  # PATCH is gated by the day-key below, not open
+      CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating credential for PATCH (see DayKeyStore)
       CPROXY_DOTENV_PATH: /etc/cproxy/.env
       FF_MASTER_KEY_FILE: /etc/cproxy/master.key
     volumes:
       - /mnt/volume_cnode/cproxy/.env:/etc/cproxy/.env:ro
       - /mnt/volume_cnode/cproxy/master.key:/etc/cproxy/master.key:ro
+      - /mnt/volume_cnode/cproxy/daykeys/daykeys.sqlite:/etc/cproxy/daykeys.sqlite:ro  # own folder, same volume as logs
       - /mnt/volume_cnode/cproxy/logs:/var/log/cproxy    # rolling logs persist on volume-cnode
     read_only: true                                      # binary writes only to the log bind mount
     cap_drop: [ALL]                                      # binds unprivileged 8080 in-container; needs no capabilities
