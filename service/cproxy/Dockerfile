@@ -11,7 +11,7 @@
 FROM debian:trixie AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential cmake git ca-certificates libssl-dev \
+      build-essential cmake git ca-certificates libssl-dev libsqlite3-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -27,10 +27,11 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 
 # ---- runtime stage ----------------------------------------------------------
 FROM debian:trixie-slim
-# wget for the HEALTHCHECK; openssl pulls libcrypto (runtime dep of the secret codec); ca-certificates
-# for good measure. libstdc++6 ships in the base.
+# wget for the HEALTHCHECK; openssl pulls libcrypto (runtime dep of the secret codec); libsqlite3-0
+# is the day-key store's runtime dependency; ca-certificates for good measure. libstdc++6 ships in
+# the base.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends wget ca-certificates openssl \
+ && apt-get install -y --no-install-recommends wget ca-certificates openssl libsqlite3-0 \
  && rm -rf /var/lib/apt/lists/*
 
 # Unprivileged runtime user (uid 10001), matching the other services. Pre-create the log directory

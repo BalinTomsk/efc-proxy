@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.5.1 LANGUAGES CXX)
+project(cproxy VERSION 0.6.1 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -31,6 +31,10 @@ find_package(Threads REQUIRED)
 # OpenSSL libcrypto — AES-256-GCM for decrypting enc:v1: config values (SecretCodec-compatible).
 find_package(OpenSSL REQUIRED)
 
+# SQLite3 — read-only day-key store for the PATCH write surface (DayKeyStore). System library via
+# CMake's built-in FindSQLite3 module (libsqlite3-dev at build time, libsqlite3-0 at runtime).
+find_package(SQLite3 REQUIRED)
+
 # Project version is surfaced by GET /health, generated into a header from PROJECT_VERSION.
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/src/version.hpp.in
@@ -42,6 +46,7 @@ configure_file(
 add_library(cproxy_core STATIC
   src/breaker.cpp
   src/config.cpp
+  src/day_key_store.cpp
   src/dotenv.cpp
   src/log.cpp
   src/proxy.cpp
@@ -51,7 +56,7 @@ target_include_directories(cproxy_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
-target_link_libraries(cproxy_core PUBLIC httplib::httplib Threads::Threads OpenSSL::Crypto)
+target_link_libraries(cproxy_core PUBLIC httplib::httplib Threads::Threads OpenSSL::Crypto SQLite::SQLite3)
 target_compile_options(cproxy_core PRIVATE -Wall -Wextra)
 
 # --- Service executable -------------------------------------------------------
@@ -75,3 +80,7 @@ add_test(NAME proxy_test COMMAND proxy_test)
 add_executable(breaker_test tests/breaker_test.cpp)
 target_link_libraries(breaker_test PRIVATE cproxy_core)
 add_test(NAME breaker_test COMMAND breaker_test)
+
+add_executable(day_key_store_test tests/day_key_store_test.cpp)
+target_link_libraries(day_key_store_test PRIVATE cproxy_core)
+add_test(NAME day_key_store_test COMMAND day_key_store_test)

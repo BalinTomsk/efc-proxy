@@ -9,10 +9,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 
 #include "breaker.hpp"
+#include "day_key_store.hpp"
 #include "log.hpp"
 #include "version.hpp"
 
@@ -61,9 +63,24 @@ struct Metrics {
 struct ProxyState {
     CircuitBreaker breaker;
     Metrics metrics;
+    // Loaded best-effort: a missing/malformed day-key database must not take down the read-only GET
+    // surface, so a load failure here just leaves this empty — every PATCH then fails closed (500)
+    // rather than the whole process refusing to start. See proxy_to_docapi's PATCH gate.
+    std::optional<DayKeyStore> daykey_store;
 
     explicit ProxyState(const Config& cfg)
-        : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {}
+        : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
+        if (!cfg.daykey_db_path.empty()) {
+            try {
+                daykey_store.emplace(cfg.daykey_db_path);
+            } catch (const std::exception& ex) {
+                log_raw(std::format(
+                    "{{\"service\":\"cproxy\",\"level\":\"ERROR\","
+                    "\"msg\":\"day-key database failed to load, PATCH will 500: {}\"}}",
+                    ex.what()));
+            }
+        }
+    }
 };
 
 bool iequals(const std::string& a, const std::string& b) {
@@ -191,6 +208,21 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         return;
     }
 
+    // The write surface (PATCH) additionally requires a per-day rotating credential — see
+    // DayKeyStore. Deliberately answered with a generic 500, not 401/403: a wrong or missing
+    // day-key must not read any differently from an ordinary server error to a caller probing it.
+    if (iequals(req.method, "PATCH")) {
+        const bool ok = state.daykey_store.has_value() &&
+                        state.daykey_store->is_valid(req.get_header_value("X-Day-Guid"),
+                                                     std::chrono::system_clock::now());
+        if (!ok) {
+            write_error(res, 500, "internal_error", "Internal error");
+            log_request(std::format("{} {} -> 500 (day-key check failed)", req.method, req.path),
+                        req.remote_addr, rid);
+            return;
+        }
+    }
+
     // Forward the RAW request target (exact bytes from the request line) so no decode/re-encode
     // round trip happens at the proxy; fall back to a rebuild if the server didn't capture it.
     std::string target = req.target.empty() ? forward_target(req) : req.target;
@@ -221,6 +253,15 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     out.body = req.body;
     for (const auto& [k, v] : req.headers) {
         if (!is_unforwardable(k)) out.set_header(k.c_str(), v.c_str());
+    }
+    // is_unforwardable drops Content-Type because the RESPONSE side reads it straight off the
+    // upstream's own reply instead of copying it — but for the OUTBOUND request that means no
+    // Content-Type crosses at all: `out` is a raw httplib::Request (not built via Client::Post,
+    // which is what sets a default), so an inbound "application/json" body would otherwise arrive
+    // upstream as text/plain and trip Spring's `consumes = APPLICATION_JSON_VALUE` on any write
+    // endpoint. Set it explicitly from the inbound request when present.
+    if (const std::string content_type = req.get_header_value("Content-Type"); !content_type.empty()) {
+        out.set_header("Content-Type", content_type.c_str());
     }
     // Standard forwarding provenance headers + the correlation id.
     out.set_header("X-Forwarded-For", req.remote_addr);

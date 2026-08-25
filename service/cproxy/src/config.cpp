@@ -65,6 +65,7 @@ Config load_config(const EnvLookup& env) {
     cfg.breaker_cooldown_ms = get_int(env, "CPROXY_BREAKER_COOLDOWN_MS", cfg.breaker_cooldown_ms);
     cfg.upstream_retry = get_int(env, "CPROXY_UPSTREAM_RETRY", cfg.upstream_retry);
     cfg.log_max_history = get_int(env, "CPROXY_LOG_MAX_HISTORY", cfg.log_max_history);
+    cfg.daykey_db_path = get_str(env, "CPROXY_DAYKEY_DB", cfg.daykey_db_path);
     cfg.external_admin = get_str(env, "EXTERNAL_ADMIN", cfg.external_admin);
     cfg.external_frontend = get_str(env, "EXTERNAL_FRONTEND", cfg.external_frontend);
 
