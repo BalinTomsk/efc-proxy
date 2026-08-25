@@ -110,6 +110,7 @@ config.ini
 
 service/cproxy/docs/*.*
 service/cproxy/CLAUDE.md
+service/cproxy/CHANGELOG.md
 
 Skills/*
 docs/*
