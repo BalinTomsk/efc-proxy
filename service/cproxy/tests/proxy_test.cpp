@@ -187,7 +187,10 @@ void oversized_body_is_rejected() {
 
 void request_bodies_are_forwarded() {
     TestServer up;
-    up.server.Post(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
+    // PUT, not POST: POST now also requires the day-key gate (see day_key_store_test.cpp and
+    // post_and_patch_require_day_key below), which is irrelevant to what this test is checking and
+    // would need its own SQLite fixture to pass.
+    up.server.Put(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
         res.set_content("got:" + req.body, "text/plain");  // echo proves the body crossed the proxy
     });
     up.start();
@@ -199,7 +202,7 @@ void request_bodies_are_forwarded() {
     proxy.start();
 
     httplib::Client cli("127.0.0.1", proxy.port);
-    auto r = cli.Post("/api/submit", "hello-body", "text/plain");
+    auto r = cli.Put("/api/submit", "hello-body", "text/plain");
     CHECK(r && r->status == 200);
     CHECK(r->body == "got:hello-body");  // a pre-routing proxy would forward an EMPTY body
 }
@@ -211,10 +214,11 @@ void request_bodies_are_forwarded() {
 // Spring write endpoint (found live: docapi's PATCH /river/fish/{guid} 500'd through cproxy on its
 // first real deploy while working fine called directly).
 void content_type_is_forwarded() {
-    // POST, not PATCH: PATCH also requires the day-key gate (see day_key_store_test.cpp), which is
-    // irrelevant to what this test is checking and would need its own SQLite fixture to pass.
+    // PUT, not POST/PATCH: both of those now require the day-key gate (see day_key_store_test.cpp
+    // and post_and_patch_require_day_key below), which is irrelevant to what this test is checking
+    // and would need its own SQLite fixture to pass.
     TestServer up;
-    up.server.Post(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
+    up.server.Put(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
         res.set_content(req.get_header_value("Content-Type"), "text/plain");
     });
     up.start();
@@ -226,9 +230,41 @@ void content_type_is_forwarded() {
     proxy.start();
 
     httplib::Client cli("127.0.0.1", proxy.port);
-    auto r = cli.Post("/api/river/fish/x", "[]", "application/json");
+    auto r = cli.Put("/api/river/fish/x", "[]", "application/json");
     CHECK(r && r->status == 200);
     CHECK(r->body == "application/json");  // the upstream must see it, not a default/missing value
+}
+
+// The write surface's day-key gate (see proxy_to_docapi) now covers POST as well as PATCH, since
+// docapi's regulation endpoints add a genuine insert (POST), not just merge-patch (PATCH). Neither
+// method reaches the upstream without a configured day-key store — this proves both fail closed
+// (500, the same generic error a wrong/missing X-Day-Guid produces) rather than silently falling
+// back to PATCH-only gating.
+void post_and_patch_require_day_key() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.server.Post(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("should not be reached", "text/plain");
+    });
+    up.server.Patch(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("should not be reached", "text/plain");
+    });
+    up.start();
+
+    Config cfg;  // no daykey_db_path -- day-key store never gets configured
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto post = cli.Post("/api/river/regulation/x", "{}", "application/json");
+    CHECK(post && post->status == 500);
+    CHECK(post->body.find("internal_error") != std::string::npos);
+
+    auto patch = cli.Patch("/api/river/fish/x", "[]", "application/json");
+    CHECK(patch && patch->status == 500);
+    CHECK(patch->body.find("internal_error") != std::string::npos);
 }
 
 void upstream_down_is_502_and_unknown_path_is_404() {
@@ -362,6 +398,7 @@ int main() {
     oversized_body_is_rejected();
     request_bodies_are_forwarded();
     content_type_is_forwarded();
+    post_and_patch_require_day_key();
     upstream_down_is_502_and_unknown_path_is_404();
     ready_reports_upstream_state_and_breaker_fails_fast();
     metrics_expose_counters();

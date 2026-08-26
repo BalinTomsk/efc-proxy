@@ -208,10 +208,13 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         return;
     }
 
-    // The write surface (PATCH) additionally requires a per-day rotating credential — see
+    // The write surface (POST, PATCH) additionally requires a per-day rotating credential — see
     // DayKeyStore. Deliberately answered with a generic 500, not 401/403: a wrong or missing
     // day-key must not read any differently from an ordinary server error to a caller probing it.
-    if (iequals(req.method, "PATCH")) {
+    // POST joined PATCH here when docapi's regulation endpoints (insert, not just merge-patch) were
+    // fronted through cproxy — every method that mutates docapi state must clear the same gate, not
+    // just PATCH.
+    if (iequals(req.method, "POST") || iequals(req.method, "PATCH")) {
         const bool ok = state.daykey_store.has_value() &&
                         state.daykey_store->is_valid(req.get_header_value("X-Day-Guid"),
                                                      std::chrono::system_clock::now());

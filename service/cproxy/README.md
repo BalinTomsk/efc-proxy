@@ -57,7 +57,7 @@ probing is visible.
 | `CPROXY_ROUTE_PREFIX` | `/api/` | path prefix forwarded to docapi |
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
-| `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db gating PATCH; empty ⇒ PATCH always `500` |
+| `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db gating POST/PATCH; empty ⇒ POST/PATCH always `500` |
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
 | `CPROXY_MAX_PAYLOAD_BYTES` | `1048576` | request bodies above this are rejected with `413` |
@@ -160,8 +160,9 @@ and the log/secret bind mounts — replacing the previous hand-typed `docker run
 
 ### Day-key store (the write surface's credential)
 
-`PATCH` requests (today, `river/fish/{guid}` and `river/description/{guid}` — the gate applies to
-every PATCH, not a specific path) are gated by a **second, independent** control on
+`POST` and `PATCH` requests (the gate applies to every POST/PATCH, not a specific path — every
+docapi write, from `river/fish/{guid}` PATCH to a new `river/regulation/{guid}` POST, clears the same
+check) are gated by a **second, independent** control on
 top of `CPROXY_API_KEY`/`CPROXY_ALLOWED_METHODS`: a per-day rotating GUID read from a small read-only
 SQLite database at `CPROXY_DAYKEY_DB` (`day_keys(day_of_year, guid)`, exactly 365 rows). A caller
 sends the current UTC day's GUID in `X-Day-Guid` (a ±1-day window is accepted); a wrong or missing

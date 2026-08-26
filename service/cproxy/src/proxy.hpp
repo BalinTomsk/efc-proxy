@@ -16,15 +16,15 @@ namespace cproxy {
  *
  * Forwarding preserves method, the raw request target, headers (minus hop-by-hop and any inbound
  * X-Forwarded or X-Request-Id), and body; adds the standard X-Forwarded headers and a correlation
- * id; enforces the optional API key, method allow-list, and (for PATCH) the day-key credential;
+ * id; enforces the optional API key, method allow-list, and (for POST/PATCH) the day-key credential;
  * rejects path traversal; and maps an unreachable/timed-out upstream to a clean 502. Upstream
  * connections are pooled per worker thread, guarded by a consecutive-failure circuit breaker that
  * fails fast during an outage.
  *
- * Every PATCH additionally requires the `X-Day-Guid` header to match the current UTC day's key
- * (yesterday/today/tomorrow window) from `cfg.daykey_db_path` — see DayKeyStore. A missing/wrong
+ * Every POST and PATCH additionally requires the `X-Day-Guid` header to match the current UTC day's
+ * key (yesterday/today/tomorrow window) from `cfg.daykey_db_path` — see DayKeyStore. A missing/wrong
  * key is answered with a generic 500, not 401, so it reads no differently from an ordinary server
- * error to anyone probing the endpoint. This is orthogonal to CPROXY_ALLOWED_METHODS: PATCH must
+ * error to anyone probing the endpoint. This is orthogonal to CPROXY_ALLOWED_METHODS: POST/PATCH must
  * still be in the allow-list for a request to reach this check at all.
  *
  * Each call creates its own breaker and counters, so several proxies can coexist in one process.
