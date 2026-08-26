@@ -28,7 +28,7 @@ namespace cproxy {
  * | CPROXY_UPSTREAM_RETRY       | 1 (0 = off)                   | retry idempotent requests once on transport failure |
  * | CPROXY_LOG_DIR              | logs                          | rolling-log directory ("" = stdout only)  |
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
- * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; PATCH always 500s while empty |
+ * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; POST/PATCH always 500 while empty |
  */
 struct Config {
     std::string listen_addr = "0.0.0.0";

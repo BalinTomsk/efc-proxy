@@ -11,8 +11,8 @@ services:
     environment:
       CPROXY_DOCAPI_UPSTREAM: http://10.118.0.3:8080     # docapi over the DO VPC (private, not on the public internet)
       CPROXY_ROUTE_PREFIX: /api/
-      CPROXY_ALLOWED_METHODS: GET,PATCH                  # PATCH is gated by the day-key below, not open
-      CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating credential for PATCH (see DayKeyStore)
+      CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the day-key below, not open
+      CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating credential for POST/PATCH (see DayKeyStore)
       CPROXY_DOTENV_PATH: /etc/cproxy/.env
       FF_MASTER_KEY_FILE: /etc/cproxy/master.key
     volumes:
