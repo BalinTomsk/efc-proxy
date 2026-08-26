@@ -161,8 +161,9 @@ and the log/secret bind mounts — replacing the previous hand-typed `docker run
 ### Day-key store (the write surface's credential)
 
 `POST` and `PATCH` requests (the gate applies to every POST/PATCH, not a specific path — every
-docapi write, from `river/fish/{guid}` PATCH to a new `river/regulation/{guid}` POST, clears the same
-check) are gated by a **second, independent** control on
+docapi write, from `river/fish/{guid}` PATCH to `river/regulation/{guid}` and
+`region/regulation/{country}[/{state}]` PATCH, clears the same check) are gated by a **second,
+independent** control on
 top of `CPROXY_API_KEY`/`CPROXY_ALLOWED_METHODS`: a per-day rotating GUID read from a small read-only
 SQLite database at `CPROXY_DAYKEY_DB` (`day_keys(day_of_year, guid)`, exactly 365 rows). A caller
 sends the current UTC day's GUID in `X-Day-Guid` (a ±1-day window is accepted); a wrong or missing
