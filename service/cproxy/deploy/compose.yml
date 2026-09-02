@@ -9,7 +9,7 @@ services:
     ports:
       - "80:8080"                                        # public edge; inbound restricted by cproxy-firewall.service (DOCKER-USER allowlist)
     environment:
-      CPROXY_DOCAPI_UPSTREAM: http://10.118.0.3:8080     # docapi over the DO VPC (private, not on the public internet)
+      CPROXY_DOCAPI_UPSTREAM: http://<docapi-vpc>:8080     # docapi over the DO VPC (private, not on the public internet)
       CPROXY_ROUTE_PREFIX: /api/
       CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the day-key below, not open
       CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating credential for POST/PATCH (see DayKeyStore)

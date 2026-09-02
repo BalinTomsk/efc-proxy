@@ -35,7 +35,7 @@ Safety guardrails for reverse proxy (C++) automation loops.
 
 ## Deployment
 
-- **Current topology:** Droplet 159.89.113.225:80 front > docapi via DO VPC (10.118.0.3:8080)
+- **Current topology:** Droplet <cproxy-droplet>:80 front > docapi via DO VPC (<docapi-vpc>:8080)
 - **Logs location:** /mnt/volume_cnode/cproxy/logs (volumes, never mkfs)
 - **Config validation:** must pass `--check` before reload
 - **Zero-downtime reload:** use systemd or container restart
