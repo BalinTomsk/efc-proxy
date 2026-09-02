@@ -108,9 +108,13 @@ application.yml
 .env
 config.ini
 
+# Internal cproxy docs stay local-only: CLAUDE.md (real droplet/VPC/admin addresses, deploy runbook),
+# and everything under docs/ EXCEPT specification.md — api-guide.html, do-update.md (the deploy
+# runbook), postman-collection.json, SKILL.md and chat.skill are operational, not reference.
+# specification.md and CHANGELOG.md ARE tracked; both carry <placeholder> hosts, never real ones.
 service/cproxy/docs/*.*
+!service/cproxy/docs/specification.md
 service/cproxy/CLAUDE.md
-service/cproxy/CHANGELOG.md
 
 Skills/*
 docs/*
