@@ -24,7 +24,10 @@ services:
       # Datacenter/cloud-provider blocking. The path MUST be on a writable bind mount: the rootfs is
       # read_only and the refresher rewrites this database in place every fortnight.
       CPROXY_CLOUDRANGE_DB: /var/lib/cproxy/cloudranges.sqlite
-      CPROXY_CLOUDRANGE_REFRESH_ON_START: "true"         # first deploy: populate now instead of waiting 336h
+      # CPROXY_CLOUDRANGE_REFRESH_ON_START is intentionally NOT set. It was on for the first deploy
+      # only, to populate the database immediately instead of waiting out the 336h timer. The
+      # database lives on the volume and survives redeploys, so leaving it on would just re-pull
+      # ~92k prefixes from twelve third-party feeds on every container restart.
       # Exempt addresses are NOT listed here - this file is tracked in a public repo. EXTERNAL_ADMIN
       # and EXTERNAL_FRONTEND are exempt automatically; anything else goes in the encrypted .env as
       # CPROXY_CLOUDRANGE_EXEMPT_IPS.
