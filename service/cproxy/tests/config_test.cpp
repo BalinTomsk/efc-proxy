@@ -94,6 +94,68 @@ void payload_limit_is_read_with_default() {
     CHECK(c.max_payload_bytes == 2048);
 }
 
+// The day-key gate has two arms: the write surface by method (any path), and CPROXY_DAYKEY_PATHS by
+// path (any method, GET included). /news/default is gated by default so the protection does not
+// depend on remembering an env var at deploy time.
+void daykey_paths_gate_reads_by_default() {
+    Config c = load_config(make_env({}));
+    CHECK(c.daykey_paths.size() == 1);
+    CHECK(c.daykey_paths[0] == "/news/default");
+
+    // The gated read, at the real route prefix and bare.
+    CHECK(c.daykey_required("GET", "/api/v1/news/default"));
+    CHECK(c.daykey_required("HEAD", "/api/v1/news/default"));
+    CHECK(c.daykey_required("GET", "/news/default"));
+    // Trailing slash and casing must not be a way around it.
+    CHECK(c.daykey_required("GET", "/api/v1/news/default/"));
+    CHECK(c.daykey_required("GET", "/api/v1/News/Default"));
+    // Anything nested under the gated path is gated too.
+    CHECK(c.daykey_required("GET", "/api/v1/news/default/extra"));
+
+    // Sibling news reads stay open — the gate is one endpoint, not the whole news surface.
+    CHECK(!c.daykey_required("GET", "/api/v1/news/list"));
+    CHECK(!c.daykey_required("GET", "/api/v1/news/search"));
+    CHECK(!c.daykey_required("GET", "/api/v1/fish"));
+    // The entry's leading '/' keeps the tail match on a segment boundary.
+    CHECK(!c.daykey_required("GET", "/api/v1/oldnews/default"));
+
+    // The write surface is still gated on every path, unchanged by any of the above.
+    CHECK(c.daykey_required("POST", "/api/v1/river/regulation/x"));
+    CHECK(c.daykey_required("PATCH", "/api/v1/river/fish/x"));
+    CHECK(c.daykey_required("patch", "/api/v1/river/fish/x"));  // case-insensitive method
+    // PUT/DELETE are deliberately NOT in the method arm: the allow-list is what blocks them.
+    CHECK(!c.daykey_required("PUT", "/api/v1/river/fish/x"));
+}
+
+void daykey_paths_are_configurable_and_can_be_cleared() {
+    Config c = load_config(make_env({{"CPROXY_DAYKEY_PATHS", "/news/default, fish/secret ,/x/y/"}}));
+    CHECK(c.daykey_paths.size() == 3);
+    CHECK(c.daykey_paths[1] == "/fish/secret");  // a missing leading '/' is supplied
+    CHECK(c.daykey_paths[2] == "/x/y");          // a trailing '/' is stripped
+    CHECK(c.daykey_required("GET", "/api/v1/fish/secret"));
+    CHECK(c.daykey_required("GET", "/api/x/y"));
+
+    // "NONE" is the off switch, and it must survive the casing an operator actually types.
+    for (const char* off_value : {"NONE", "none", " None "}) {
+        Config off = load_config(make_env({{"CPROXY_DAYKEY_PATHS", off_value}}));
+        CHECK(off.daykey_paths.empty());
+        CHECK(!off.daykey_required("GET", "/api/v1/news/default"));
+        CHECK(off.daykey_required("POST", "/api/v1/news/default"));  // write surface is unaffected
+    }
+
+    // Why the off switch is a sentinel and not "": system_env() maps an empty variable to nullopt,
+    // so in a real process CPROXY_DAYKEY_PATHS="" is indistinguishable from unset and MUST leave the
+    // default gate standing. Asserted through system_env itself, because make_env would hand back a
+    // real empty string and hide exactly the discrepancy this pins down (it did, once).
+    CHECK(!system_env("CPROXY_DAYKEY_PATHS_DEFINITELY_UNSET_12345").has_value());
+    Config empty = load_config([](const char* k) -> std::optional<std::string> {
+        return std::string(k) == "CPROXY_DAYKEY_PATHS" ? system_env("PATH_THAT_IS_NOT_SET_98765")
+                                                       : std::nullopt;
+    });
+    CHECK(empty.daykey_paths.size() == 1);
+    CHECK(empty.daykey_required("GET", "/api/v1/news/default"));
+}
+
 }  // namespace
 
 int main() {
@@ -104,6 +166,8 @@ int main() {
     external_values_are_read_from_the_env_lookup();
     validation_accepts_defaults_and_rejects_nonsense();
     payload_limit_is_read_with_default();
+    daykey_paths_gate_reads_by_default();
+    daykey_paths_are_configurable_and_can_be_cleared();
     std::cout << "config_test: all assertions passed\n";
     return 0;
 }

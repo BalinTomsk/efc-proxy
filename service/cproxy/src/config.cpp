@@ -15,6 +15,12 @@ std::string to_upper(std::string s) {
     return s;
 }
 
+std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
 std::string trim(const std::string& s) {
     auto begin = s.find_first_not_of(" \t\r\n");
     if (begin == std::string::npos) return {};
@@ -38,6 +44,23 @@ int get_int(const EnvLookup& env, const char* name, int fallback) {
     }
 }
 
+/**
+ * Canonical form for day-key path matching: lower-cased, guaranteed leading '/', trailing '/'
+ * stripped. Applied to BOTH the configured entries and the incoming request path so that
+ * "/News/Default/" and "/news/default" cannot be two different things to the gate.
+ *
+ * Case folding is deliberate even though HTTP paths are case-sensitive: the cost of gating a
+ * request the upstream would have 404'd is nothing, while the cost of letting "/News/Default"
+ * through on an upstream that happens to route case-insensitively is the whole point of the gate.
+ */
+std::string normalize_gate_path(std::string s) {
+    s = to_lower(trim(s));
+    if (s.empty()) return s;
+    if (s.front() != '/') s.insert(s.begin(), '/');
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    return s;
+}
+
 }  // namespace
 
 std::optional<std::string> system_env(const char* name) {
@@ -49,6 +72,26 @@ std::optional<std::string> system_env(const char* name) {
 bool Config::method_allowed(const std::string& method) const {
     if (allowed_methods.empty()) return true;
     return allowed_methods.count(to_upper(method)) > 0;
+}
+
+bool Config::daykey_gated_path(const std::string& path) const {
+    if (daykey_paths.empty()) return false;
+    const std::string norm = normalize_gate_path(path);
+    for (const std::string& entry : daykey_paths) {
+        // ends_with covers the endpoint itself at any route prefix ("/api/v1" + "/news/default");
+        // the entry's own leading '/' is what keeps it on a segment boundary, so "/oldnews/default"
+        // does not match "/news/default". The contains() arm extends the gate to anything nested
+        // under a gated path - a sub-resource of a protected resource is protected too.
+        if (norm.ends_with(entry) || norm.contains(entry + "/")) return true;
+    }
+    return false;
+}
+
+bool Config::daykey_required(const std::string& method, const std::string& path) const {
+    // The write surface is gated wholesale, whatever the path (see proxy_to_docapi).
+    const std::string m = to_upper(method);
+    if (m == "POST" || m == "PATCH") return true;
+    return daykey_gated_path(path);
 }
 
 Config load_config(const EnvLookup& env) {
@@ -73,6 +116,23 @@ Config load_config(const EnvLookup& env) {
     // directly rather than via get_str (which would substitute the default for an empty value).
     if (auto ld = env("CPROXY_LOG_DIR")) {
         cfg.log_dir = trim(*ld);
+    }
+
+    // "NONE" turns the path gate off entirely; anything else is a CSV that REPLACES the default.
+    // The off switch is a sentinel rather than an empty string because system_env() reports an
+    // empty variable as unset, so CPROXY_DAYKEY_PATHS="" is indistinguishable from not setting it
+    // at all and would silently leave the default gate in place — the opposite of what an operator
+    // typing it means. (Same reason CPROXY_ALLOWED_METHODS spells "no restriction" as "ALL".)
+    if (auto paths = env("CPROXY_DAYKEY_PATHS")) {
+        cfg.daykey_paths.clear();
+        if (to_upper(trim(*paths)) != "NONE") {
+            std::istringstream ps(*paths);
+            std::string ptok;
+            while (std::getline(ps, ptok, ',')) {
+                auto p = normalize_gate_path(ptok);
+                if (!p.empty() && p != "/") cfg.daykey_paths.push_back(p);
+            }
+        }
     }
 
     // "ALL" or empty means no restriction; anything else is a CSV allow-list.
