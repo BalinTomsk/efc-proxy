@@ -9,6 +9,47 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-02: **0.9.0 — the day-key store is keyed by DATE, not day-of-year. DEPLOYED.**
+  The store held exactly 365 rows indexed `1..365` and reused them every year. The generated key set
+  — `secret/daykeys.csv` and `secret/daykeys_mssql.sql` (`dbo.day_keys`) — is **date-keyed and spans
+  ten years, 3,652 rows**, so a 365-row projection of it agreed for about twelve months and then
+  drifted: cproxy and every other consumer would have disagreed from 2027-09-02. cproxy now holds
+  the same record count as the CSV, and they agree by construction.
+  - **How this surfaced.** A key that was valid in the date-keyed set was rejected by the gate. The
+    deployed SQLite and the local `secret/daykeys.sqlite` were byte-identical (so "just re-upload the
+    file" would have been a no-op), and the GUID was in `daykeys.csv` but in *none* of the 365 rows —
+    two different generations of key material, only one of which cproxy could represent.
+  - **The rewrite deleted logic rather than adding it.** `day_keys(stamp TEXT PRIMARY KEY, guid TEXT
+    NOT NULL)`, an `unordered_map<date, guid>`, and yesterday/today/tomorrow by plain chrono
+    arithmetic. Gone: the **year-boundary wrap** (365 → 1) and the **leap-day clamp**, under which
+    day 366 reused day 365's key — 29 February and 31 December shared a credential. The live store
+    now carries 3 genuine leap-day keys (2028/2032/2036). Side effect: `day_key_store_test` went from
+    **16.6s to 0.63s** and `proxy_test` from 3.6s to 0.45s, because the fixtures no longer write 365
+    rows per case.
+  - **Startup now logs the covered range** (`days`, `from`, `to`). The store is finite; past the last
+    date every gated request fails closed with the usual opaque 500 and nothing else says why, so
+    that line is the only warning it is expiring.
+  - **Fails loud on the old schema.** A 0.9.0 binary against a pre-0.9.0 database throws with an
+    explicit "regenerate from secret/daykeys.csv" message instead of loading an empty store and
+    silently 500ing everything. `legacy_day_of_year_schema_throws` pins it.
+  - **Deploy is a coordinated two-part change** — 0.9.0 rejects the 365-row schema and 0.8.0 rejects
+    a 3,652-row one, so either mismatch fails closed across the whole gated surface. Sequence used:
+    push the image, upload the new SQLite next to the *running* container (which holds its keys in
+    memory and is unaffected), then recreate once so binary and store land together.
+  - **A near-miss worth remembering:** the first rebuild used `secret/daykeys_new.csv` because it
+    already had a `day_of_year` column — but that file (16:16) is an **earlier, superseded
+    generation** with different GUIDs; the authoritative set is `daykeys.csv` (16:25), matching
+    `daykeys_mssql.sql` (16:26). Only an assertion against the known-good key caught it. A store
+    built from the wrong file looks perfectly valid — right row count, no empties — and rejects every
+    live key.
+  - **Verified live:** `/health` → `0.9.0`; `day-key store loaded, days:3652, from:2026-09-02,
+    to:2036-08-31`; the real key → `200` (1.06 MB); no key / wrong key → `500`; **tomorrow's** key →
+    `200` (±1 day window) and a key **5 days out** → `500`; POST write gate still `500`;
+    `fish/search` and the cloud-range store (3,758 ranges, GCP override intact) unaffected.
+  - Also this session: `daykeys.sqlite` tightened to `0400` (was `0444`), matching `.env` /
+    `master.key`. Verified by restarting rather than assuming — the store is read at startup, so a
+    permission mistake would have sat latent until an unrelated deploy.
+
 - 2026-09-02: **DEPLOYED 0.8.0 to prod** (digest `sha256:38a734f2…cc93`), which also carried the
   undeployed `0.7.0` day-key read gate. Verified live from an allowlisted machine: `/health` →
   `0.8.0`, breaker `closed`, traversal `400`, unknown route `404`, `POST` and `GET /news/default` →

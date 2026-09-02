@@ -83,6 +83,13 @@ struct ProxyState {
         if (!cfg.daykey_db_path.empty()) {
             try {
                 daykey_store.emplace(cfg.daykey_db_path);
+                // Log the covered range: the store is date-keyed and finite, so this is the only
+                // visible warning that it is running out. Past the last date every gated request
+                // fails closed with the usual opaque 500 and nothing else says why.
+                log_raw(std::format(
+                    "{{\"service\":\"cproxy\",\"msg\":\"day-key store loaded\",\"days\":{},"
+                    "\"from\":\"{}\",\"to\":\"{}\"}}",
+                    daykey_store->size(), daykey_store->first_date(), daykey_store->last_date()));
             } catch (const std::exception& ex) {
                 log_raw(std::format(
                     "{{\"service\":\"cproxy\",\"level\":\"ERROR\","
