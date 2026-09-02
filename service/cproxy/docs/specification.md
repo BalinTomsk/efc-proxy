@@ -48,8 +48,9 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
 - **Optional guards:** if `CPROXY_API_KEY` is set, a request lacking a matching `X-API-Key` → `401`;
   if `CPROXY_ALLOWED_METHODS` is a non-empty CSV, a method not in it → `405`.
 - **Day-key guard:** independent of the two guards above — a gated request additionally requires
-  `X-Day-Guid` to match the current UTC day's credential from the `CPROXY_DAYKEY_DB` SQLite database
-  (±1 day window); a wrong or missing value → `500` (deliberately not `401`, so it reads no
+  `X-Day-Guid` to match the current UTC date's credential from the `CPROXY_DAYKEY_DB` SQLite database
+  (`day_keys(stamp TEXT PRIMARY KEY, guid TEXT NOT NULL)`, one row per calendar date; ±1 day window);
+  a wrong or missing value → `500` (deliberately not `401`, so it reads no
   differently from an ordinary server error). Two arms, either one gates: **every POST/PATCH**
   whatever the path, and **every method on a path in `CPROXY_DAYKEY_PATHS`** (default
   `/news/default` — this is how a *read* is put behind the credential, added 0.7.0). Matching is on
@@ -104,7 +105,7 @@ src/
   config.hpp/.cpp      Config struct + load_config(EnvLookup); method_allowed(); auth_required();
                        daykey_required(method,path) / daykey_gated_path(path)
   log.hpp/.cpp         JSON console + daily-rolling-file logger; init_logging/log_line/log_raw
-  day_key_store.hpp/.cpp  SQLite-backed per-day PATCH credential; DayKeyStore::is_valid()
+  day_key_store.hpp/.cpp  SQLite-backed per-DATE rotating credential; DayKeyStore::is_valid()
   proxy.hpp/.cpp       install_routes(Server&, Config&): per-method routes; forwarding; PATCH day-key gate
   main.cpp             load config; init logging; SIGINT/SIGTERM -> server.stop(); listen
 tests/
@@ -113,6 +114,31 @@ tests/
   proxy_test.cpp           real HTTP through install_routes(); includes the gated-read cases
                            (/news/default 500 without a key, 502 through with one, siblings open)
 ```
+
+## Day-key store (0.9.0: date-keyed)
+
+`day_key_store.hpp/.cpp`. A read-only SQLite table `day_keys(stamp TEXT PRIMARY KEY, guid TEXT NOT
+NULL)`, one row per calendar date, loaded once at startup into an `unordered_map<date, guid>` and
+never re-queried per request. `is_valid(guid, now)` accepts yesterday / today / tomorrow in UTC.
+
+- **Why date-keyed.** Until 0.9.0 the table was `day_keys(day_of_year INTEGER, guid)` with *exactly*
+  365 rows, reused every year. The generated key set (`secret/daykeys.csv`, and the `dbo.day_keys`
+  MSSQL table) is date-keyed and spans ten years, so any 365-row projection of it agreed for roughly
+  twelve months and then drifted — the consumers would have started disagreeing on 2027-09-02.
+  Matching the real date makes them agree by construction.
+- **Two special cases disappeared with it:** the year-boundary wrap (day 365 → 1) and the leap-day
+  clamp, where day 366 reused day 365's key so 29 February and 31 December shared a credential.
+  29 February is now an ordinary distinct key.
+- **Fails loud at startup** on an empty table, a malformed row (stamp not `YYYY-MM-DD`, empty guid),
+  or the pre-0.9.0 day-of-year schema — the last matters because a new binary against an old
+  database would otherwise load nothing and silently 500 the entire gated surface.
+  `day_key_store_test.legacy_day_of_year_schema_throws` pins it.
+- **The store is finite.** Startup logs `day-key store loaded` with `days` / `from` / `to`; past the
+  last date every gated request fails closed with the usual opaque `500` and nothing else explains
+  why, so that line is the only warning it is expiring.
+- **Deploying a new store is a two-part change**: binary and SQLite must land together, since each
+  version rejects the other's schema. Upload the file next to the *running* container (which holds
+  its keys in memory and is unaffected), then recreate once.
 
 ## Datacenter / cloud-provider IP blocking (0.8.0)
 

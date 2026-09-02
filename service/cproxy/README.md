@@ -207,10 +207,18 @@ and the log/secret bind mounts — replacing the previous hand-typed `docker run
 
 Some requests are gated by a **second, independent** control on top of
 `CPROXY_API_KEY`/`CPROXY_ALLOWED_METHODS`: a per-day rotating GUID read from a small read-only SQLite
-database at `CPROXY_DAYKEY_DB` (`day_keys(day_of_year, guid)`, exactly 365 rows). A caller sends the
-current UTC day's GUID in `X-Day-Guid` (a ±1-day window is accepted); a wrong or missing value
-answers a plain `500`, never `401` — the failure looks identical to an ordinary server error to
-anyone probing it.
+database at `CPROXY_DAYKEY_DB` (`day_keys(stamp TEXT PRIMARY KEY, guid TEXT NOT NULL)`, one row per
+calendar date). A caller sends the current UTC day's GUID in `X-Day-Guid` (a ±1-day window is
+accepted); a wrong or missing value answers a plain `500`, never `401` — the failure looks identical
+to an ordinary server error to anyone probing it.
+
+**Keyed by real date since 0.9.0.** It previously held exactly 365 rows indexed by day-of-year and
+reused them annually, which could not represent the generated key set (date-keyed, spanning years) —
+a 365-row projection agreed with it for about twelve months and then drifted. Matching on the date
+makes every consumer agree by construction, and removed two special cases: the year-boundary wrap and
+the leap-day clamp, under which 29 February reused 31 December's key. The store is finite, so startup
+logs the covered range (`days`, `from`, `to`); past the last date every gated request fails closed
+with the usual opaque `500` and nothing else says why.
 
 Two arms decide what is gated, and either one is enough:
 

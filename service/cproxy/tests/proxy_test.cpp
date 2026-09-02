@@ -50,23 +50,25 @@ void install_fake_upstream(httplib::Server& s) {
 }
 
 /**
- * A day-key database whose 365 rows all hold the SAME guid, so `guid` is the valid key no matter
- * what day the test runs on. day_key_store_test covers which row is picked for which date; this
- * file only needs "a key that works today" to exercise the proxy's gate.
+ * A date-keyed day-key database covering a window around the CURRENT date, every row holding the
+ * SAME guid — so `guid` is the valid key whenever the test runs. day_key_store_test covers which
+ * row is picked for which date; this file only needs "a key that works today" to exercise the
+ * proxy's gate. The window is generous so the test is immune to running across a UTC midnight.
  */
 void write_uniform_day_key_db(const std::string& path, const std::string& guid) {
     std::remove(path.c_str());
     sqlite3* db = nullptr;
     CHECK(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
-    CHECK(sqlite3_exec(db,
-                       "CREATE TABLE day_keys (day_of_year INTEGER PRIMARY KEY, guid TEXT NOT NULL)",
+    CHECK(sqlite3_exec(db, "CREATE TABLE day_keys (stamp TEXT PRIMARY KEY, guid TEXT NOT NULL)",
                        nullptr, nullptr, nullptr) == SQLITE_OK);
     sqlite3_stmt* stmt = nullptr;
-    CHECK(sqlite3_prepare_v2(db, "INSERT INTO day_keys (day_of_year, guid) VALUES (?, ?)", -1, &stmt,
+    CHECK(sqlite3_prepare_v2(db, "INSERT INTO day_keys (stamp, guid) VALUES (?, ?)", -1, &stmt,
                              nullptr) == SQLITE_OK);
-    for (int i = 0; i < DayKeyStore::kDays; ++i) {
+    const auto today = std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now());
+    for (int offset = -3; offset <= 3; ++offset) {
+        const std::string stamp = utc_date_string(today + std::chrono::days{offset});
         sqlite3_reset(stmt);
-        sqlite3_bind_int(stmt, 1, i + 1);
+        sqlite3_bind_text(stmt, 1, stamp.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, guid.c_str(), -1, SQLITE_TRANSIENT);
         CHECK(sqlite3_step(stmt) == SQLITE_DONE);
     }
