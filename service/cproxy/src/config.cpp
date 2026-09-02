@@ -112,11 +112,15 @@ Config load_config(const EnvLookup& env) {
     cfg.external_admin = get_str(env, "EXTERNAL_ADMIN", cfg.external_admin);
     cfg.external_frontend = get_str(env, "EXTERNAL_FRONTEND", cfg.external_frontend);
 
-    // log_dir is special: an explicitly-set but EMPTY value means "console only", so it is read
-    // directly rather than via get_str (which would substitute the default for an empty value).
-    if (auto ld = env("CPROXY_LOG_DIR")) {
-        cfg.log_dir = trim(*ld);
-    }
+    // "NONE" turns file logging off (console only); anything else is the rolling-log directory.
+    // The off switch is a sentinel rather than an empty string for the same reason as
+    // CPROXY_DAYKEY_PATHS below: system_env() reports an empty variable as unset, so through a real
+    // process environment `-e CPROXY_LOG_DIR=` is indistinguishable from not setting it at all and
+    // can only ever mean "use the default". This used to be read directly (empty => console only),
+    // which worked in the unit tests and from a dotenv line but never from the documented `-e` form
+    // — see console_only_sentinel_works_through_the_real_environment in config_test.
+    auto log_dir = get_str(env, "CPROXY_LOG_DIR", cfg.log_dir);
+    cfg.log_dir = to_upper(log_dir) == "NONE" ? "" : log_dir;
 
     // "NONE" turns the path gate off entirely; anything else is a CSV that REPLACES the default.
     // The off switch is a sentinel rather than an empty string because system_env() reports an

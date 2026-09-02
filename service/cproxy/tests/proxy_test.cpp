@@ -350,8 +350,8 @@ void gated_read_path_requires_day_key() {
     std::remove(db.c_str());
 }
 
-// Turning the path gate off (CPROXY_DAYKEY_PATHS="") must actually open the read back up, otherwise
-// there is no way to roll the protection back without shipping a new binary.
+// Turning the path gate off (CPROXY_DAYKEY_PATHS=NONE) must actually open the read back up,
+// otherwise there is no way to roll the protection back without shipping a new binary.
 void gated_read_path_can_be_disabled() {
     TestServer up;
     install_fake_upstream(up.server);
@@ -359,7 +359,7 @@ void gated_read_path_can_be_disabled() {
 
     Config cfg;
     cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
-    cfg.daykey_paths.clear();  // what CPROXY_DAYKEY_PATHS="" produces
+    cfg.daykey_paths.clear();  // what CPROXY_DAYKEY_PATHS=NONE produces
     TestServer proxy;
     install_routes(proxy.server, cfg);
     proxy.start();

@@ -1,6 +1,7 @@
 // Minimal, framework-free unit tests for config parsing. Registered with CTest; run via
 // `ctest --test-dir build` (also executed inside the Docker build).
 #include "check.hpp"
+#include <cstdlib>  // setenv/unsetenv (POSIX), _putenv_s (Windows) — see put_real_env
 #include <iostream>
 #include <map>
 #include <string>
@@ -43,14 +44,70 @@ void external_values_are_read_from_the_env_lookup() {
     CHECK(c.external_frontend == "example.test");
 }
 
-void logging_env_is_read_including_empty_dir() {
+void logging_env_is_read_including_console_only_sentinel() {
     Config a = load_config(make_env({{"CPROXY_LOG_DIR", "/var/log/cproxy"},
                                      {"CPROXY_LOG_MAX_HISTORY", "14"}}));
     CHECK(a.log_dir == "/var/log/cproxy");
     CHECK(a.log_max_history == 14);
-    // An explicitly-empty dir means console-only and must be honored (not replaced by the default).
-    Config b = load_config(make_env({{"CPROXY_LOG_DIR", ""}}));
-    CHECK(b.log_dir.empty());
+    // "NONE" is the console-only switch, and it must survive the casing/padding an operator types.
+    for (const char* off_value : {"NONE", "none", " None "}) {
+        CHECK(load_config(make_env({{"CPROXY_LOG_DIR", off_value}})).log_dir.empty());
+    }
+    // An empty value is NOT the switch: it reads as unset and leaves the default standing. Asserted
+    // here for the contract, and through the real process environment below for the reason.
+    CHECK(load_config(make_env({{"CPROXY_LOG_DIR", ""}})).log_dir == "logs");
+}
+
+/**
+ * Sets `name` in the REAL process environment; a null `value` removes it. Windows and POSIX disagree
+ * about what an explicitly-empty variable even is — POSIX keeps it as an empty string, Windows
+ * deletes it — which is part of why "explicitly empty" cannot be a portable config state.
+ */
+void put_real_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value == nullptr ? "" : value);
+#else
+    if (value == nullptr) {
+        ::unsetenv(name);
+    } else {
+        ::setenv(name, value, 1);
+    }
+#endif
+}
+
+/**
+ * The trap this pins down: system_env() maps an explicitly-EMPTY variable to nullopt, so through a
+ * real process environment `-e CPROXY_LOG_DIR=` cannot mean anything other than "unset".
+ *
+ * Every assertion here goes through the real environment and the real system_env, NOT make_env —
+ * the fake hands back a genuine empty string that the process environment never produces, and that
+ * gap is exactly what let CPROXY_LOG_DIR="" be documented as a working console-only switch (and
+ * unit-tested as one) while the deployed service silently kept writing rolling files. The same blind
+ * spot bit CPROXY_DAYKEY_PATHS in 0.7.0.
+ */
+void console_only_sentinel_works_through_the_real_environment() {
+    // The blind spot itself, turned into an assertion: the fake and the real environment do NOT
+    // agree about what an explicitly-empty variable is, so any config rule that leans on "empty"
+    // has to be validated against the real one before it can be documented as working.
+    put_real_env("CPROXY_LOG_DIR", "");
+    CHECK(make_env({{"CPROXY_LOG_DIR", ""}})("CPROXY_LOG_DIR").has_value());  // fake: a real ""
+    CHECK(!system_env("CPROXY_LOG_DIR").has_value());  // reality: indistinguishable from unset ...
+    CHECK(load_config().log_dir == "logs");            // ... so the default has to stand
+
+    put_real_env("CPROXY_LOG_DIR", "NONE");
+    auto v = system_env("CPROXY_LOG_DIR");
+    CHECK(v.has_value() && *v == "NONE");
+    CHECK(load_config().log_dir.empty());  // the sentinel is what actually reaches init_logging
+
+    put_real_env("CPROXY_LOG_DIR", " none ");
+    CHECK(load_config().log_dir.empty());  // trimmed and case-folded, like every other sentinel
+
+    put_real_env("CPROXY_LOG_DIR", "/var/log/cproxy");
+    CHECK(load_config().log_dir == "/var/log/cproxy");
+
+    put_real_env("CPROXY_LOG_DIR", nullptr);
+    CHECK(!system_env("CPROXY_LOG_DIR").has_value());
+    CHECK(load_config().log_dir == "logs");
 }
 
 void overrides_are_read_and_methods_restricted() {
@@ -162,7 +219,8 @@ int main() {
     defaults_apply_when_env_is_empty();
     overrides_are_read_and_methods_restricted();
     malformed_int_falls_back_and_all_keyword_means_unrestricted();
-    logging_env_is_read_including_empty_dir();
+    logging_env_is_read_including_console_only_sentinel();
+    console_only_sentinel_works_through_the_real_environment();
     external_values_are_read_from_the_env_lookup();
     validation_accepts_defaults_and_rejects_nonsense();
     payload_limit_is_read_with_default();

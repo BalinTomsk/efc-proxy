@@ -65,17 +65,23 @@ probing is visible.
 | `CPROXY_BREAKER_THRESHOLD` | `5` | consecutive upstream failures before failing fast (`0` disables) |
 | `CPROXY_BREAKER_COOLDOWN_MS` | `5000` | how long the breaker stays open before allowing one probe |
 | `CPROXY_UPSTREAM_RETRY` | `1` | retry idempotent requests once on a transport failure (`0` disables) |
-| `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `""` = console-only |
+| `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `NONE` = console-only (an empty value reads as unset) |
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
 
 See `.env.example`. No config file — everything is env, so one image runs anywhere.
+
+**An empty value always means "use the default."** `getenv() == ""` is indistinguishable from unset,
+so every switch spells its *off* state as a word instead: `CPROXY_ALLOWED_METHODS=ALL`,
+`CPROXY_DAYKEY_PATHS=NONE`, `CPROXY_LOG_DIR=NONE` (case-insensitive, trimmed). `-e CPROXY_LOG_DIR=`
+does **not** turn file logging off — it falls back to `logs`.
 
 ## Logging
 
 Same functionality as the sibling `waterservice`: structured **JSON** lines to **both** the console
 (`docker logs`) and a **daily-rolling file** with bounded retention. The active file is
 `<CPROXY_LOG_DIR>/cproxy.log`; at the first write of each new UTC day it rolls to
-`cproxy.<YYYY-MM-DD>.log` and files older than `CPROXY_LOG_MAX_HISTORY` days are pruned. In production
+`cproxy.<YYYY-MM-DD>.log` and files older than `CPROXY_LOG_MAX_HISTORY` days are pruned. Set
+`CPROXY_LOG_DIR=NONE` for console-only. In production
 the log directory is a   bind-mounted at `/var/log/cproxy`, so logs survive
 container redeploys and reboots.
 
