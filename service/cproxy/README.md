@@ -59,6 +59,12 @@ probing is visible.
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
 | `CPROXY_DAYKEY_PATHS` | `/news/default` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
+| `CPROXY_BLOCK_CLOUD_IPS` | `true` | kill-switch — `false` keeps the data and refresh but refuses nothing |
+| `CPROXY_CLOUDRANGE_REFRESH_HOURS` | `336` | interval between provider-feed refreshes (fortnightly) |
+| `CPROXY_CLOUDRANGE_REFRESH_ON_START` | `false` | fetch once at boot instead of waiting a full interval |
+| `CPROXY_CLOUDRANGE_PROVIDERS` | (all 12) | CSV of feeds; `NONE` stops refreshing but keeps blocking |
+| `CPROXY_CLOUDRANGE_EXEMPT_IPS` | (empty) | never blocked (admin + frontend are exempt automatically) |
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
 | `CPROXY_MAX_PAYLOAD_BYTES` | `1048576` | request bodies above this are rejected with `413` |
@@ -74,6 +80,38 @@ See `.env.example`. No config file — everything is env, so one image runs anyw
 so every switch spells its *off* state as a word instead: `CPROXY_ALLOWED_METHODS=ALL`,
 `CPROXY_DAYKEY_PATHS=NONE`, `CPROXY_LOG_DIR=NONE` (case-insensitive, trimmed). `-e CPROXY_LOG_DIR=`
 does **not** turn file logging off — it falls back to `logs`.
+
+## Datacenter / cloud-provider IP blocking
+
+A REST call whose peer address falls in published datacenter space is refused with an opaque `500`
+before any other guard runs. This is the cproxy half of the frontend's `dbo.CloudProviderIpRange`
+control (see `aspnet/Account/CLAUDE.md`): real anglers come from residential and mobile ISPs, so
+sustained traffic from AWS/GCP/Azure/Oracle/DigitalOcean/Alibaba and friends is bots and scrapers.
+
+- **Same shape as the frontend's table** — one row per published CIDR, expanded to an inclusive
+  numeric `[ip_start, ip_end]` window, with a `disabled` flag as a manual per-row override that the
+  refresh preserves per `(provider, cidr)`.
+- **Ranges are coalesced in memory.** The frontend's single-seek SQL is only correct while ranges
+  are disjoint; across twelve feeds they are not. Merging overlapping and adjacent intervals makes
+  the binary search correct unconditionally — and collapses ~92k raw rows to under 4k intervals.
+- **The peer address comes from the TCP connection, never `X-Forwarded-For`.** cproxy is the edge,
+  so an inbound XFF is attacker-controlled: trusting it would let anyone bypass the block, or get a
+  third party blocked, just by setting a header.
+- **`500`, not `403`** — identical to a failed day-key, so probing the gateway reveals nothing.
+
+**Three escape hatches, because a wrong range takes the portal offline.** `CPROXY_BLOCK_CLOUD_IPS=false`
+disables refusal without a redeploy; `CPROXY_CLOUDRANGE_EXEMPT_IPS` (plus `EXTERNAL_ADMIN` /
+`EXTERNAL_FRONTEND`, exempt automatically) allowlists individual addresses; and an empty or missing
+database blocks nothing, which is also the state before the first refresh.
+
+The refresher runs in-process on a fortnightly timer, fetching each provider's published feed over
+HTTPS and rewriting the database in one transaction. A feed that fails leaves its own rows intact;
+if every feed fails the database is not touched at all.
+
+> **This is why the binary links libssl.** cpp-httplib TLS was deliberately off ("cproxy speaks
+> plain HTTP to internal upstreams") and that still holds for the proxy path — but the provider
+> feeds are HTTPS-only, so 0.8.0 turns TLS on and gives the proxy outbound internet egress it did
+> not previously have. `ca-certificates` in the runtime image is load-bearing from here on.
 
 ## Logging
 

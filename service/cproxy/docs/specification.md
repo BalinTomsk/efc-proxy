@@ -69,6 +69,13 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV method allow-list |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
 | `CPROXY_DAYKEY_PATHS` | `/news/default` | CSV of paths day-key gated on **every** method, GET included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
+| `CPROXY_BLOCK_CLOUD_IPS` | `true` | kill-switch; `false` keeps data + refresh but refuses nothing |
+| `CPROXY_CLOUDRANGE_REFRESH_HOURS` | `336` | fortnightly provider-feed refresh |
+| `CPROXY_CLOUDRANGE_REFRESH_ON_START` | `false` | fetch at boot instead of waiting an interval |
+| `CPROXY_CLOUDRANGE_FETCH_TIMEOUT_SECONDS` | `60` | per-feed HTTP timeout |
+| `CPROXY_CLOUDRANGE_PROVIDERS` | (all 12) | CSV of feeds; `NONE` stops refreshing, keeps blocking |
+| `CPROXY_CLOUDRANGE_EXEMPT_IPS` | (empty) | never blocked (admin + frontend exempt automatically) |
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
 | `CPROXY_LOG_DIR` | `logs` (Docker image: `/var/log/cproxy`) | rolling-log directory; `NONE` = console-only (an empty value reads as unset) |
@@ -106,6 +113,48 @@ tests/
   proxy_test.cpp           real HTTP through install_routes(); includes the gated-read cases
                            (/news/default 500 without a key, 502 through with one, siblings open)
 ```
+
+## Datacenter / cloud-provider IP blocking (0.8.0)
+
+The cproxy half of the frontend's `dbo.CloudProviderIpRange` control (`aspnet/Account/CLAUDE.md`).
+A request whose peer address falls in published datacenter space is refused **before every other
+guard** with the same opaque `500` as a failed day-key.
+
+- **Store** (`cloud_range_store.hpp/.cpp`). SQLite table `cloud_provider_ip_range(provider, cidr,
+  ip_start, ip_end, disabled, source, updated_utc)`, PK `(provider, cidr)`, partial index on
+  `ip_start WHERE disabled = 0` — the same shape and the same filtered index as the frontend's
+  table, so the two remain recognisably one design.
+- **Lookup is in-memory, not per-request SQL.** cproxy sees every call, so enabled rows are loaded
+  once into a sorted vector and binary-searched. Refreshes publish a new snapshot through
+  `std::atomic<std::shared_ptr<const vector>>`, so readers never lock and never see a partial set.
+- **Ranges are coalesced at load.** The frontend's `TOP 1 … ORDER BY ipStart DESC` seek is correct
+  only for *disjoint* ranges; a nested interval would make it answer "not blocked" for a covered
+  address. Merging overlapping and adjacent windows makes the search correct unconditionally. In
+  practice it also collapses ~92k published rows to under 4k intervals.
+- **Peer address is `req.remote_addr`, never `X-Forwarded-For`.** cproxy is the edge; an inbound
+  XFF is attacker-controlled, so honouring it would make the block both bypassable and abusable.
+- **Fail-safe, not fail-closed** (the opposite of the day-key store): a missing or unreadable
+  database leaves the set empty and blocks nothing. A missing file logs at INFO — that is the
+  normal state before the first refresh — while a corrupt one logs ERROR.
+- **Escape hatches:** `CPROXY_BLOCK_CLOUD_IPS=false`; `CPROXY_CLOUDRANGE_EXEMPT_IPS` plus automatic
+  exemption of `EXTERNAL_ADMIN` / `EXTERNAL_FRONTEND` (the portal host sits at a hosting provider —
+  without this the block would take the site down); and the empty-store case above.
+
+**Refresher** (`cloud_range_refresh.hpp/.cpp`) — an in-process thread on a fortnightly timer,
+mirroring `envfish-db/mssql/tools/Update-CloudProviderRanges.ps1` feed for feed: AWS, GCP, Oracle
+and DigitalOcean first-party feeds, the weekly Azure ServiceTags file (link scraped from the
+download page), and RIPEstat announced-prefixes for Alibaba/Linode/Vultr/Hetzner/OVH/Scaleway/
+Tencent. Both quirks that script documents are carried over: GCP entries with no `ipv4Prefix` are
+guarded, and DigitalOcean's CSV arrives without a text content-type. Rows for the providers that
+succeeded are replaced in one transaction with `disabled` overrides preserved per `(provider,
+cidr)`; a failed feed keeps its own rows, and if every feed fails the database is untouched. The
+thread waits on a condition variable, so shutdown never blocks on the two-week timer.
+
+**TLS was turned on for this.** `HTTPLIB_USE_OPENSSL_IF_AVAILABLE` was deliberately `OFF` and the
+reasoning still holds for the proxy path (still plain HTTP to docapi over the VPC), but every
+provider feed is HTTPS-only. 0.8.0 accepts the trade knowingly: libssl joins libcrypto, the image
+grows, `ca-certificates` becomes load-bearing, and the proxy makes outbound internet calls it never
+made before. nlohmann/json (header-only) was added to parse the feeds.
 
 ## Encrypted config (secret_codec + dotenv)
 

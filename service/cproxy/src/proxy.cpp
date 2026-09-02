@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <filesystem>
 #include <format>
 #include <map>
 #include <memory>
@@ -14,6 +15,7 @@
 #include <string>
 
 #include "breaker.hpp"
+#include "cloud_range_store.hpp"
 #include "day_key_store.hpp"
 #include "log.hpp"
 #include "version.hpp"
@@ -67,9 +69,17 @@ struct ProxyState {
     // surface, so a load failure here just leaves this empty — every gated request then fails closed
     // (500) rather than the whole process refusing to start. See proxy_to_docapi's day-key gate.
     std::optional<DayKeyStore> daykey_store;
+    // Datacenter / cloud-provider ranges. Load failures leave this EMPTY, which blocks nothing —
+    // the opposite of the day-key store's fail-closed stance, and deliberate: a missing range file
+    // must never turn into "refuse all traffic". The frontend takes the same position by starting
+    // with an empty table.
+    CloudRangeStore owned_ranges;
+    // Points at owned_ranges, or at a store the caller shares with the refresh thread.
+    CloudRangeStore* cloud_ranges = &owned_ranges;
 
-    explicit ProxyState(const Config& cfg)
+    explicit ProxyState(const Config& cfg, CloudRangeStore* shared_ranges)
         : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
+        if (shared_ranges != nullptr) cloud_ranges = shared_ranges;
         if (!cfg.daykey_db_path.empty()) {
             try {
                 daykey_store.emplace(cfg.daykey_db_path);
@@ -77,6 +87,26 @@ struct ProxyState {
                 log_raw(std::format(
                     "{{\"service\":\"cproxy\",\"level\":\"ERROR\","
                     "\"msg\":\"day-key database failed to load, PATCH will 500: {}\"}}",
+                    ex.what()));
+            }
+        }
+        if (!cfg.cloudrange_db_path.empty()) {
+            try {
+                cloud_ranges->reload(cfg.cloudrange_db_path);
+                log_raw(std::format("{{\"service\":\"cproxy\",\"msg\":\"cloud-range store loaded\","
+                                    "\"merged_ranges\":{}}}",
+                                    cloud_ranges->size()));
+            } catch (const std::exception& ex) {
+                // A file that does not exist yet is the normal first-boot state (the refresher has
+                // not run), not a fault — logging it at ERROR would train everyone to ignore the
+                // line that also reports a genuinely corrupt or unreadable database.
+                const bool absent = !std::filesystem::exists(cfg.cloudrange_db_path);
+                log_raw(std::format(
+                    "{{\"service\":\"cproxy\",\"level\":\"{}\",\"msg\":\"{}: {}\"}}",
+                    absent ? "INFO" : "ERROR",
+                    absent ? "no cloud-range database yet, nothing IP-blocked until the first "
+                             "refresh"
+                           : "cloud-range database failed to load, nothing will be IP-blocked",
                     ex.what()));
             }
         }
@@ -193,6 +223,25 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
                      httplib::Response& res) {
     const std::string rid = request_id(req);
     res.set_header("X-Request-Id", rid);
+
+    // Datacenter / cloud-provider block, first of all the guards — a request from hosting space is
+    // refused before it can consume an upstream call, a day-key comparison, or anything else.
+    //
+    // The peer address is taken from req.remote_addr and NEVER from X-Forwarded-For: cproxy is the
+    // edge, so remote_addr is the real TCP peer, while an inbound XFF is attacker-controlled and
+    // trusting it would let anyone bypass the block by claiming a residential address (or get a
+    // third party blocked by claiming theirs).
+    //
+    // Answered with the same opaque 500 as a failed day-key rather than 403: a caller probing the
+    // gateway learns nothing about why it was refused. The frontend uses an opaque 404 for the same
+    // reason; 500 is the convention already established here.
+    if (cfg.cloudrange_block_enabled && !cfg.cloudrange_exempt(req.remote_addr) &&
+        state.cloud_ranges->is_blocked(req.remote_addr)) {
+        write_error(res, 500, "internal_error", "Internal error");
+        log_request(std::format("{} {} -> 500 (datacenter ip)", req.method, req.path),
+                    req.remote_addr, rid);
+        return;
+    }
 
     if (!cfg.method_allowed(req.method)) {
         write_error(res, 405, "method_not_allowed", "Method not allowed by this proxy");
@@ -367,10 +416,10 @@ std::string render_metrics(const ProxyState& state) {
 
 }  // namespace
 
-void install_routes(httplib::Server& server, const Config& cfg) {
+void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore* shared_ranges) {
     // Per-server state (breaker + counters), captured by value into every handler so it lives
     // exactly as long as they do. See ProxyState for why this is not a global.
-    auto state = std::make_shared<ProxyState>(cfg);
+    auto state = std::make_shared<ProxyState>(cfg, shared_ranges);
 
     // Oversized request bodies are cut off with 413 while being read, before any handler runs.
     server.set_payload_max_length(static_cast<size_t>(cfg.max_payload_bytes));

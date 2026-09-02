@@ -9,6 +9,104 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-02: **DEPLOYED 0.8.0 to prod** (digest `sha256:38a734f2…cc93`), which also carried the
+  undeployed `0.7.0` day-key read gate. Verified live from an allowlisted machine: `/health` →
+  `0.8.0`, breaker `closed`, traversal `400`, unknown route `404`, `POST` and `GET /news/default` →
+  `500` (day-key), `news/list` not gated, `cloud-range store loaded … merged_ranges: 3914`, and all
+  **12 feeds** refreshed in prod writing an 8.6 MB database to the volume.
+  - **I caused a short outage during this deploy, and the cause is worth remembering.** The
+    2026-09-02 redaction pass replaced the docapi VPC address in `deploy/compose.yml` with the
+    literal `<docapi-vpc>` — but that file is `scp`'d to `/opt/cproxy/compose.yml` **verbatim**, so
+    cproxy tried to resolve the placeholder and answered every `/api/*` with
+    `502 Could not establish connection`. **A `<placeholder>` in a deployed file is an outage, not
+    documentation.** It was hard to spot because `/health` is local-only and stayed `200`, and
+    `/health/ready` only reports breaker state — only a real proxied call revealed it.
+  - **Fixed properly, not just hot-patched:** `CPROXY_DOCAPI_UPSTREAM` is now **absent** from the
+    tracked `compose.yml` and supplied by `/mnt/volume_cnode/cproxy/.env` next to
+    `EXTERNAL_ADMIN`/`EXTERNAL_FRONTEND`. A real process env var wins over the dotenv, so the key
+    must stay absent rather than empty. Re-deployed from the corrected git file to prove the
+    git→droplet path is clean. `do-update.md` gained the rule, a pre-ship
+    `grep -n '<[a-z-]*>' deploy/*` check, and "always finish by calling a real proxied endpoint".
+  - **Pre-existing, NOT caused by this deploy:** docapi returns `500` on `/api/v1/fish/search` and
+    `/api/v1/news/list`. Confirmed by querying docapi directly, bypassing cproxy — identical
+    statuses; cproxy logs them with upstream latency (`-> 500 (784ms)`), i.e. it is relaying
+    faithfully. Needs looking at on the docapi side.
+  - **Pre-deploy safety check** (every critical address tested against the range set before enabling
+    anything): admin, frontend A record, frontend egress and the docapi VPC address are all clear.
+    **The cproxy droplet's own public address IS in the DigitalOcean feed** — moot today because the
+    `DOCKER-USER` allowlist means it can never be a client, but exempt it before widening that list.
+  - Also learned: 91,633 fetched rows collapse to 63,818 unique `(provider, cidr)` — Azure repeats
+    prefixes across service tags — and then to 3,914 coalesced intervals.
+  - **Follow-up:** `CPROXY_CLOUDRANGE_REFRESH_ON_START=true` is still set from the first populate and
+    should come out, or every redeploy re-pulls twelve third-party feeds.
+
+- 2026-09-02: **0.8.0 — datacenter / cloud-provider IP blocking, with an in-process fortnightly
+  feed refresher.**
+  Ports the frontend's `dbo.CloudProviderIpRange` control (`aspnet/Account/CLAUDE.md`) to the
+  gateway: a REST call whose peer address falls in published datacenter space is refused with the
+  same opaque `500` as a failed day-key, **before every other guard**. Real anglers come from
+  residential/mobile ISPs; sustained traffic from AWS/GCP/Azure/Oracle/DO/Alibaba is bots.
+  - **Store** (`cloud_range_store.*`): SQLite `cloud_provider_ip_range(provider, cidr, ip_start,
+    ip_end, disabled, source, updated_utc)`, PK `(provider, cidr)`, partial index on `ip_start
+    WHERE disabled = 0` — same shape and same filtered index as the frontend's table.
+  - **Lookup is in-memory**, not one indexed SQL seek per request as on the frontend: cproxy sees
+    every call, so enabled rows load once into a sorted vector and binary-search. Refreshes publish
+    a new snapshot via `std::atomic<std::shared_ptr<const vector>>` — readers never lock, never see
+    a half-updated set, and a refresh takes effect with no restart.
+  - **Ranges are COALESCED at load, and this is a real correctness fix, not an optimisation.** The
+    frontend's single-seek query is only correct while ranges are disjoint. Across twelve feeds they
+    are not: an interval nested inside another makes `TOP 1 … ORDER BY ipStart DESC` return the
+    wrong row and answer "not blocked" for an address that *is* covered. Merging overlapping and
+    adjacent windows makes the binary search correct unconditionally — and collapsed **91,633 raw
+    rows to 3,914 intervals** in the first live run, so the small count is expected, not a bug.
+    *(The frontend has the same latent hazard; not touched here.)*
+  - **Peer address is `req.remote_addr`, never `X-Forwarded-For`** — cproxy is the edge, so an
+    inbound XFF is attacker-controlled; honouring it would make the block both bypassable and a way
+    to get a third party refused.
+  - **Fail-SAFE, deliberately the opposite of the day-key store's fail-closed stance.** A missing or
+    unreadable range DB blocks nothing. A *missing* file logs INFO (the normal state before the
+    first refresh); a corrupt one logs ERROR. Refusing all traffic because a data file vanished is
+    exactly the outage this asymmetry avoids — don't "make them consistent".
+  - **`EXTERNAL_FRONTEND` / `EXTERNAL_ADMIN` are exempt automatically**, plus
+    `CPROXY_CLOUDRANGE_EXEMPT_IPS`. The portal's own host sits at a hosting provider whose space a
+    feed can legitimately cover, so without this the first refresh could take the site offline.
+    Third hatch: `CPROXY_BLOCK_CLOUD_IPS=false` (no redeploy), mirroring the frontend's
+    `BlockCloudProviderIps`.
+  - **Refresher** (`cloud_range_refresh.*`): in-process thread, **fortnightly** (336h, configurable),
+    mirroring `envfish-db/mssql/tools/Update-CloudProviderRanges.ps1` feed for feed — AWS, GCP,
+    Oracle, DigitalOcean, the weekly Azure ServiceTags file (link scraped from the download page),
+    and RIPEstat announced-prefixes for Alibaba/Linode/Vultr/Hetzner/OVH/Scaleway/Tencent. Both
+    quirks that script documents are carried across (GCP entries with no `ipv4Prefix`; DO's CSV with
+    no text content-type). Providers that succeeded are replaced in one transaction with `disabled`
+    overrides preserved per `(provider, cidr)`; a failed feed keeps its own rows; if every feed
+    fails the DB is untouched. Waits on a condition variable so shutdown never blocks on the timer.
+    Does **not** refresh on boot by default — a redeploy loop would hammer the feeds for data that
+    moves on the order of weeks.
+  - **TLS turned ON, reversing a deliberate decision.** `HTTPLIB_USE_OPENSSL_IF_AVAILABLE` was off
+    ("lean binary; cproxy speaks plain HTTP to internal upstreams") and that reasoning still holds
+    for the proxy path, which is unchanged. But every provider feed is HTTPS-only. Accepted
+    knowingly: libssl joins libcrypto, the image grows, **`ca-certificates` becomes load-bearing**
+    (without the trust store every fetch fails cert verification), and the proxy now makes outbound
+    internet calls it never made. nlohmann/json v3.11.3 (header-only) added to parse the feeds.
+  - Tests: new `cloud_range_store_test` (IPv4 parsing incl. rejecting leading-zero/port/CIDR forms,
+    CIDR expansion incl. `/0` and `/32` and host-bit masking, coalescing of nested/overlapping/
+    adjacent ranges and the top-of-space wrap guard, boundary-exact lookups, `disabled` rows
+    ignored, and a failed reload keeping the previous set); `proxy_test` gains
+    `datacenter_ip_is_refused_with_500` (incl. proof it runs before the method allow-list, so the
+    block can't be probed by method) and `datacenter_block_has_escape_hatches`. **6 suites, all
+    passing** in the Docker build. Every address in the tests is RFC 5737/1918.
+  - **Verified live (2026-09-02, Docker):** real container, real feeds, all **12 providers fetched
+    successfully** — AWS 10,520 · GCP 1,003 · Azure 69,064 · Oracle 1,107 · DigitalOcean 1,080 ·
+    Alibaba 2,193 · Linode 349 · Vultr 1,723 · Hetzner 481 · OVH 715 · Scaleway 20 · Tencent 3,378.
+    91,633 rows written (8.6 MB SQLite), read back and coalesced to 3,914 intervals; `/health` →
+    `0.8.0`. The Azure download-page scrape — the fragile one — worked.
+  - **Deploy note (NOT deployed):** needs `CPROXY_CLOUDRANGE_DB` pointed at a **writable** path on
+    the volume; the container runs `read_only: true`, so the range DB must live on a bind mount
+    (alongside the day-key DB), not in the image. Until the first refresh completes nothing is
+    blocked. Consider setting `CPROXY_CLOUDRANGE_REFRESH_ON_START=true` for the first deploy only,
+    and confirm `EXTERNAL_FRONTEND` is set before enabling — that exemption is what keeps the portal
+    reachable.
+
 - 2026-09-01: **0.7.0 — the day-key now also gates a READ: `GET /api/v1/news/default`; plus the
   `CPROXY_LOG_DIR=""` console-only switch is fixed (it never worked) → `CPROXY_LOG_DIR=NONE`. BUILT
   AND VERIFIED LOCALLY, NOT DEPLOYED.**

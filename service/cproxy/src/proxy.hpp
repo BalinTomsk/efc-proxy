@@ -2,6 +2,7 @@
 
 #include <httplib.h>
 
+#include "cloud_range_store.hpp"
 #include "config.hpp"
 
 namespace cproxy {
@@ -27,9 +28,19 @@ namespace cproxy {
  * error to anyone probing the endpoint. This is orthogonal to CPROXY_ALLOWED_METHODS: POST/PATCH must
  * still be in the allow-list for a request to reach this check at all.
  *
+ * A request whose peer address falls in `cfg.cloudrange_db_path`'s datacenter ranges is refused
+ * with the same generic 500 before any other guard runs — see CloudRangeStore. Exempt addresses
+ * (the frontend host, the admin IP, `CPROXY_CLOUDRANGE_EXEMPT_IPS`) short-circuit first, and
+ * `CPROXY_BLOCK_CLOUD_IPS=false` disables the refusal without a redeploy.
+ *
  * Each call creates its own breaker and counters, so several proxies can coexist in one process.
  * `cfg` must outlive `server` (the handlers hold a reference to it).
+ *
+ * `shared_ranges`, when non-null, is used INSTEAD of a privately-loaded range set, so the refresh
+ * thread's atomic swap is seen by live traffic without a restart. It must outlive `server`. Tests
+ * pass nullptr and get a private store loaded from the config path.
  */
-void install_routes(httplib::Server& server, const Config& cfg);
+void install_routes(httplib::Server& server, const Config& cfg,
+                    CloudRangeStore* shared_ranges = nullptr);
 
 }  // namespace cproxy

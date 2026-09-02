@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.7.0 LANGUAGES CXX)
+project(cproxy VERSION 0.8.0 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -11,12 +11,17 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # --- HTTP engine: cpp-httplib (header-only server + client) -------------------
-# Pinned to a release tag for reproducible builds. Keep the optional TLS/zlib/brotli
-# integrations OFF: cproxy speaks plain HTTP to the internal upstreams, so a lean
-# binary with no libssl/libz runtime dependency is preferred. TLS termination for the
-# public edge is a fronting concern (added later), not this process's job yet.
+# Pinned to a release tag for reproducible builds.
+#
+# TLS is ON as of 0.8.0. It was deliberately OFF before ("cproxy speaks plain HTTP to the internal
+# upstreams, so a lean binary with no libssl runtime dependency is preferred"), and that reasoning
+# still holds for the PROXY path — which is unchanged and still plain HTTP to docapi over the VPC.
+# What changed is that the cloud-range refresher fetches provider feeds (AWS/GCP/Azure/Oracle/DO and
+# RIPEstat) directly, and every one of those is HTTPS-only. Cost of the reversal, accepted knowingly:
+# libssl joins libcrypto as a runtime dependency, the image grows, and the proxy now makes outbound
+# internet calls it never used to. Zlib/brotli stay OFF — nothing needs them.
 include(FetchContent)
-set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE ON  CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_ZLIB_IF_AVAILABLE   OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
@@ -25,6 +30,17 @@ FetchContent_Declare(
   GIT_TAG        v0.15.3
 )
 FetchContent_MakeAvailable(httplib)
+
+# --- JSON: nlohmann/json (header-only) ----------------------------------------
+# Needed only by the cloud-range refresher to parse the provider feeds. Header-only, so it adds
+# nothing to the runtime image.
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3
+)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(nlohmann_json)
 
 find_package(Threads REQUIRED)
 
@@ -45,6 +61,8 @@ configure_file(
 # --- Core library (config + proxy) so it can be unit-tested apart from main() --
 add_library(cproxy_core STATIC
   src/breaker.cpp
+  src/cloud_range_refresh.cpp
+  src/cloud_range_store.cpp
   src/config.cpp
   src/day_key_store.cpp
   src/dotenv.cpp
@@ -56,7 +74,10 @@ target_include_directories(cproxy_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
-target_link_libraries(cproxy_core PUBLIC httplib::httplib Threads::Threads OpenSSL::Crypto SQLite::SQLite3)
+# OpenSSL::SSL joins libcrypto now that the refresher fetches provider feeds over HTTPS.
+target_link_libraries(cproxy_core PUBLIC
+  httplib::httplib Threads::Threads OpenSSL::SSL OpenSSL::Crypto SQLite::SQLite3
+  nlohmann_json::nlohmann_json)
 target_compile_options(cproxy_core PRIVATE -Wall -Wextra)
 
 # --- Service executable -------------------------------------------------------
@@ -84,3 +105,7 @@ add_test(NAME breaker_test COMMAND breaker_test)
 add_executable(day_key_store_test tests/day_key_store_test.cpp)
 target_link_libraries(day_key_store_test PRIVATE cproxy_core)
 add_test(NAME day_key_store_test COMMAND day_key_store_test)
+
+add_executable(cloud_range_store_test tests/cloud_range_store_test.cpp)
+target_link_libraries(cloud_range_store_test PRIVATE cproxy_core)
+add_test(NAME cloud_range_store_test COMMAND cloud_range_store_test)
