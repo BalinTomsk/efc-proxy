@@ -26,9 +26,10 @@ namespace cproxy {
  * | CPROXY_BREAKER_THRESHOLD    | 5 (0 = disabled)              | consecutive upstream failures to open     |
  * | CPROXY_BREAKER_COOLDOWN_MS  | 5000                          | fail-fast window before a probe is allowed |
  * | CPROXY_UPSTREAM_RETRY       | 1 (0 = off)                   | retry idempotent requests once on transport failure |
- * | CPROXY_LOG_DIR              | logs                          | rolling-log directory ("" = stdout only)  |
+ * | CPROXY_LOG_DIR              | logs                          | rolling-log directory ("NONE" = stdout only) |
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
  * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; POST/PATCH always 500 while empty |
+ * | CPROXY_DAYKEY_PATHS         | /news/default                 | CSV of paths day-key gated on EVERY method, GET included ("NONE" disables) |
  */
 struct Config {
     std::string listen_addr = "0.0.0.0";
@@ -47,20 +48,39 @@ struct Config {
     // A pooled keep-alive connection can be closed by the upstream while idle, so the first send
     // on it fails through no fault of the request; one retry hides that. Idempotent methods only.
     int upstream_retry = 1;
-    std::string log_dir = "logs";  // "" => console only; the Docker image sets an absolute path
-    int log_max_history = 7;       // days of rolled log files to keep
+    // Rolling-log directory; the Docker image sets an absolute path. Empty means console only, but
+    // the way to ASK for that is CPROXY_LOG_DIR=NONE — an empty env value reads as "unset" and
+    // leaves this default standing (see load_config).
+    std::string log_dir = "logs";
+    int log_max_history = 7;  // days of rolled log files to keep
 
     // Path to the day-key SQLite database (see DayKeyStore). Empty means day-key auth is not
     // configured, so every PATCH request fails closed with 500 regardless of CPROXY_ALLOWED_METHODS.
     std::string daykey_db_path;
 
+    // Paths that require the day-key on EVERY method, not just the write surface — the way to put a
+    // read endpoint behind the rotating credential. Stored lower-case, leading '/', no trailing '/'.
+    // Defaults to the assembled news home page, which is expensive to build and has no business
+    // being scraped anonymously; ops can widen the list via CPROXY_DAYKEY_PATHS, or turn the path
+    // gate off with CPROXY_DAYKEY_PATHS=NONE (an empty value would read as "unset" — see load_config).
+    std::vector<std::string> daykey_paths = {"/news/default"};
+
+    /** Case-insensitive method allow-list check. Empty allow-list => everything permitted. */
+    bool method_allowed(const std::string& method) const;
+
+    /**
+     * True when this request must present a valid X-Day-Guid: the whole write surface (POST/PATCH)
+     * regardless of path, plus any path in daykey_paths regardless of method.
+     */
+    bool daykey_required(const std::string& method, const std::string& path) const;
+
+    /** True when `path` is at or under one of the daykey_paths entries. */
+    bool daykey_gated_path(const std::string& path) const;
+
     // Values typically supplied via an encrypted dotenv on the volume (EXTERNAL_ADMIN / EXTERNAL_FRONTEND);
     // decrypted at load time. Empty when not configured.
     std::string external_admin;     // e.g. an admin source IP (secret)
     std::string external_frontend;  // e.g. the frontend host
-
-    /** Case-insensitive method allow-list check. Empty allow-list => everything permitted. */
-    bool method_allowed(const std::string& method) const;
 
     /** True when CPROXY_API_KEY is set and callers must present a matching X-API-Key. */
     bool auth_required() const { return !api_key.empty(); }

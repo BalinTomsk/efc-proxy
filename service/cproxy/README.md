@@ -57,24 +57,31 @@ probing is visible.
 | `CPROXY_ROUTE_PREFIX` | `/api/` | path prefix forwarded to docapi |
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
-| `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db gating POST/PATCH; empty ⇒ POST/PATCH always `500` |
+| `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
+| `CPROXY_DAYKEY_PATHS` | `/news/default` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
 | `CPROXY_MAX_PAYLOAD_BYTES` | `1048576` | request bodies above this are rejected with `413` |
 | `CPROXY_BREAKER_THRESHOLD` | `5` | consecutive upstream failures before failing fast (`0` disables) |
 | `CPROXY_BREAKER_COOLDOWN_MS` | `5000` | how long the breaker stays open before allowing one probe |
 | `CPROXY_UPSTREAM_RETRY` | `1` | retry idempotent requests once on a transport failure (`0` disables) |
-| `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `""` = console-only |
+| `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `NONE` = console-only (an empty value reads as unset) |
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
 
 See `.env.example`. No config file — everything is env, so one image runs anywhere.
+
+**An empty value always means "use the default."** `getenv() == ""` is indistinguishable from unset,
+so every switch spells its *off* state as a word instead: `CPROXY_ALLOWED_METHODS=ALL`,
+`CPROXY_DAYKEY_PATHS=NONE`, `CPROXY_LOG_DIR=NONE` (case-insensitive, trimmed). `-e CPROXY_LOG_DIR=`
+does **not** turn file logging off — it falls back to `logs`.
 
 ## Logging
 
 Same functionality as the sibling `waterservice`: structured **JSON** lines to **both** the console
 (`docker logs`) and a **daily-rolling file** with bounded retention. The active file is
 `<CPROXY_LOG_DIR>/cproxy.log`; at the first write of each new UTC day it rolls to
-`cproxy.<YYYY-MM-DD>.log` and files older than `CPROXY_LOG_MAX_HISTORY` days are pruned. In production
+`cproxy.<YYYY-MM-DD>.log` and files older than `CPROXY_LOG_MAX_HISTORY` days are pruned. Set
+`CPROXY_LOG_DIR=NONE` for console-only. In production
 the log directory is a   bind-mounted at `/var/log/cproxy`, so logs survive
 container redeploys and reboots.
 
@@ -158,19 +165,31 @@ The container itself runs from `deploy/compose.yml` (kept at `/opt/cproxy/compos
 image **pinned by digest**, `read_only` rootfs, `cap_drop: ALL`, `no-new-privileges`, restart policy,
 and the log/secret bind mounts — replacing the previous hand-typed `docker run`.
 
-### Day-key store (the write surface's credential)
+### Day-key store (the rotating credential)
 
-`POST` and `PATCH` requests (the gate applies to every POST/PATCH, not a specific path — every
-docapi write, from `river/fish/{guid}` PATCH to `river/regulation/{guid}` and
-`region/regulation/{country}[/{state}]` PATCH, clears the same check) are gated by a **second,
-independent** control on
-top of `CPROXY_API_KEY`/`CPROXY_ALLOWED_METHODS`: a per-day rotating GUID read from a small read-only
-SQLite database at `CPROXY_DAYKEY_DB` (`day_keys(day_of_year, guid)`, exactly 365 rows). A caller
-sends the current UTC day's GUID in `X-Day-Guid` (a ±1-day window is accepted); a wrong or missing
-value answers a plain `500`, never `401` — the failure looks identical to an ordinary server error to
-anyone probing it. The database is generated out-of-band (never from source) and deployed like any
-other secret — see `secret/daykeys.sqlite` (gitignored) and `CLAUDE.md` → "Day-key store" for the
-full design and deploy path.
+Some requests are gated by a **second, independent** control on top of
+`CPROXY_API_KEY`/`CPROXY_ALLOWED_METHODS`: a per-day rotating GUID read from a small read-only SQLite
+database at `CPROXY_DAYKEY_DB` (`day_keys(day_of_year, guid)`, exactly 365 rows). A caller sends the
+current UTC day's GUID in `X-Day-Guid` (a ±1-day window is accepted); a wrong or missing value
+answers a plain `500`, never `401` — the failure looks identical to an ordinary server error to
+anyone probing it.
+
+Two arms decide what is gated, and either one is enough:
+
+- **The whole write surface, by method** — every `POST` and `PATCH`, whatever the path, so every
+  docapi write (`river/fish/{guid}`, `river/regulation/{guid}`,
+  `region/regulation/{country}[/{state}]`, and anything added later) clears the same check with no
+  configuration.
+- **Named paths, by path** — `CPROXY_DAYKEY_PATHS`, default `/news/default`. This is how a **read**
+  is put behind the credential: `GET /api/v1/news/default` assembles the whole news home page
+  upstream, and being a `GET` is not a reason to hand it to anonymous scrapers. Matching is on the
+  path tail (so an entry works at any route prefix), case-folded, trailing-slash-insensitive, and
+  covers anything nested underneath. Set `CPROXY_DAYKEY_PATHS=NONE` to turn this arm off — an empty
+  value reads as *unset* and leaves the default in place.
+
+The database is generated out-of-band (never from source) and deployed like any other secret — see
+`secret/daykeys.sqlite` (gitignored) and `CLAUDE.md` → "Day-key store" for the full design and deploy
+path.
 
 ## Tests
 

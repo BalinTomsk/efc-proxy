@@ -2,6 +2,7 @@
 // Framework-free like config_test; registered with CTest (also executed inside the Docker build).
 #include "check.hpp"
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <mutex>
 #include <set>
@@ -9,8 +10,10 @@
 #include <thread>
 
 #include <httplib.h>
+#include <sqlite3.h>
 
 #include "config.hpp"
+#include "day_key_store.hpp"
 #include "proxy.hpp"
 
 using namespace cproxy;
@@ -43,6 +46,31 @@ void install_fake_upstream(httplib::Server& s) {
         res.set_header("X-Got-Reqid", req.get_header_value("X-Request-Id"));
         res.set_content("upstream:" + req.target, "text/plain");
     });
+}
+
+/**
+ * A day-key database whose 365 rows all hold the SAME guid, so `guid` is the valid key no matter
+ * what day the test runs on. day_key_store_test covers which row is picked for which date; this
+ * file only needs "a key that works today" to exercise the proxy's gate.
+ */
+void write_uniform_day_key_db(const std::string& path, const std::string& guid) {
+    std::remove(path.c_str());
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+                       "CREATE TABLE day_keys (day_of_year INTEGER PRIMARY KEY, guid TEXT NOT NULL)",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_stmt* stmt = nullptr;
+    CHECK(sqlite3_prepare_v2(db, "INSERT INTO day_keys (day_of_year, guid) VALUES (?, ?)", -1, &stmt,
+                             nullptr) == SQLITE_OK);
+    for (int i = 0; i < DayKeyStore::kDays; ++i) {
+        sqlite3_reset(stmt);
+        sqlite3_bind_int(stmt, 1, i + 1);
+        sqlite3_bind_text(stmt, 2, guid.c_str(), -1, SQLITE_TRANSIENT);
+        CHECK(sqlite3_step(stmt) == SQLITE_DONE);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
 }
 
 void health_is_local() {
@@ -267,6 +295,81 @@ void post_and_patch_require_day_key() {
     CHECK(patch->body.find("internal_error") != std::string::npos);
 }
 
+// GET /news/default is day-key gated by config default: the credential is no longer only about
+// mutating state, it also fences off a read that is expensive to assemble upstream. Everything here
+// is a GET, so nothing in the method arm of the gate is doing the work.
+void gated_read_path_requires_day_key() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    const std::string db = "proxy_test_day_keys.sqlite";
+    write_uniform_day_key_db(db, "TEST-DAY-KEY");
+
+    Config cfg;  // daykey_paths defaults to {"/news/default"}
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    cfg.daykey_db_path = db;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+
+    // No key, wrong key: the generic 500, indistinguishable from an ordinary server error.
+    auto bare = cli.Get("/api/v1/news/default");
+    CHECK(bare && bare->status == 500);
+    CHECK(bare->body.find("internal_error") != std::string::npos);
+    CHECK(bare->body.find("day") == std::string::npos);  // the reason must not leak into the body
+    auto wrong = cli.Get("/api/v1/news/default", {{"X-Day-Guid", "nope"}});
+    CHECK(wrong && wrong->status == 500);
+
+    // The current day's key gets through, and the request still reaches the upstream intact.
+    auto ok = cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}});
+    CHECK(ok && ok->status == 200);
+    CHECK(ok->body == "upstream:/api/v1/news/default");
+
+    // Trailing slash, casing, a query string, and a nested sub-path are all still gated.
+    CHECK(cli.Get("/api/v1/news/default/")->status == 500);
+    CHECK(cli.Get("/api/v1/News/Default")->status == 500);
+    CHECK(cli.Get("/api/v1/news/default?country=CA")->status == 500);
+    CHECK(cli.Get("/api/v1/news/default/extra")->status == 500);
+
+    // Traversal must not be able to re-point a request past the gate: the tail here is "/default",
+    // which would clear a naive suffix match, but a Spring upstream normalizes it straight back to
+    // the gated endpoint. The dot-dot rejection runs first, so it never reaches the gate at all.
+    auto dodge = cli.Get("/api/v1/news/default/../default");
+    CHECK(dodge && dodge->status == 400);
+
+    // Sibling news reads are untouched — no key, still served.
+    auto list = cli.Get("/api/v1/news/list?country=CA");
+    CHECK(list && list->status == 200);
+    CHECK(list->body == "upstream:/api/v1/news/list?country=CA");
+    auto fish = cli.Get("/api/v1/fish?water=fresh");
+    CHECK(fish && fish->status == 200);
+
+    std::remove(db.c_str());
+}
+
+// Turning the path gate off (CPROXY_DAYKEY_PATHS=NONE) must actually open the read back up,
+// otherwise there is no way to roll the protection back without shipping a new binary.
+void gated_read_path_can_be_disabled() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    cfg.daykey_paths.clear();  // what CPROXY_DAYKEY_PATHS=NONE produces
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto r = cli.Get("/api/v1/news/default");
+    CHECK(r && r->status == 200);
+    CHECK(r->body == "upstream:/api/v1/news/default");
+}
+
 void upstream_down_is_502_and_unknown_path_is_404() {
     Config cfg;
     cfg.docapi_upstream = "http://127.0.0.1:1";  // nothing listens there
@@ -399,6 +502,8 @@ int main() {
     request_bodies_are_forwarded();
     content_type_is_forwarded();
     post_and_patch_require_day_key();
+    gated_read_path_requires_day_key();
+    gated_read_path_can_be_disabled();
     upstream_down_is_502_and_unknown_path_is_404();
     ready_reports_upstream_state_and_breaker_fails_fast();
     metrics_expose_counters();

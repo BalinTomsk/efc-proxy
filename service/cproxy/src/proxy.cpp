@@ -63,9 +63,9 @@ struct Metrics {
 struct ProxyState {
     CircuitBreaker breaker;
     Metrics metrics;
-    // Loaded best-effort: a missing/malformed day-key database must not take down the read-only GET
-    // surface, so a load failure here just leaves this empty — every PATCH then fails closed (500)
-    // rather than the whole process refusing to start. See proxy_to_docapi's PATCH gate.
+    // Loaded best-effort: a missing/malformed day-key database must not take down the ungated GET
+    // surface, so a load failure here just leaves this empty — every gated request then fails closed
+    // (500) rather than the whole process refusing to start. See proxy_to_docapi's day-key gate.
     std::optional<DayKeyStore> daykey_store;
 
     explicit ProxyState(const Config& cfg)
@@ -208,13 +208,37 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         return;
     }
 
-    // The write surface (POST, PATCH) additionally requires a per-day rotating credential — see
-    // DayKeyStore. Deliberately answered with a generic 500, not 401/403: a wrong or missing
-    // day-key must not read any differently from an ordinary server error to a caller probing it.
+    // Forward the RAW request target (exact bytes from the request line) so no decode/re-encode
+    // round trip happens at the proxy; fall back to a rebuild if the server didn't capture it.
+    std::string target = req.target.empty() ? forward_target(req) : req.target;
+    const std::string target_path = target.substr(0, target.find('?'));
+    // Dot-dot segments must die here: the upstream may normalize them and escape the route prefix
+    // (e.g. /api/../actuator on a Spring upstream). req.path is the decoded form (catches %2e%2e);
+    // the raw target's path portion catches the plain form.
+    //
+    // This runs BEFORE the day-key gate below, and must stay there. The gate matches on the tail of
+    // the path, so traversal cannot strip a gated suffix off — but it can ADD one past it:
+    // /api/v1/news/default/../default ends in "/default", clears a tail match on "/news/default",
+    // and still normalizes back to the gated endpoint at a Spring upstream. Rejecting dot-dot first
+    // means no request that reaches the gate can be re-pointed after it.
+    if (has_dotdot_segment(req.path) || has_dotdot_segment(target_path)) {
+        write_error(res, 400, "bad_request", "Path traversal is not allowed");
+        log_request(std::format("{} {} -> 400 (dot-dot path)", req.method, req.path),
+                    req.remote_addr, rid);
+        return;
+    }
+
+    // The write surface (POST, PATCH) plus any path in CPROXY_DAYKEY_PATHS additionally requires a
+    // per-day rotating credential — see DayKeyStore. Deliberately answered with a generic 500, not
+    // 401/403: a wrong or missing day-key must not read any differently from an ordinary server
+    // error to a caller probing it.
     // POST joined PATCH here when docapi's regulation endpoints (insert, not just merge-patch) were
     // fronted through cproxy — every method that mutates docapi state must clear the same gate, not
-    // just PATCH.
-    if (iequals(req.method, "POST") || iequals(req.method, "PATCH")) {
+    // just PATCH. The path arm came later, to put READ endpoints behind the same credential
+    // (/news/default first): expensive to assemble, and nothing about GET makes free scraping of it
+    // acceptable. Both the decoded path and the raw target are tested, and either one matching
+    // gates the request — the union is the fail-secure direction.
+    if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const bool ok = state.daykey_store.has_value() &&
                         state.daykey_store->is_valid(req.get_header_value("X-Day-Guid"),
                                                      std::chrono::system_clock::now());
@@ -224,19 +248,6 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
                         req.remote_addr, rid);
             return;
         }
-    }
-
-    // Forward the RAW request target (exact bytes from the request line) so no decode/re-encode
-    // round trip happens at the proxy; fall back to a rebuild if the server didn't capture it.
-    std::string target = req.target.empty() ? forward_target(req) : req.target;
-    // Dot-dot segments must die here: the upstream may normalize them and escape the route prefix
-    // (e.g. /api/../actuator on a Spring upstream). req.path is the decoded form (catches %2e%2e);
-    // the raw target's path portion catches the plain form.
-    if (has_dotdot_segment(req.path) || has_dotdot_segment(target.substr(0, target.find('?')))) {
-        write_error(res, 400, "bad_request", "Path traversal is not allowed");
-        log_request(std::format("{} {} -> 400 (dot-dot path)", req.method, req.path),
-                    req.remote_addr, rid);
-        return;
     }
 
     // Fail fast while the breaker is open: an outage would otherwise make every request pay the
