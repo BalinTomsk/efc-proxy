@@ -3,24 +3,41 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:1d3621568162c2b95a00cbcad38337f0b7f04890f6100ef13413013aa496905a  # 0.6.1 pinned by digest
+    image: ghcr.io/balintomsk/cproxy@sha256:38a734f25b227141e8110d2f4bac2b404b6d8597da29101d4b76a2fa1a4ecc93  # 0.8.0 pinned by digest
     container_name: cproxy
     restart: unless-stopped
     ports:
       - "80:8080"                                        # public edge; inbound restricted by cproxy-firewall.service (DOCKER-USER allowlist)
     environment:
-      CPROXY_DOCAPI_UPSTREAM: http://<docapi-vpc>:8080     # docapi over the DO VPC (private, not on the public internet)
+      # CPROXY_DOCAPI_UPSTREAM is deliberately NOT set here. This repo is public, so the docapi VPC
+      # address cannot live in a tracked file — and this file is deployed VERBATIM to
+      # /opt/cproxy/compose.yml, so a <placeholder> here is not documentation, it is an outage:
+      # cproxy would try to resolve the literal placeholder and answer every /api/* call with 502.
+      # (That is exactly what happened on 2026-09-02.) The real value is supplied by the dotenv on
+      # the volume, /mnt/volume_cnode/cproxy/.env, alongside EXTERNAL_ADMIN / EXTERNAL_FRONTEND.
+      # A real process env var would win over the dotenv, which is why this must stay unset.
       CPROXY_ROUTE_PREFIX: /api/
       CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the day-key below, not open
       CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating credential for POST/PATCH (see DayKeyStore)
       CPROXY_DOTENV_PATH: /etc/cproxy/.env
       FF_MASTER_KEY_FILE: /etc/cproxy/master.key
+      # Datacenter/cloud-provider blocking. The path MUST be on a writable bind mount: the rootfs is
+      # read_only and the refresher rewrites this database in place every fortnight.
+      CPROXY_CLOUDRANGE_DB: /var/lib/cproxy/cloudranges.sqlite
+      # CPROXY_CLOUDRANGE_REFRESH_ON_START is intentionally NOT set. It was on for the first deploy
+      # only, to populate the database immediately instead of waiting out the 336h timer. The
+      # database lives on the volume and survives redeploys, so leaving it on would just re-pull
+      # ~92k prefixes from twelve third-party feeds on every container restart.
+      # Exempt addresses are NOT listed here - this file is tracked in a public repo. EXTERNAL_ADMIN
+      # and EXTERNAL_FRONTEND are exempt automatically; anything else goes in the encrypted .env as
+      # CPROXY_CLOUDRANGE_EXEMPT_IPS.
     volumes:
       - /mnt/volume_cnode/cproxy/.env:/etc/cproxy/.env:ro
       - /mnt/volume_cnode/cproxy/master.key:/etc/cproxy/master.key:ro
       - /mnt/volume_cnode/cproxy/daykeys/daykeys.sqlite:/etc/cproxy/daykeys.sqlite:ro  # own folder, same volume as logs
       - /mnt/volume_cnode/cproxy/logs:/var/log/cproxy    # rolling logs persist on volume-cnode
-    read_only: true                                      # binary writes only to the log bind mount
+      - /mnt/volume_cnode/cproxy/cloudranges:/var/lib/cproxy  # rw: the refresher rewrites the range db here
+    read_only: true                                      # binary writes only to the two rw bind mounts
     cap_drop: [ALL]                                      # binds unprivileged 8080 in-container; needs no capabilities
     security_opt:
       - no-new-privileges:true

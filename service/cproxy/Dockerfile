@@ -27,9 +27,11 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 
 # ---- runtime stage ----------------------------------------------------------
 FROM debian:trixie-slim
-# wget for the HEALTHCHECK; openssl pulls libcrypto (runtime dep of the secret codec); libsqlite3-0
-# is the day-key store's runtime dependency; ca-certificates for good measure. libstdc++6 ships in
-# the base.
+# wget for the HEALTHCHECK; openssl pulls libcrypto AND libssl (the secret codec needs libcrypto;
+# libssl is required from 0.8.0 because the cloud-range refresher fetches provider feeds over
+# HTTPS); libsqlite3-0 backs both the day-key and cloud-range stores. ca-certificates is NOT
+# optional any more — without the trust store every provider feed fetch fails certificate
+# verification. libstdc++6 ships in the base.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends wget ca-certificates openssl libsqlite3-0 \
  && rm -rf /var/lib/apt/lists/*

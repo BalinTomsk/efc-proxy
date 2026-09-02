@@ -12,6 +12,7 @@
 #include <httplib.h>
 #include <sqlite3.h>
 
+#include "cloud_range_store.hpp"
 #include "config.hpp"
 #include "day_key_store.hpp"
 #include "proxy.hpp"
@@ -370,6 +371,101 @@ void gated_read_path_can_be_disabled() {
     CHECK(r->body == "upstream:/api/v1/news/default");
 }
 
+// A REST call from datacenter space is refused with 500 before anything else runs. The tests
+// connect over loopback, so 127.0.0.1 is the peer address and the range under test has to cover it
+// — every other address here is an RFC 5737 documentation one.
+void datacenter_ip_is_refused_with_500() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    cfg.daykey_paths.clear();  // isolate this from the day-key gate
+
+    CloudRangeStore ranges;
+    ranges.replace({{*parse_ipv4("127.0.0.0"), *parse_ipv4("127.0.0.255")}});
+
+    TestServer proxy;
+    install_routes(proxy.server, cfg, &ranges);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto blocked = cli.Get("/api/v1/fish");
+    CHECK(blocked && blocked->status == 500);
+    CHECK(blocked->body.find("internal_error") != std::string::npos);
+    // The reason must not leak — a caller probing the gateway cannot tell this from a real fault.
+    CHECK(blocked->body.find("datacenter") == std::string::npos);
+    CHECK(blocked->body.find("ip") == std::string::npos);
+
+    // It runs BEFORE the method allow-list: a disallowed method from a blocked IP still reads as
+    // 500, not 405, so the block cannot be probed by watching which methods answer differently.
+    Config restricted = cfg;
+    restricted.allowed_methods = {"GET"};
+    TestServer proxy2;
+    install_routes(proxy2.server, restricted, &ranges);
+    proxy2.start();
+    httplib::Client cli2("127.0.0.1", proxy2.port);
+    auto post = cli2.Post("/api/v1/fish", "x", "text/plain");
+    CHECK(post && post->status == 500);
+}
+
+// Three independent escape hatches, because a wrong range here takes the portal offline: the
+// kill-switch, the exempt list, and an empty store.
+void datacenter_block_has_escape_hatches() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+    const std::string upstream = "http://127.0.0.1:" + std::to_string(up.port);
+
+    CloudRangeStore ranges;
+    ranges.replace({{*parse_ipv4("127.0.0.0"), *parse_ipv4("127.0.0.255")}});
+
+    // 1. CPROXY_BLOCK_CLOUD_IPS=false — ranges still loaded, nothing refused.
+    {
+        Config cfg;
+        cfg.docapi_upstream = upstream;
+        cfg.daykey_paths.clear();
+        cfg.cloudrange_block_enabled = false;
+        TestServer proxy;
+        install_routes(proxy.server, cfg, &ranges);
+        proxy.start();
+        httplib::Client cli("127.0.0.1", proxy.port);
+        auto r = cli.Get("/api/v1/fish");
+        CHECK(r && r->status == 200);
+    }
+
+    // 2. The exempt list. external_frontend is exempt automatically: the portal's own host sits at
+    //    a hosting provider, so without this the block would take the site down.
+    {
+        Config cfg;
+        cfg.docapi_upstream = upstream;
+        cfg.daykey_paths.clear();
+        cfg.external_frontend = "127.0.0.1";
+        CHECK(cfg.cloudrange_exempt("127.0.0.1"));
+        TestServer proxy;
+        install_routes(proxy.server, cfg, &ranges);
+        proxy.start();
+        httplib::Client cli("127.0.0.1", proxy.port);
+        auto r = cli.Get("/api/v1/fish");
+        CHECK(r && r->status == 200);
+    }
+
+    // 3. An empty store blocks nothing — the state after a failed load or before the first refresh.
+    {
+        Config cfg;
+        cfg.docapi_upstream = upstream;
+        cfg.daykey_paths.clear();
+        CloudRangeStore empty;
+        TestServer proxy;
+        install_routes(proxy.server, cfg, &empty);
+        proxy.start();
+        httplib::Client cli("127.0.0.1", proxy.port);
+        auto r = cli.Get("/api/v1/fish");
+        CHECK(r && r->status == 200);
+    }
+}
+
 void upstream_down_is_502_and_unknown_path_is_404() {
     Config cfg;
     cfg.docapi_upstream = "http://127.0.0.1:1";  // nothing listens there
@@ -504,6 +600,8 @@ int main() {
     post_and_patch_require_day_key();
     gated_read_path_requires_day_key();
     gated_read_path_can_be_disabled();
+    datacenter_ip_is_refused_with_500();
+    datacenter_block_has_escape_hatches();
     upstream_down_is_502_and_unknown_path_is_404();
     ready_reports_upstream_state_and_breaker_fails_fast();
     metrics_expose_counters();

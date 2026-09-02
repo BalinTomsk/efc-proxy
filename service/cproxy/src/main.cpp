@@ -7,6 +7,8 @@
 
 #include <httplib.h>
 
+#include "cloud_range_refresh.hpp"
+#include "cloud_range_store.hpp"
 #include "config.hpp"
 #include "dotenv.hpp"
 #include "log.hpp"
@@ -63,7 +65,14 @@ int main() {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    cproxy::install_routes(server, cfg);
+    // One range set shared by the request path and the refresh thread: the refresher swaps it
+    // atomically, so new ranges take effect without a restart and no reader ever blocks.
+    // Declared before install_routes so it outlives the handlers that capture a pointer to it.
+    cproxy::CloudRangeStore cloud_ranges;
+    cproxy::install_routes(server, cfg, &cloud_ranges);
+
+    cproxy::CloudRangeRefresher refresher(cfg, cloud_ranges);
+    refresher.start();
 
     // external_admin / external_frontend are secret (encrypted at rest) — log only their presence.
     cproxy::log_raw(std::format(

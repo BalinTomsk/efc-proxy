@@ -7,6 +7,10 @@
 
 namespace cproxy {
 
+// Defined in cloud_range_refresh.cpp. Forward-declared rather than included: that header pulls in
+// httplib/json and depends on this one, so including it here would be circular.
+std::vector<std::string> known_cloud_providers();
+
 namespace {
 
 std::string to_upper(std::string s) {
@@ -53,6 +57,29 @@ int get_int(const EnvLookup& env, const char* name, int fallback) {
  * request the upstream would have 404'd is nothing, while the cost of letting "/News/Default"
  * through on an upstream that happens to route case-insensitively is the whole point of the gate.
  */
+/** Parses a CSV env value into trimmed, non-empty tokens. */
+std::vector<std::string> split_csv(const std::string& value) {
+    std::vector<std::string> out;
+    std::istringstream ss(value);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        auto t = trim(tok);
+        if (!t.empty()) out.push_back(t);
+    }
+    return out;
+}
+
+/** "false"/"0"/"no"/"off" are false; anything else keeps the default. Mirrors the frontend's
+ *  true/`false`/`0` appSetting convention for BlockCloudProviderIps. */
+bool get_bool(const EnvLookup& env, const char* name, bool fallback) {
+    auto v = env(name);
+    if (!v || trim(*v).empty()) return fallback;
+    const std::string s = to_upper(trim(*v));
+    if (s == "FALSE" || s == "0" || s == "NO" || s == "OFF") return false;
+    if (s == "TRUE" || s == "1" || s == "YES" || s == "ON") return true;
+    return fallback;
+}
+
 std::string normalize_gate_path(std::string s) {
     s = to_lower(trim(s));
     if (s.empty()) return s;
@@ -85,6 +112,18 @@ bool Config::daykey_gated_path(const std::string& path) const {
         if (norm.ends_with(entry) || norm.contains(entry + "/")) return true;
     }
     return false;
+}
+
+bool Config::cloudrange_exempt(const std::string& ip) const {
+    if (ip.empty()) return false;
+    // The frontend host and the admin address are exempt unconditionally. Both are ordinary
+    // hosting/ISP addresses that a provider feed can legitimately cover, and blocking either would
+    // take the portal (or our own access to it) down — the same reason the frontend's allowlist
+    // short-circuits before any block check.
+    if (!external_frontend.empty() && ip == external_frontend) return true;
+    if (!external_admin.empty() && ip == external_admin) return true;
+    return std::find(cloudrange_exempt_ips.begin(), cloudrange_exempt_ips.end(), ip) !=
+           cloudrange_exempt_ips.end();
 }
 
 bool Config::daykey_required(const std::string& method, const std::string& path) const {
@@ -136,6 +175,31 @@ Config load_config(const EnvLookup& env) {
                 auto p = normalize_gate_path(ptok);
                 if (!p.empty() && p != "/") cfg.daykey_paths.push_back(p);
             }
+        }
+    }
+
+    // --- Datacenter / cloud-provider blocking -------------------------------------------------
+    cfg.cloudrange_db_path = get_str(env, "CPROXY_CLOUDRANGE_DB", cfg.cloudrange_db_path);
+    cfg.cloudrange_block_enabled =
+        get_bool(env, "CPROXY_BLOCK_CLOUD_IPS", cfg.cloudrange_block_enabled);
+    cfg.cloudrange_refresh_hours =
+        get_int(env, "CPROXY_CLOUDRANGE_REFRESH_HOURS", cfg.cloudrange_refresh_hours);
+    cfg.cloudrange_refresh_on_start =
+        get_bool(env, "CPROXY_CLOUDRANGE_REFRESH_ON_START", cfg.cloudrange_refresh_on_start);
+    cfg.cloudrange_fetch_timeout_seconds =
+        get_int(env, "CPROXY_CLOUDRANGE_FETCH_TIMEOUT_SECONDS",
+                cfg.cloudrange_fetch_timeout_seconds);
+    cfg.cloudrange_exempt_ips = split_csv(get_str(env, "CPROXY_CLOUDRANGE_EXEMPT_IPS", ""));
+
+    // Unset => every feed this build knows. "NONE" stops the refresh without disabling enforcement,
+    // so the stored ranges keep blocking while the fetching is paused. (Sentinel, not "", for the
+    // reason spelled out above CPROXY_LOG_DIR.)
+    {
+        auto providers = get_str(env, "CPROXY_CLOUDRANGE_PROVIDERS", "");
+        if (providers.empty()) {
+            cfg.cloudrange_providers = known_cloud_providers();
+        } else if (to_upper(providers) != "NONE") {
+            cfg.cloudrange_providers = split_csv(providers);
         }
     }
 

@@ -30,6 +30,11 @@ namespace cproxy {
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
  * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; POST/PATCH always 500 while empty |
  * | CPROXY_DAYKEY_PATHS         | /news/default                 | CSV of paths day-key gated on EVERY method, GET included ("NONE" disables) |
+ * | CPROXY_CLOUDRANGE_DB        | (empty)                       | SQLite datacenter-IP range db; empty = feature off |
+ * | CPROXY_BLOCK_CLOUD_IPS      | true                          | kill-switch for refusing datacenter IPs   |
+ * | CPROXY_CLOUDRANGE_REFRESH_HOURS | 336 (fortnightly)         | interval between provider-feed refreshes  |
+ * | CPROXY_CLOUDRANGE_PROVIDERS | (all known)                   | CSV of provider feeds ("NONE" disables the refresh) |
+ * | CPROXY_CLOUDRANGE_EXEMPT_IPS| (empty)                       | CSV never blocked (admin/frontend always exempt) |
  */
 struct Config {
     std::string listen_addr = "0.0.0.0";
@@ -57,6 +62,33 @@ struct Config {
     // Path to the day-key SQLite database (see DayKeyStore). Empty means day-key auth is not
     // configured, so every PATCH request fails closed with 500 regardless of CPROXY_ALLOWED_METHODS.
     std::string daykey_db_path;
+
+    // --- Datacenter / cloud-provider IP blocking (mirrors the frontend's CloudProviderIpRange) ---
+    // Path to the SQLite range database. Empty => the feature is off entirely: no blocking, and the
+    // refresh thread never starts.
+    std::string cloudrange_db_path;
+    // Kill-switch equivalent to the frontend's BlockCloudProviderIps appSetting: false keeps the
+    // database and the refresh running but stops refusing anything, so blocking can be dropped
+    // without a redeploy.
+    bool cloudrange_block_enabled = true;
+    // Fortnightly by default. The published ranges move on the order of weeks, and every refresh
+    // pulls ~100k prefixes from a dozen third-party feeds.
+    int cloudrange_refresh_hours = 336;
+    // Off by default: the stored set is already usable at boot, and refreshing on every start would
+    // hammer the feeds during a redeploy loop.
+    bool cloudrange_refresh_on_start = false;
+    int cloudrange_fetch_timeout_seconds = 60;
+    // Providers to fetch; defaults to every feed this build knows. "NONE" disables the refresh
+    // while leaving enforcement running against whatever is already stored.
+    std::vector<std::string> cloudrange_providers;
+    // Addresses that are NEVER blocked, whatever the ranges say. external_admin/external_frontend
+    // are added automatically — the frontend host is the source of essentially all legitimate
+    // traffic, and it sits at a hosting provider, so without this the block would take the portal
+    // offline. This is the equivalent of the frontend's exempt-IP allowlist short-circuit.
+    std::vector<std::string> cloudrange_exempt_ips;
+
+    /** True when `ip` is exempt from cloud-range blocking (admin, frontend, or configured). */
+    bool cloudrange_exempt(const std::string& ip) const;
 
     // Paths that require the day-key on EVERY method, not just the write surface — the way to put a
     // read endpoint behind the rotating credential. Stored lower-case, leading '/', no trailing '/'.
