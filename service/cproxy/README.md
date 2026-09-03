@@ -58,7 +58,7 @@ probing is visible.
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
-| `CPROXY_DAYKEY_PATHS` | `/news/default` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
 | `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
 | `CPROXY_BLOCK_CLOUD_IPS` | `true` | kill-switch — `false` keeps the data and refresh but refuses nothing |
 | `CPROXY_CLOUDRANGE_REFRESH_HOURS` | `336` | interval between provider-feed refreshes (fortnightly) |
@@ -226,8 +226,13 @@ Two arms decide what is gated, and either one is enough:
   docapi write (`river/fish/{guid}`, `river/regulation/{guid}`,
   `region/regulation/{country}[/{state}]`, and anything added later) clears the same check with no
   configuration.
-- **Named paths, by path** — `CPROXY_DAYKEY_PATHS`, default `/news/default`. This is how a **read**
-  is put behind the credential: `GET /api/v1/news/default` assembles the whole news home page
+- **Named paths, by path** — `CPROXY_DAYKEY_PATHS`, default
+  `/news/default,/news/featured,/news/more`. This is how a **read** is put behind the credential.
+  **All three home-page endpoints are listed together on purpose:** docapi 1.8.1 split
+  `/news/default` into `/news/featured` (the 2 lead articles, ~1.09 MB) and `/news/more` (the
+  sidebar, ~1.6 KB), and the three serve the *same* content — gating only `/news/default` leaves the
+  other two as an unauthenticated bypass. If docapi splits or renames these again, add the new paths
+  here in the same change. `GET /api/v1/news/default` assembles the whole news home page
   upstream, and being a `GET` is not a reason to hand it to anonymous scrapers. Matching is on the
   path tail (so an entry works at any route prefix), case-folded, trailing-slash-insensitive, and
   covers anything nested underneath. Set `CPROXY_DAYKEY_PATHS=NONE` to turn this arm off — an empty

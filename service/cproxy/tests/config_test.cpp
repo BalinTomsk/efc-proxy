@@ -156,8 +156,10 @@ void payload_limit_is_read_with_default() {
 // depend on remembering an env var at deploy time.
 void daykey_paths_gate_reads_by_default() {
     Config c = load_config(make_env({}));
-    CHECK(c.daykey_paths.size() == 1);
+    CHECK(c.daykey_paths.size() == 3);
     CHECK(c.daykey_paths[0] == "/news/default");
+    CHECK(c.daykey_paths[1] == "/news/featured");
+    CHECK(c.daykey_paths[2] == "/news/more");
 
     // The gated read, at the real route prefix and bare.
     CHECK(c.daykey_required("GET", "/api/v1/news/default"));
@@ -169,10 +171,24 @@ void daykey_paths_gate_reads_by_default() {
     // Anything nested under the gated path is gated too.
     CHECK(c.daykey_required("GET", "/api/v1/news/default/extra"));
 
-    // Sibling news reads stay open — the gate is one endpoint, not the whole news surface.
+    // THE BYPASS: docapi 1.8.1 split /news/default into these two, which serve the same content.
+    // Gating only /news/default would leave the expensive half (~1.09 MB of lead articles) readable
+    // with no credential — which is exactly what shipped, briefly, before this default was widened.
+    CHECK(c.daykey_required("GET", "/api/v1/news/featured"));
+    CHECK(c.daykey_required("GET", "/api/v1/news/more"));
+    CHECK(c.daykey_required("HEAD", "/api/v1/news/featured"));
+    CHECK(c.daykey_required("GET", "/api/v1/news/featured/"));
+    CHECK(c.daykey_required("GET", "/api/v1/News/Featured"));
+    CHECK(c.daykey_required("GET", "/api/v1/news/more/"));
+    CHECK(c.daykey_required("GET", "/api/v1/News/More"));
+
+    // Sibling news reads stay open — the gate is the home page, not the whole news surface.
     CHECK(!c.daykey_required("GET", "/api/v1/news/list"));
     CHECK(!c.daykey_required("GET", "/api/v1/news/search"));
     CHECK(!c.daykey_required("GET", "/api/v1/fish"));
+    // A near-miss must not be swept in by the new entries either.
+    CHECK(!c.daykey_required("GET", "/api/v1/news/moreish"));
+    CHECK(!c.daykey_required("GET", "/api/v1/oldnews/more"));
     // The entry's leading '/' keeps the tail match on a segment boundary.
     CHECK(!c.daykey_required("GET", "/api/v1/oldnews/default"));
 
@@ -209,8 +225,10 @@ void daykey_paths_are_configurable_and_can_be_cleared() {
         return std::string(k) == "CPROXY_DAYKEY_PATHS" ? system_env("PATH_THAT_IS_NOT_SET_98765")
                                                        : std::nullopt;
     });
-    CHECK(empty.daykey_paths.size() == 1);
+    CHECK(empty.daykey_paths.size() == 3);
     CHECK(empty.daykey_required("GET", "/api/v1/news/default"));
+    CHECK(empty.daykey_required("GET", "/api/v1/news/featured"));
+    CHECK(empty.daykey_required("GET", "/api/v1/news/more"));
 }
 
 }  // namespace

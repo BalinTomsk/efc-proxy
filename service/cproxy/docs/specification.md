@@ -53,7 +53,9 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
   a wrong or missing value → `500` (deliberately not `401`, so it reads no
   differently from an ordinary server error). Two arms, either one gates: **every POST/PATCH**
   whatever the path, and **every method on a path in `CPROXY_DAYKEY_PATHS`** (default
-  `/news/default` — this is how a *read* is put behind the credential, added 0.7.0). Matching is on
+  `/news/default`, `/news/featured` and `/news/more` — this is how a *read* is put behind the
+  credential, added 0.7.0; the two extra entries came in 0.9.1 when docapi 1.8.1 split the home
+  page and left them as an unauthenticated bypass). Matching is on
   the path tail, case-folded, trailing-slash-insensitive, and covers anything nested under a gated
   path; dot-dot is rejected before the gate so traversal cannot re-point a request past it. See
   `DayKeyStore` below.
@@ -69,7 +71,7 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
 | `CPROXY_API_KEY` | (empty) | require `X-API-Key` when set |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV method allow-list |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
-| `CPROXY_DAYKEY_PATHS` | `/news/default` | CSV of paths day-key gated on **every** method, GET included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more` | CSV of paths day-key gated on **every** method, GET included; `NONE` disables (an empty value reads as unset) |
 | `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
 | `CPROXY_BLOCK_CLOUD_IPS` | `true` | kill-switch; `false` keeps data + refresh but refuses nothing |
 | `CPROXY_CLOUDRANGE_REFRESH_HOURS` | `336` | fortnightly provider-feed refresh |
@@ -112,7 +114,8 @@ tests/
   config_test.cpp          framework-free assertions; registered with CTest
   day_key_store_test.cpp   yesterday/today/tomorrow window, year boundary, leap-day-366 clamp
   proxy_test.cpp           real HTTP through install_routes(); includes the gated-read cases
-                           (/news/default 500 without a key, 502 through with one, siblings open)
+                           (/news/default, /news/featured, /news/more all 500 without a key,
+                            502 through with one, siblings open)
 ```
 
 ## Day-key store (0.9.0: date-keyed)

@@ -9,6 +9,39 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-03: **0.9.1 — `/news/featured` and `/news/more` join `/news/default` behind the day-key.
+  BUILT AND TESTED, NOT DEPLOYED.** Closes an unauthenticated bypass that this stack opened itself.
+
+  docapi 1.8.1 split `GET /api/v1/news/default` into `/news/featured` (the 2 lead articles, ~1.09 MB)
+  and `/news/more` (the sidebar, ~1.6 KB), so a caller can take whichever half it renders. But
+  `daykey_paths` still named only `/news/default`, and `/api/*` is forwarded wholesale — so the two
+  new paths went live **completely open**. Confirmed against the deployed gateway with no
+  `X-Day-Guid` header:
+
+  ```
+  /api/v1/news/default    500          62 bytes   (gated, as intended)
+  /api/v1/news/featured   200   1,085,243 bytes   (the bypass)
+  /api/v1/news/more       200       1,636 bytes   (the bypass)
+  ```
+
+  The whole point of gating `/news/default` is that assembling it is expensive and there is no reason
+  to serve it to anonymous scrapers. `/news/featured` handed over the expensive half — the same
+  content, larger per request — for free.
+
+  - **Fix:** `Config::daykey_paths` now defaults to
+    `{"/news/default", "/news/featured", "/news/more"}`. No routing change was needed; `/api/*` was
+    already forwarded. The comment on the field now says in capitals that these three must be listed
+    together and that a future split must add its paths in the same commit.
+  - **Tests.** `daykey_paths_gate_reads_by_default` gains the two endpoints at the real route prefix,
+    bare, with a trailing slash and in mixed case, plus near-miss negatives (`/news/moreish` and
+    `/oldnews/more` must stay open). **Verified failing first**: reverting the default to
+    `{"/news/default"}` — with the size assertions relaxed so only the gate itself could fail —
+    produces `CHECK failed: c.daykey_required("GET", "/api/v1/news/featured")` at
+    `config_test.cpp:177`. 6/6 test binaries pass on a `--no-cache` build with the fix.
+  - **No env change needed at deploy:** production sets no `CPROXY_DAYKEY_PATHS`, so it runs on this
+    default. That is also why the bypass existed — the gate list lives in the binary, and shipping a
+    docapi change alone could not update it.
+
 - 2026-09-02: **0.9.0 — the day-key store is keyed by DATE, not day-of-year. DEPLOYED.**
   The store held exactly 365 rows indexed `1..365` and reused them every year. The generated key set
   — `secret/daykeys.csv` and `secret/daykeys_mssql.sql` (`dbo.day_keys`) — is **date-keyed and spans
