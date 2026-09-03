@@ -10,7 +10,7 @@ tracked. Newest entries first.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
 - 2026-09-03: **0.9.1 — `/news/featured` and `/news/more` join `/news/default` behind the day-key.
-  BUILT AND TESTED, NOT DEPLOYED.** Closes an unauthenticated bypass that this stack opened itself.
+  DEPLOYED.** Closes an unauthenticated bypass that this stack opened itself.
 
   docapi 1.8.1 split `GET /api/v1/news/default` into `/news/featured` (the 2 lead articles, ~1.09 MB)
   and `/news/more` (the sidebar, ~1.6 KB), so a caller can take whichever half it renders. But
@@ -41,6 +41,22 @@ tracked. Newest entries first.
   - **No env change needed at deploy:** production sets no `CPROXY_DAYKEY_PATHS`, so it runs on this
     default. That is also why the bypass existed — the gate list lives in the binary, and shipping a
     docapi change alone could not update it.
+  - **Deployed 2026-09-03**, digest `sha256:638c1284…` pinned in `compose.yml`; `/health` reports
+    `0.9.1` and the running container's image id matches the pinned digest. Verified through the
+    public edge, which is the only check that proves anything here:
+
+    | request | before | after |
+    |---|---|---|
+    | `/news/default` no key | 500 / 62 B | 500 / 62 B |
+    | `/news/featured` no key | **200 / 1,085,243 B** | **500 / 62 B** |
+    | `/news/more` no key | **200 / 1,636 B** | **500 / 62 B** |
+    | `/news/featured` valid key | — | 200 / 1,085,243 B |
+    | `/news/featured` wrong key | — | 500 / 62 B |
+    | `/news/list`, `/fish/search` (ungated) | 200 | 200 |
+
+    The valid-key row matters as much as the bypass rows: gating a path so hard that the legitimate
+    caller cannot get through would be its own outage, and `/health` would have reported `UP` either
+    way.
 
 - 2026-09-02: **0.9.0 — the day-key store is keyed by DATE, not day-of-year. DEPLOYED.**
   The store held exactly 365 rows indexed `1..365` and reused them every year. The generated key set
