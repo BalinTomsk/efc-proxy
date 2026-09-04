@@ -87,6 +87,21 @@ struct Config {
     // offline. This is the equivalent of the frontend's exempt-IP allowlist short-circuit.
     std::vector<std::string> cloudrange_exempt_ips;
 
+    // RabbitMQ account-event consumer. When enabled, cproxy polls the RabbitMQ management HTTPS API
+    // for account/user and API-key events emitted by fishfind-frontend, then mirrors them into a
+    // local SQLite database for fast local auth/cache use.
+    bool rabbitmq_events_enabled = false;
+    // No real infrastructure address baked in as a default (same reason docapi_upstream stays a
+    // neutral placeholder): production always sets CPROXY_RABBITMQ_MANAGEMENT_URL explicitly, and
+    // validate_config() fails startup on an empty/schemeless value when events are enabled.
+    std::string rabbitmq_management_url;
+    std::string rabbitmq_username = "fishfind";
+    std::string rabbitmq_password;
+    std::string rabbitmq_queue = "fishfind.account.events";
+    std::string account_mirror_db_path = "/var/lib/cproxy/auth.sqlite";
+    int rabbitmq_poll_ms = 1000;
+    int rabbitmq_batch_size = 25;
+
     /** True when `ip` is exempt from cloud-range blocking (admin, frontend, or configured). */
     bool cloudrange_exempt(const std::string& ip) const;
 
@@ -138,7 +153,23 @@ Config load_config(const EnvLookup& env = system_env);
  * Sanity-checks a loaded Config. Returns one human-readable message per problem; an empty vector
  * means the config is usable. Startup treats any problem as fatal (fail fast beats limping along
  * with a port of 0 or a negative timeout).
+ *
+ * Deliberately covers ONLY what the proxy itself needs. Settings that belong to an optional
+ * side-feature are checked by their own function (see rabbitmq_config_problems) so a broken feature
+ * degrades instead of taking the whole service down.
  */
 std::vector<std::string> validate_config(const Config& cfg);
 
+/**
+ * Problems that disable ONLY the RabbitMQ account/user mirror, never the proxy. Empty when events
+ * are disabled, or when they are enabled and fully configured.
+ *
+ * Separate from validate_config on purpose: forwarding /api/* does not depend on the mirror, so a
+ * missing management URL or password must not stop cproxy from binding its port. Treating these as
+ * fatal took the public edge offline on the 0.9.2 deploy. main() logs each problem and turns the
+ * consumer off instead.
+ */
+std::vector<std::string> rabbitmq_config_problems(const Config& cfg);
+
 }  // namespace cproxy
+
