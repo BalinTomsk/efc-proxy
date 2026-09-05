@@ -65,6 +65,14 @@ probing is visible.
 | `CPROXY_CLOUDRANGE_REFRESH_ON_START` | `false` | fetch once at boot instead of waiting a full interval |
 | `CPROXY_CLOUDRANGE_PROVIDERS` | (all 12) | CSV of feeds; `NONE` stops refreshing but keeps blocking |
 | `CPROXY_CLOUDRANGE_EXEMPT_IPS` | (empty) | never blocked (admin + frontend are exempt automatically) |
+| `CPROXY_RABBITMQ_EVENTS_ENABLED` | `false` | consume frontend account/API-key events from RabbitMQ into local SQLite |
+| `CPROXY_RABBITMQ_MANAGEMENT_URL` | (empty) | RabbitMQ HTTPS management API used for queue polling; required (`scheme://host[:port]`) when events are enabled — no default, set via the encrypted dotenv like `CPROXY_RABBITMQ_PASSWORD` |
+| `CPROXY_RABBITMQ_USERNAME` | `fishfind` | RabbitMQ user for account-event consumption |
+| `CPROXY_RABBITMQ_PASSWORD` | (empty) | RabbitMQ password; required when events are enabled; keep in encrypted dotenv |
+| `CPROXY_RABBITMQ_QUEUE` | `fishfind.account.events` | durable queue carrying account and API-key events |
+| `CPROXY_ACCOUNT_MIRROR_DB` | `/var/lib/cproxy/auth.sqlite` | local SQLite mirror for `Users`, `user_api_key`, and raw account events |
+| `CPROXY_RABBITMQ_POLL_MS` | `1000` | delay between empty/failed RabbitMQ polls |
+| `CPROXY_RABBITMQ_BATCH_SIZE` | `25` | max messages consumed per RabbitMQ poll |
 | `CPROXY_CONNECT_TIMEOUT_MS` | `3000` | upstream connect timeout |
 | `CPROXY_READ_TIMEOUT_MS` | `10000` | upstream read timeout |
 | `CPROXY_MAX_PAYLOAD_BYTES` | `1048576` | request bodies above this are rejected with `413` |
@@ -113,6 +121,35 @@ if every feed fails the database is not touched at all.
 > feeds are HTTPS-only, so 0.8.0 turns TLS on and gives the proxy outbound internet egress it did
 > not previously have. `ca-certificates` in the runtime image is load-bearing from here on.
 
+
+## RabbitMQ account-event mirror
+
+When `CPROXY_RABBITMQ_EVENTS_ENABLED=true`, cproxy polls RabbitMQ's HTTPS management API at
+`CPROXY_RABBITMQ_MANAGEMENT_URL`, consumes the durable queue `fishfind.account.events`, and writes
+an idempotent local SQLite mirror to `CPROXY_ACCOUNT_MIRROR_DB`. The mirror has four tables:
+`account_events` for raw event audit, `users` for the registration/OAuth profile snapshot,
+`users_sync` for the full `dbo.Users` row mirror (see below), and `user_api_key` for API-key
+issue/disable/enable/delete state.
+
+The RabbitMQ management URL and password are both deployment secrets, not tracked values — this
+repo is public. In production put `CPROXY_RABBITMQ_MANAGEMENT_URL=<url>` and
+`CPROXY_RABBITMQ_PASSWORD=<password>` in the encrypted dotenv mounted at `/etc/cproxy/.env`; do not
+put either in tracked `deploy/compose.yml`.
+
+Frontend publishers emit these event types:
+
+- `fishfind.account.user` with actions `registered`, `oauth_registered`, and `oauth_login`.
+- `fishfind.account.api_key` with actions `issued`, `disabled`, `enabled`, and `deleted`.
+- `fishfind.account.user_sync` with actions `created` and `updated`, emitted by
+  `fishfind-frontend/aspnet/tools/Run-UsersSyncDispatch.ps1` (a scheduled-task dispatcher, not app
+  code) draining `dbo.UsersSyncOutbox`. `dbo.TR_Users_SyncOutbox` (envfish-db) appends to that outbox
+  on **every** write to `dbo.Users`, including a manual admin `UPDATE` to `access`/`suspended`/
+  `deleted` run directly against the table — there is no app code path for those today, so this is
+  the only event type that reflects such changes. The `users_sync` table carries `id`, `users_id`
+  (`dbo.Users.UsersId`), `user_name`, `email`, `last_visit`, `access`, `suspended`, `auth_type`,
+  `deleted`, `deleted_utc`.
+
+The consumer stores by `eventId` first, so replayed messages are harmless duplicates.
 ## Logging
 
 Same functionality as the sibling `waterservice`: structured **JSON** lines to **both** the console
@@ -249,3 +286,4 @@ malformed-value fallback), `secret_codec_test`, `proxy_test`, `breaker_test`, an
 `day_key_store_test` (the yesterday/today/tomorrow window, both directions of the year boundary, the
 leap-day-366 clamp, and the fail-loud-on-a-bad-database cases). Proxy behaviour is also verified by
 running the container against a reachable echo upstream (see `docs/specification.md`).
+

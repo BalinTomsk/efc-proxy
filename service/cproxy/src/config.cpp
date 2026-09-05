@@ -191,6 +191,18 @@ Config load_config(const EnvLookup& env) {
                 cfg.cloudrange_fetch_timeout_seconds);
     cfg.cloudrange_exempt_ips = split_csv(get_str(env, "CPROXY_CLOUDRANGE_EXEMPT_IPS", ""));
 
+    cfg.rabbitmq_events_enabled =
+        get_bool(env, "CPROXY_RABBITMQ_EVENTS_ENABLED", cfg.rabbitmq_events_enabled);
+    cfg.rabbitmq_management_url =
+        get_str(env, "CPROXY_RABBITMQ_MANAGEMENT_URL", cfg.rabbitmq_management_url);
+    cfg.rabbitmq_username = get_str(env, "CPROXY_RABBITMQ_USERNAME", cfg.rabbitmq_username);
+    cfg.rabbitmq_password = get_str(env, "CPROXY_RABBITMQ_PASSWORD", cfg.rabbitmq_password);
+    cfg.rabbitmq_queue = get_str(env, "CPROXY_RABBITMQ_QUEUE", cfg.rabbitmq_queue);
+    cfg.account_mirror_db_path =
+        get_str(env, "CPROXY_ACCOUNT_MIRROR_DB", cfg.account_mirror_db_path);
+    cfg.rabbitmq_poll_ms = get_int(env, "CPROXY_RABBITMQ_POLL_MS", cfg.rabbitmq_poll_ms);
+    cfg.rabbitmq_batch_size = get_int(env, "CPROXY_RABBITMQ_BATCH_SIZE", cfg.rabbitmq_batch_size);
+
     // Unset => every feed this build knows. "NONE" stops the refresh without disabling enforcement,
     // so the stored ranges keep blocking while the fetching is paused. (Sentinel, not "", for the
     // reason spelled out above CPROXY_LOG_DIR.)
@@ -216,6 +228,28 @@ Config load_config(const EnvLookup& env) {
     return cfg;
 }
 
+std::vector<std::string> rabbitmq_config_problems(const Config& cfg) {
+    std::vector<std::string> problems;
+    if (!cfg.rabbitmq_events_enabled) return problems;  // nothing to run, nothing to complain about
+
+    if (cfg.rabbitmq_management_url.rfind("http://", 0) != 0 &&
+        cfg.rabbitmq_management_url.rfind("https://", 0) != 0)
+        problems.push_back("CPROXY_RABBITMQ_MANAGEMENT_URL must be scheme://host[:port] with http or https");
+    if (cfg.rabbitmq_username.empty())
+        problems.push_back("CPROXY_RABBITMQ_USERNAME is required when RabbitMQ events are enabled");
+    if (cfg.rabbitmq_password.empty())
+        problems.push_back("CPROXY_RABBITMQ_PASSWORD is required when RabbitMQ events are enabled");
+    if (cfg.rabbitmq_queue.empty())
+        problems.push_back("CPROXY_RABBITMQ_QUEUE is required when RabbitMQ events are enabled");
+    if (cfg.account_mirror_db_path.empty())
+        problems.push_back("CPROXY_ACCOUNT_MIRROR_DB is required when RabbitMQ events are enabled");
+    if (cfg.rabbitmq_poll_ms <= 0)
+        problems.push_back("CPROXY_RABBITMQ_POLL_MS must be positive");
+    if (cfg.rabbitmq_batch_size <= 0)
+        problems.push_back("CPROXY_RABBITMQ_BATCH_SIZE must be positive");
+    return problems;
+}
+
 std::vector<std::string> validate_config(const Config& cfg) {
     std::vector<std::string> errors;
     if (cfg.listen_port < 1 || cfg.listen_port > 65535)
@@ -236,7 +270,9 @@ std::vector<std::string> validate_config(const Config& cfg) {
         errors.push_back("CPROXY_ROUTE_PREFIX must start with '/'");
     if (cfg.docapi_upstream.rfind("http://", 0) != 0 && cfg.docapi_upstream.rfind("https://", 0) != 0)
         errors.push_back("CPROXY_DOCAPI_UPSTREAM must be scheme://host[:port] with http or https");
+    // RabbitMQ settings are deliberately NOT checked here — see rabbitmq_config_problems().
     return errors;
 }
 
 }  // namespace cproxy
+

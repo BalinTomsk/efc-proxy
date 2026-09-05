@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.9.1 LANGUAGES CXX)
+project(cproxy VERSION 0.9.4 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -60,6 +60,7 @@ configure_file(
 
 # --- Core library (config + proxy) so it can be unit-tested apart from main() --
 add_library(cproxy_core STATIC
+  src/account_mirror_store.cpp
   src/breaker.cpp
   src/cloud_range_refresh.cpp
   src/cloud_range_store.cpp
@@ -68,6 +69,7 @@ add_library(cproxy_core STATIC
   src/dotenv.cpp
   src/log.cpp
   src/proxy.cpp
+  src/rabbit_event_consumer.cpp
   src/secret_codec.cpp
 )
 target_include_directories(cproxy_core PUBLIC
@@ -109,3 +111,8 @@ add_test(NAME day_key_store_test COMMAND day_key_store_test)
 add_executable(cloud_range_store_test tests/cloud_range_store_test.cpp)
 target_link_libraries(cloud_range_store_test PRIVATE cproxy_core)
 add_test(NAME cloud_range_store_test COMMAND cloud_range_store_test)
+
+add_executable(account_mirror_store_test tests/account_mirror_store_test.cpp)
+target_link_libraries(account_mirror_store_test PRIVATE cproxy_core)
+add_test(NAME account_mirror_store_test COMMAND account_mirror_store_test)
+

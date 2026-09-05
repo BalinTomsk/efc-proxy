@@ -13,6 +13,7 @@
 #include "dotenv.hpp"
 #include "log.hpp"
 #include "proxy.hpp"
+#include "rabbit_event_consumer.hpp"
 #include "version.hpp"
 
 namespace {
@@ -44,7 +45,7 @@ int main() {
         return 1;
     }
 
-    const cproxy::Config cfg = cproxy::load_config(cproxy::make_env_lookup(dotenv));
+    cproxy::Config cfg = cproxy::load_config(cproxy::make_env_lookup(dotenv));
 
     // Fail fast on nonsense config (port 0, negative timeout, prefix without '/') instead of
     // limping into listen() with values that can only misbehave.
@@ -60,6 +61,18 @@ int main() {
 
     cproxy::init_logging(cfg.log_dir, cfg.log_max_history);
 
+    // A misconfigured mirror must never cost us the proxy. These problems are reported and the
+    // consumer is switched off; /api/* keeps serving. (Before 0.9.4 they were fatal, and an empty
+    // management URL with events enabled took the public edge down on the 0.9.2 deploy.)
+    if (const auto rabbit_problems = cproxy::rabbitmq_config_problems(cfg); !rabbit_problems.empty()) {
+        for (const auto& p : rabbit_problems) {
+            cproxy::log_raw(std::format("{{\"service\":\"cproxy\",\"level\":\"ERROR\","
+                                        "\"msg\":\"RabbitMQ mirror disabled: {}\"}}",
+                                        p));
+        }
+        cfg.rabbitmq_events_enabled = false;
+    }
+
     httplib::Server server;
     g_server = &server;
     std::signal(SIGINT, on_signal);
@@ -73,6 +86,9 @@ int main() {
 
     cproxy::CloudRangeRefresher refresher(cfg, cloud_ranges);
     refresher.start();
+
+    cproxy::RabbitEventConsumer rabbit_events(cfg);
+    rabbit_events.start();
 
     // external_admin / external_frontend are secret (encrypted at rest) — log only their presence.
     cproxy::log_raw(std::format(
@@ -94,10 +110,13 @@ int main() {
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
     if (!server.listen(cfg.listen_addr, cfg.listen_port)) {
+        rabbit_events.stop();
         cproxy::log_raw(std::format("{{\"service\":\"cproxy\",\"level\":\"FATAL\","
                                     "\"msg\":\"failed to bind {}:{}\"}}",
                                     cfg.listen_addr, cfg.listen_port));
         return 1;
     }
+    rabbit_events.stop();
     return 0;
 }
+

@@ -34,6 +34,12 @@ void defaults_apply_when_env_is_empty() {
     CHECK(c.log_max_history == 7);
     CHECK(c.external_admin.empty());
     CHECK(c.external_frontend.empty());
+    CHECK(!c.rabbitmq_events_enabled);
+    // No real infrastructure address in tests — same reason as docapi_upstream above.
+    CHECK(c.rabbitmq_management_url.empty());
+    CHECK(c.rabbitmq_username == "fishfind");
+    CHECK(c.rabbitmq_queue == "fishfind.account.events");
+    CHECK(c.account_mirror_db_path == "/var/lib/cproxy/auth.sqlite");
 }
 
 void external_values_are_read_from_the_env_lookup() {
@@ -129,6 +135,44 @@ void malformed_int_falls_back_and_all_keyword_means_unrestricted() {
                                      {"CPROXY_ALLOWED_METHODS", "ALL"}}));
     CHECK(c.listen_port == 8080);  // fell back to the default
     CHECK(c.method_allowed("DELETE"));
+}
+
+// A broken RabbitMQ mirror must DEGRADE, never take the proxy down. Forwarding /api/* does not
+// depend on the mirror in any way, so a missing management URL or password has to leave startup
+// alone and disable only the consumer. Treating it as fatal is what took the public edge offline on
+// the 0.9.2 deploy: validate_config flagged the empty URL, main() exited, and port 80 stopped
+// binding — an outage caused by a feature that was doing nothing for request handling.
+void rabbitmq_misconfig_degrades_the_mirror_not_the_proxy() {
+    // Placeholder host — no real infrastructure address in tests. rabbitmq_management_url has no
+    // default (see config.hpp), so it must be supplied explicitly whenever events are enabled, same
+    // as the password.
+    Config ok = load_config(make_env({{"CPROXY_RABBITMQ_EVENTS_ENABLED", "true"},
+                                      {"CPROXY_RABBITMQ_MANAGEMENT_URL", "https://rabbitmq.example.invalid:15671"},
+                                      {"CPROXY_RABBITMQ_PASSWORD", "secret"}}));
+    CHECK(ok.rabbitmq_events_enabled);
+    CHECK(ok.rabbitmq_password == "secret");
+    CHECK(validate_config(ok).empty());
+    CHECK(rabbitmq_config_problems(ok).empty());
+
+    // Enabled with no URL and no password: startup must survive, and the problems must be reported
+    // through the separate channel so main() can log them and switch the consumer off.
+    Config unset_url = load_config(make_env({{"CPROXY_RABBITMQ_EVENTS_ENABLED", "true"}}));
+    CHECK(unset_url.rabbitmq_management_url.empty());
+    CHECK(validate_config(unset_url).empty());
+    CHECK(rabbitmq_config_problems(unset_url).size() >= 2);  // URL and password
+
+    // Same for a schemeless URL / zero poll interval.
+    Config bad = load_config(make_env({{"CPROXY_RABBITMQ_EVENTS_ENABLED", "true"},
+                                       {"CPROXY_RABBITMQ_MANAGEMENT_URL", "rabbit:15671"},
+                                       {"CPROXY_RABBITMQ_PASSWORD", ""},
+                                       {"CPROXY_RABBITMQ_POLL_MS", "0"}}));
+    CHECK(validate_config(bad).empty());
+    CHECK(rabbitmq_config_problems(bad).size() >= 2);
+
+    // Disabled entirely: nothing to report, whatever the other values are.
+    Config off = load_config(make_env({}));
+    CHECK(!off.rabbitmq_events_enabled);
+    CHECK(rabbitmq_config_problems(off).empty());
 }
 
 void validation_accepts_defaults_and_rejects_nonsense() {
@@ -240,6 +284,7 @@ int main() {
     logging_env_is_read_including_console_only_sentinel();
     console_only_sentinel_works_through_the_real_environment();
     external_values_are_read_from_the_env_lookup();
+    rabbitmq_misconfig_degrades_the_mirror_not_the_proxy();
     validation_accepts_defaults_and_rejects_nonsense();
     payload_limit_is_read_with_default();
     daykey_paths_gate_reads_by_default();
@@ -247,3 +292,4 @@ int main() {
     std::cout << "config_test: all assertions passed\n";
     return 0;
 }
+
