@@ -44,6 +44,37 @@ void exec(sqlite3* db, const char* sql, const std::string& context) {
     }
 }
 
+bool column_exists(sqlite3* db, const std::string& table, const std::string& column) {
+    sqlite3_stmt* stmt = nullptr;
+    const std::string sql = std::format("PRAGMA table_info({})", table);
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(std::format("inspect columns of {}: {}", table, sqlite3_errmsg(db)));
+    }
+    bool found = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* name = sqlite3_column_text(stmt, 1);  // table_info: cid, name, type, ...
+        if (name != nullptr && column == reinterpret_cast<const char*>(name)) {
+            found = true;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+// `CREATE TABLE IF NOT EXISTS` is a no-op against a mirror database that already exists, so a column
+// added to the DDL above only ever appears on a FRESH file -- every deployed mirror would silently
+// keep the old shape and the new field would be dropped on the floor with no error anywhere. Adding a
+// column has to be an explicit, idempotent migration. SQLite's ALTER TABLE ADD COLUMN is O(1)
+// metadata-only and requires the new column to be NULLable or carry a constant default, which both of
+// these do.
+void add_column_if_missing(sqlite3* db, const std::string& table, const std::string& column,
+                           const std::string& decl) {
+    if (column_exists(db, table, column)) return;
+    const std::string sql = std::format("ALTER TABLE {} ADD COLUMN {} {}", table, column, decl);
+    exec(db, sql.c_str(), std::format("add column {}.{}", table, column));
+}
+
 class Tx {
 public:
     explicit Tx(sqlite3* db) : db_(db) { exec(db_, "BEGIN IMMEDIATE", "begin account mirror transaction"); }
@@ -139,20 +170,28 @@ std::int64_t int64_or_zero(const nlohmann::json& obj, const char* key) {
 }
 
 // Full dbo.Users row mirror (id, UsersId, userName, email, lastVisit, access, suspended, authType,
-// deleted, deletedUtc) fed by the fishfind-frontend outbox dispatcher (Run-UsersSyncDispatch.ps1),
-// which snapshots EVERY write to dbo.Users -- including a manual admin UPDATE to
-// access/suspended/deleted, not just app code paths. Distinct from `users` above, which only ever
-// carries the narrower registration/OAuth profile fields.
+// deleted, deletedUtc, prime, prime_expired) fed by the fishfind-frontend outbox dispatcher
+// (Run-UsersSyncDispatch.ps1), which snapshots EVERY write to dbo.Users -- including a manual admin
+// UPDATE to access/suspended/deleted, not just app code paths. Distinct from `users` above, which only
+// ever carries the narrower registration/OAuth profile fields.
+//
+// prime is 0 on the 'created' event of a new account and arrives for real on the following 'updated'
+// event, because the frontend writes the Users row before dbo.sp_user_prime_assign issues its prime
+// (envfish-db/CLAUDE.md -> "Per-user prime allocation"). 0 therefore means "not allocated yet" here
+// exactly as it does in dbo.Users -- it is NOT a parse failure, and it is not a state to alarm on
+// until the second event fails to show up.
 void upsert_user_sync(sqlite3* db, const nlohmann::json& user, const nlohmann::json& event) {
     sqlite3_stmt* stmt = nullptr;
     static const char* const sql =
         "INSERT INTO users_sync "
-        "(id, users_id, user_name, email, last_visit, access, suspended, auth_type, deleted, deleted_utc, updated_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "(id, users_id, user_name, email, last_visit, access, suspended, auth_type, deleted, deleted_utc, "
+        "prime, prime_expired, updated_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "users_id=excluded.users_id, user_name=excluded.user_name, email=excluded.email, "
         "last_visit=excluded.last_visit, access=excluded.access, suspended=excluded.suspended, "
         "auth_type=excluded.auth_type, deleted=excluded.deleted, deleted_utc=excluded.deleted_utc, "
+        "prime=excluded.prime, prime_expired=excluded.prime_expired, "
         "updated_utc=excluded.updated_utc";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         throw std::runtime_error(std::format("prepare users_sync upsert: {}", sqlite3_errmsg(db)));
@@ -172,7 +211,18 @@ void upsert_user_sync(sqlite3* db, const nlohmann::json& user, const nlohmann::j
     } else {
         bind_text(stmt, 10, deleted_utc);
     }
-    bind_text(stmt, 11, str_or_empty(event, "occurredUtc"));
+    // bigint, same 64-bit reasoning as users_id: the global prime sequence starts above 10^6 and only
+    // grows, so a 32-bit bind would eventually store a different prime rather than a close one.
+    sqlite3_bind_int64(stmt, 11, int64_or_zero(user, "prime"));
+    // A calendar date ("yyyy-MM-dd"), stored verbatim. NULL only on events replayed from outbox rows
+    // written before the column existed.
+    const std::string prime_expired = str_or_empty(user, "primeExpired");
+    if (prime_expired.empty()) {
+        sqlite3_bind_null(stmt, 12);
+    } else {
+        bind_text(stmt, 12, prime_expired);
+    }
+    bind_text(stmt, 13, str_or_empty(event, "occurredUtc"));
     const int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
@@ -274,6 +324,8 @@ void AccountMirrorStore::ensure_schema() {
         "  auth_type TEXT NOT NULL DEFAULT '',"
         "  deleted INTEGER NOT NULL DEFAULT 0,"
         "  deleted_utc TEXT NULL,"
+        "  prime INTEGER NOT NULL DEFAULT 0,"
+        "  prime_expired TEXT NULL,"
         "  updated_utc TEXT NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS ix_users_sync_email ON users_sync(email);"
@@ -290,6 +342,11 @@ void AccountMirrorStore::ensure_schema() {
         "CREATE INDEX IF NOT EXISTS ix_user_api_key_user ON user_api_key(user_id, created_utc DESC);"
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_user_api_key_secret ON user_api_key(api_key) WHERE api_key <> '';";
     exec(handle.db, ddl, "create account mirror schema");
+
+    // Migrations for mirror databases created before a column existed (see add_column_if_missing).
+    // dbo.Users.prime is a bigint -- SQLite INTEGER is 64-bit, so it holds the full range.
+    add_column_if_missing(handle.db, "users_sync", "prime", "INTEGER NOT NULL DEFAULT 0");
+    add_column_if_missing(handle.db, "users_sync", "prime_expired", "TEXT NULL");
 }
 
 bool AccountMirrorStore::apply_event(const nlohmann::json& event) {
