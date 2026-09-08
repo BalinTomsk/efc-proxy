@@ -337,6 +337,153 @@ void preserves_users_id_beyond_32_bits() {
     std::remove(db_path.c_str());
 }
 
+// dbo.Users_Prime mirror, fed by the same dispatcher via dbo.UserPrimeSyncOutbox. ONE event carries
+// an account's WHOLE 365-entry array -- the DB trigger aggregates them, because
+// dbo.sp_user_prime_assign writes all 365 rows in a single INSERT and a T-SQL trigger is
+// statement-level -- so a single apply_event must land 365 rows. Row-per-prime would be ~1.7M
+// messages/min at the measured registration rate, so the batching is a performance invariant.
+//
+// The day-365 prime asserted here is above 2^32 on purpose: dbo.Users_Prime.prime comes from the
+// same global bigint sequence as Users.prime and is an access-security value, so a 32-bit bind would
+// store a WRONG credential rather than an approximate number.
+void applies_user_prime_sync_creating_all_day_rows() {
+    const std::string db_path = "account_mirror_store_test_userprime.sqlite";
+    std::remove(db_path.c_str());
+
+    AccountMirrorStore store(db_path);
+    store.ensure_schema();
+
+    nlohmann::json days = nlohmann::json::array();
+    for (int d = 1; d <= 365; ++d) {
+        days.push_back({{"day", d}, {"prime", 9010000000LL + d}});
+    }
+
+    nlohmann::json created = {
+        {"schema", "fishfind.account-event.v1"},
+        {"eventId", "userprimesync-1"},
+        {"eventType", "fishfind.account.user_prime_sync"},
+        {"action", "created"},
+        {"aggregateId", "user-prime-1"},
+        {"occurredUtc", "2026-09-08T18:00:00Z"},
+        {"source", "fishfind-frontend"},
+        {"userPrime", {{"userId", "user-prime-1"}, {"dayCount", 365}, {"days", days}}}
+    };
+    CHECK(store.apply_event(created));
+    CHECK(!store.apply_event(created));   // duplicate delivery is a no-op (account_events dedup)
+
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(db_path.c_str(), &db) == SQLITE_OK);
+    CHECK(count_rows(db, "user_prime_sync") == 365);
+
+    sqlite3_stmt* stmt = nullptr;
+    CHECK(sqlite3_prepare_v2(db,
+                             "SELECT prime FROM user_prime_sync "
+                             "WHERE user_id = 'user-prime-1' AND day_year = 365",
+                             -1, &stmt, nullptr) == SQLITE_OK);
+    CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    const std::int64_t stored = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    if (stored != 9010000365LL) {
+        std::cout << "day prime truncated: expected 9010000365, stored " << stored << "\n";
+    }
+    CHECK(stored == 9010000365LL);
+
+    std::remove(db_path.c_str());
+}
+
+// The 'deleted' arm: a revocation, including the ON DELETE CASCADE fired when a dbo.Users row is
+// hard-deleted. Without it the mirror keeps serving primes for an account that no longer holds any.
+// Only the days actually listed in the event are removed, so a partial revocation stays partial.
+void removes_user_prime_rows_on_delete_event() {
+    const std::string db_path = "account_mirror_store_test_userprime_del.sqlite";
+    std::remove(db_path.c_str());
+
+    AccountMirrorStore store(db_path);
+    store.ensure_schema();
+
+    nlohmann::json days = nlohmann::json::array();
+    for (int d = 1; d <= 3; ++d) {
+        days.push_back({{"day", d}, {"prime", 9030000000LL + d}});
+    }
+    nlohmann::json created = {
+        {"eventId", "userprimesync-del-1"},
+        {"eventType", "fishfind.account.user_prime_sync"},
+        {"action", "created"},
+        {"aggregateId", "user-prime-del"},
+        {"occurredUtc", "2026-09-08T18:00:00Z"},
+        {"userPrime", {{"userId", "user-prime-del"}, {"dayCount", 3}, {"days", days}}}
+    };
+    CHECK(store.apply_event(created));
+
+    nlohmann::json released = nlohmann::json::array();
+    released.push_back({{"day", 1}, {"prime", 9030000001LL}});
+    released.push_back({{"day", 3}, {"prime", 9030000003LL}});
+    nlohmann::json deleted = {
+        {"eventId", "userprimesync-del-2"},
+        {"eventType", "fishfind.account.user_prime_sync"},
+        {"action", "deleted"},
+        {"aggregateId", "user-prime-del"},
+        {"occurredUtc", "2026-09-08T18:05:00Z"},
+        {"userPrime", {{"userId", "user-prime-del"}, {"dayCount", 2}, {"days", released}}}
+    };
+    CHECK(store.apply_event(deleted));
+
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(db_path.c_str(), &db) == SQLITE_OK);
+    CHECK(count_rows(db, "user_prime_sync") == 1);
+
+    sqlite3_stmt* stmt = nullptr;
+    CHECK(sqlite3_prepare_v2(db, "SELECT day_year FROM user_prime_sync WHERE user_id = 'user-prime-del'",
+                             -1, &stmt, nullptr) == SQLITE_OK);
+    CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    const int remaining_day = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    CHECK(remaining_day == 2);
+
+    std::remove(db_path.c_str());
+}
+
+// ensure_schema()'s comment claims a brand-new TABLE is safe to add without an add_column_if_missing
+// migration, because `CREATE TABLE IF NOT EXISTS` DOES create it on an already-deployed mirror --
+// unlike a new COLUMN, which is silently dropped on the floor there. That distinction is subtle
+// enough to be worth proving rather than asserting: build a mirror with no user_prime_sync, holding
+// rows in the older tables, re-run ensure_schema(), and check the table appears with the existing
+// data untouched.
+void adds_user_prime_table_to_an_existing_mirror() {
+    const std::string db_path = "account_mirror_store_test_userprime_migrate.sqlite";
+    std::remove(db_path.c_str());
+
+    {
+        AccountMirrorStore store(db_path);
+        store.ensure_schema();
+    }
+
+    // Roll the file back to a pre-change shape and put a row in users_sync that must survive.
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(db_path.c_str(), &db) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "DROP TABLE user_prime_sync;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+                       "INSERT INTO users_sync (id, users_id, user_name, email, last_visit, access, "
+                       "suspended, auth_type, deleted, deleted_utc, prime, prime_expired, updated_utc) "
+                       "VALUES ('user-old', 7, 'Grace', 'grace@example.test', '', 0, 0, 'Local', 0, "
+                       "NULL, 1000003, '2027-09-08', '2026-09-08T00:00:00Z');",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+
+    AccountMirrorStore store(db_path);
+    store.ensure_schema();
+
+    CHECK(sqlite3_open(db_path.c_str(), &db) == SQLITE_OK);
+    CHECK(count_rows(db, "user_prime_sync") == 0);   // exists, and is empty -- not an error
+    CHECK(count_rows(db, "users_sync") == 1);        // pre-existing data survived the upgrade
+    sqlite3_close(db);
+
+    std::remove(db_path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -346,6 +493,9 @@ int main() {
     preserves_prime_beyond_32_bits();
     migrates_prime_columns_onto_an_existing_mirror();
     stores_missing_prime_expired_as_null();
+    applies_user_prime_sync_creating_all_day_rows();
+    removes_user_prime_rows_on_delete_event();
+    adds_user_prime_table_to_an_existing_mirror();
     std::cout << "account_mirror_store_test: all assertions passed\n";
     return 0;
 }
