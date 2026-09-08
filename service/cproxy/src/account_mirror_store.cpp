@@ -277,6 +277,61 @@ void upsert_api_key(sqlite3* db, const nlohmann::json& key, const nlohmann::json
     }
 }
 
+// One account's per-day primes (dbo.Users_Prime). ONE event carries the whole 365-entry array rather
+// than 365 events: dbo.sp_user_prime_assign writes all 365 rows in a single INSERT and a T-SQL
+// trigger is statement-level, so dbo.TR_Users_Prime_SyncOutbox aggregates them. Row-per-prime would
+// be ~1.7M messages/min at the measured registration rate.
+//
+// Two actions, matching the trigger's two arms -- there is no 'updated', because dbo.Users_Prime is
+// write-once per account (sp_user_prime_assign inserts under a NOT EXISTS guard and never rewrites):
+//   'created' -> upsert every (day, prime) pair
+//   'deleted' -> drop exactly the listed days; a revocation, including the ON DELETE CASCADE that
+//                fires when a dbo.Users row is hard-deleted. Without this arm the mirror would keep
+//                serving primes for an account that no longer holds any.
+// A rotation therefore arrives as a 'deleted' followed by a 'created'.
+//
+// ONE prepared statement is reused across all 365 rows (reset + rebind per pair) inside the caller's
+// transaction; preparing per row would compile 365 statements per registration.
+void apply_user_prime_sync(sqlite3* db, const nlohmann::json& user_prime, const nlohmann::json& event) {
+    const std::string user_id = str_or_empty(user_prime, "userId");
+    if (user_id.empty()) return;
+    if (!user_prime.contains("days") || !user_prime["days"].is_array()) return;
+
+    const bool is_delete = str_or_empty(event, "action") == "deleted";
+    static const char* const upsert_sql =
+        "INSERT INTO user_prime_sync (user_id, day_year, prime, updated_utc) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id, day_year) DO UPDATE SET "
+        "prime=excluded.prime, updated_utc=excluded.updated_utc";
+    static const char* const delete_sql =
+        "DELETE FROM user_prime_sync WHERE user_id = ? AND day_year = ?";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, is_delete ? delete_sql : upsert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(std::format("prepare user_prime_sync: {}", sqlite3_errmsg(db)));
+    }
+
+    const std::string occurred = str_or_empty(event, "occurredUtc");
+    for (const auto& entry : user_prime["days"]) {
+        if (!entry.is_object()) continue;
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        bind_text(stmt, 1, user_id);
+        sqlite3_bind_int(stmt, 2, int_or_zero(entry, "day"));
+        if (!is_delete) {
+            // bigint from the same global sequence as Users.prime, and an access-security value:
+            // a 32-bit bind would store a DIFFERENT prime, i.e. a wrong credential, not a rounding
+            // error. Same reasoning as users_sync.prime and users_id.
+            sqlite3_bind_int64(stmt, 3, int64_or_zero(entry, "prime"));
+            bind_text(stmt, 4, occurred);
+        }
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            throw std::runtime_error(std::format("apply user_prime_sync: {}", sqlite3_errmsg(db)));
+        }
+    }
+    sqlite3_finalize(stmt);
+}
+
 }  // namespace
 
 AccountMirrorStore::AccountMirrorStore(std::string db_path) : db_path_(std::move(db_path)) {}
@@ -329,6 +384,28 @@ void AccountMirrorStore::ensure_schema() {
         "  updated_utc TEXT NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS ix_users_sync_email ON users_sync(email);"
+        // dbo.Users_Prime -- one row per (account, day of year), 365 per allocated account. Shaped
+        // like the MSSQL table rather than as a JSON blob per user so a per-day lookup is a primary
+        // key seek, not a parse of 365 entries on every request.
+        //
+        // A brand-new TABLE is safe to add here, unlike a new COLUMN: `CREATE TABLE IF NOT EXISTS`
+        // does create it on an already-deployed mirror (the table genuinely does not exist yet),
+        // which is why this needs no add_column_if_missing migration below. Do not read the
+        // "IF NOT EXISTS is a no-op on an existing mirror" rule as applying to whole tables --
+        // it is about columns bolted onto a table that already exists.
+        "CREATE TABLE IF NOT EXISTS user_prime_sync ("
+        "  user_id TEXT NOT NULL,"
+        "  day_year INTEGER NOT NULL,"
+        "  prime INTEGER NOT NULL DEFAULT 0,"
+        "  updated_utc TEXT NOT NULL,"
+        "  PRIMARY KEY (user_id, day_year)"
+        ");"
+        // Deliberately NOT unique, though UK_Users_Prime on the MSSQL side is: primes are issued
+        // once globally, but a mirror can legitimately hold a stale pair for a moment if a 'created'
+        // for a re-issued prime is applied before the 'deleted' that released it. Enforcing
+        // uniqueness here would turn that ordering into a hard failure on an event that is merely
+        // out of order. The mirror reflects; the database enforces.
+        "CREATE INDEX IF NOT EXISTS ix_user_prime_sync_prime ON user_prime_sync(prime);"
         "CREATE TABLE IF NOT EXISTS user_api_key ("
         "  key_id TEXT PRIMARY KEY,"
         "  user_id TEXT NOT NULL DEFAULT '',"
@@ -376,6 +453,9 @@ bool AccountMirrorStore::apply_event(const nlohmann::json& event) {
         upsert_api_key(handle.db, event.contains("apiKey") ? event["apiKey"] : nlohmann::json::object(), event);
     } else if (type == "fishfind.account.user_sync") {
         upsert_user_sync(handle.db, event.contains("user") ? event["user"] : nlohmann::json::object(), event);
+    } else if (type == "fishfind.account.user_prime_sync") {
+        apply_user_prime_sync(handle.db,
+                              event.contains("userPrime") ? event["userPrime"] : nlohmann::json::object(), event);
     }
     tx.commit();
     return true;
