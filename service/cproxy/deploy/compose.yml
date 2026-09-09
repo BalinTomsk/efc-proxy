@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:39af80b9e1eb95e11406ec35ccc6b1dab6fb66af6676b016aefc920f30b82950  # 0.9.5 pinned by digest
+    image: ghcr.io/balintomsk/cproxy@sha256:fed021258e114c4951634a9e6346e1d402a30d6b1869dac2ff0c32f9e905517a  # 0.10.0 pinned by digest
     container_name: cproxy
     restart: unless-stopped
     ports:
@@ -39,6 +39,36 @@ services:
       # CPROXY_RABBITMQ_PASSWORD is secret and must come from /mnt/volume_cnode/cproxy/.env.
       CPROXY_RABBITMQ_QUEUE: fishfind.account.events
       CPROXY_ACCOUNT_MIRROR_DB: /var/lib/cproxy/auth.sqlite
+      # Gateway JWT (0.10.0). CPROXY_JWT_SECRET is secret and comes from the volume's .env, same as
+      # the two above -- it must equal FishApi:JwtKey in the frontend's secrets.config byte for byte.
+      #
+      # The bare X-Day-Guid header is NO LONGER ACCEPTED as of 2026-09-09: a signed token is the only
+      # credential for the gated surface. This is the step where the migration actually buys
+      # something -- before it, a leaked day-key was still a working credential on its own. Every
+      # caller must present Authorization: Bearer <token>; for a human that means
+      # Profile -> Gateway token -> Save jwt.txt on the portal. Rollback is setting this to "false"
+      # and re-running compose up -d (no rebuild, no image change).
+      CPROXY_JWT_REQUIRED: "true"
+      #
+      # The `user` claim is now enforced too (2026-09-09): a POST/PATCH must carry one, and any claim
+      # present -- on a read as well -- must resolve to a live, non-suspended, non-deleted, unexpired
+      # account in the RabbitMQ mirror. A gated READ with NO claim is still allowed, because
+      # /news/featured and /news/more are the public home page and the gate there is against
+      # anonymous scraping, not anonymous reading.
+      #
+      # This was blocked until the mirror actually had data. It was empty for two independent
+      # reasons, both silent: TR_Users_Prime_SyncOutbox postdates every existing account (fixed by
+      # dbo.sp_user_prime_sync_backfill), and the dispatcher's prime stream was broken under Windows
+      # PowerShell 5.1. Mirror now holds 1095 user_prime_sync rows / 3 accounts.
+      #
+      # BEFORE CHANGING THIS, read the startup line "user-prime store loaded" and check `accounts` is
+      # non-zero. The store fails CLOSED -- an empty or unreadable mirror refuses every write and
+      # every signed-in read, with only an opaque 500 to show for it. Rollback is setting this to
+      # "false" and re-running compose up -d.
+      CPROXY_JWT_REQUIRE_USER: "true"
+      #   issuer/audience/subject       -- envfish / fishfind.info / cproxy, which is what the
+      #                                    frontend mints; writing them here would just be a second
+      #                                    place to keep in sync.
       # CPROXY_CLOUDRANGE_REFRESH_ON_START is intentionally NOT set. It was on for the first deploy
       # only, to populate the database immediately instead of waiting out the 336h timer. The
       # database lives on the volume and survives redeploys, so leaving it on would just re-pull

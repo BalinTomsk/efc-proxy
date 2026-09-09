@@ -10,6 +10,7 @@
 #include <thread>
 
 #include <httplib.h>
+#include <openssl/hmac.h>
 #include <sqlite3.h>
 
 #include "cloud_range_store.hpp"
@@ -353,6 +354,139 @@ void gated_read_path_requires_day_key() {
     std::remove(db.c_str());
 }
 
+// --- JWT credential (0.10.0) -------------------------------------------------------------------
+// The day-key now travels inside a signed token instead of on its own in a header. These tests drive
+// the gate end to end through real HTTP; jwt_verifier_test covers the token format itself.
+
+const std::string kTestJwtSecret = "proxy-test-signing-secret-long-enough-for-hs512-use";
+
+std::string b64url(const std::string& bytes) {
+    static const char* const alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    int bits = 0;
+    unsigned int acc = 0;
+    for (unsigned char c : bytes) {
+        acc = (acc << 8) | c;
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            out.push_back(alphabet[(acc >> bits) & 0x3F]);
+        }
+    }
+    if (bits > 0) out.push_back(alphabet[(acc << (6 - bits)) & 0x3F]);
+    return out;
+}
+
+/** The token the frontend's FishApiJwt would mint: exp at the end of the current UTC day. */
+std::string mint_token(const std::string& day_guid, const std::string& user = "",
+                       const std::string& secret = kTestJwtSecret) {
+    const auto now = std::chrono::system_clock::now();
+    const auto end_of_day = std::chrono::floor<std::chrono::days>(now) + std::chrono::days{1};
+    const long long exp =
+        std::chrono::duration_cast<std::chrono::seconds>(end_of_day.time_since_epoch()).count() - 1;
+    const long long iat =
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+
+    std::string payload = "{\"iss\":\"envfish\",\"iat\":" + std::to_string(iat) +
+                          ",\"exp\":" + std::to_string(exp) +
+                          ",\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"" + day_guid +
+                          "\"";
+    if (!user.empty()) payload += ",\"user\":\"" + user + "\"";
+    payload += "}";
+
+    const std::string signing_input =
+        b64url("{\"typ\":\"JWT\",\"alg\":\"HS512\"}") + "." + b64url(payload);
+
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int length = 0;
+    HMAC(EVP_sha512(), secret.data(), static_cast<int>(secret.size()),
+         reinterpret_cast<const unsigned char*>(signing_input.data()), signing_input.size(), digest,
+         &length);
+    return signing_input + "." + b64url(std::string(reinterpret_cast<char*>(digest), length));
+}
+
+// While CPROXY_JWT_REQUIRED is off, a token and the legacy header are both accepted — that overlap
+// is what lets the frontend and the gateway be deployed in either order. What must NOT work is a
+// broken token alongside a good header: falling back there would let an attacker downgrade past the
+// signature check with a day-key harvested from anywhere.
+void bearer_jwt_clears_the_gate_alongside_the_legacy_header() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    const std::string db = "proxy_test_jwt_day_keys.sqlite";
+    write_uniform_day_key_db(db, "TEST-DAY-KEY");
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    cfg.daykey_db_path = db;
+    cfg.jwt_secret = kTestJwtSecret;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+
+    auto with_token =
+        cli.Get("/api/v1/news/default", {{"Authorization", "Bearer " + mint_token("TEST-DAY-KEY")}});
+    CHECK(with_token && with_token->status == 200);
+    CHECK(with_token->body == "upstream:/api/v1/news/default");
+
+    // Case-insensitive on the day-key, exactly as the header path has always been.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_token("test-day-key")}})
+              ->status == 200);
+
+    // Legacy header, still good.
+    CHECK(cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}})->status == 200);
+
+    // A token signed with the wrong secret is fatal even though a perfectly good day-key header
+    // rides along with it. No downgrade.
+    auto forged = cli.Get("/api/v1/news/default",
+                          {{"Authorization", "Bearer " + mint_token("TEST-DAY-KEY", "", "wrong")},
+                           {"X-Day-Guid", "TEST-DAY-KEY"}});
+    CHECK(forged && forged->status == 500);
+    CHECK(forged->body.find("jwt") == std::string::npos);  // the reason stays in the log
+
+    // A valid signature over the wrong day-key is refused too: the token proves who minted it, the
+    // `server` claim proves they hold today's rotating credential, and both are required.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_token("NOT-TODAYS-KEY")}})
+              ->status == 500);
+
+    std::remove(db.c_str());
+}
+
+// The end state of the migration: CPROXY_JWT_REQUIRED retires the bare header. Until this is turned
+// on, nothing has actually been taken away from an attacker who has the day-key.
+void jwt_required_retires_the_legacy_header() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    const std::string db = "proxy_test_jwt_required_day_keys.sqlite";
+    write_uniform_day_key_db(db, "TEST-DAY-KEY");
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    cfg.daykey_db_path = db;
+    cfg.jwt_secret = kTestJwtSecret;
+    cfg.jwt_required = true;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    CHECK(cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}})->status == 500);
+    CHECK(cli.Get("/api/v1/news/default")->status == 500);
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_token("TEST-DAY-KEY")}})
+              ->status == 200);
+
+    std::remove(db.c_str());
+}
+
 // Turning the path gate off (CPROXY_DAYKEY_PATHS=NONE) must actually open the read back up,
 // otherwise there is no way to roll the protection back without shipping a new binary.
 void gated_read_path_can_be_disabled() {
@@ -601,6 +735,8 @@ int main() {
     content_type_is_forwarded();
     post_and_patch_require_day_key();
     gated_read_path_requires_day_key();
+    bearer_jwt_clears_the_gate_alongside_the_legacy_header();
+    jwt_required_retires_the_legacy_header();
     gated_read_path_can_be_disabled();
     datacenter_ip_is_refused_with_500();
     datacenter_block_has_escape_hatches();

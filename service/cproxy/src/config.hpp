@@ -30,6 +30,14 @@ namespace cproxy {
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
  * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; POST/PATCH always 500 while empty |
  * | CPROXY_DAYKEY_PATHS         | /news/default,/news/featured,/news/more | CSV of paths day-key gated on EVERY method, GET included ("NONE" disables) |
+ * | CPROXY_JWT_SECRET           | (empty)                       | HS512 shared secret; empty = Bearer tokens not verified, X-Day-Guid only |
+ * | CPROXY_JWT_REQUIRED         | false                         | true = a valid JWT is the only accepted credential |
+ * | CPROXY_JWT_REQUIRE_USER     | false                         | true = writes must name an account, and any `user` claim must match the mirror |
+ * | CPROXY_JWT_ISSUER           | envfish                       | required `iss` ("" = do not check)        |
+ * | CPROXY_JWT_AUDIENCE         | fishfind.info                 | required `aud` ("" = do not check)        |
+ * | CPROXY_JWT_SUBJECT          | cproxy                        | required `sub` ("" = do not check)        |
+ * | CPROXY_JWT_LEEWAY_SECONDS   | 300                           | clock-skew allowance on exp/iat           |
+ * | CPROXY_JWT_USER_CACHE_SECONDS | 60                          | how long the account-prime snapshot is reused |
  * | CPROXY_CLOUDRANGE_DB        | (empty)                       | SQLite datacenter-IP range db; empty = feature off |
  * | CPROXY_BLOCK_CLOUD_IPS      | true                          | kill-switch for refusing datacenter IPs   |
  * | CPROXY_CLOUDRANGE_REFRESH_HOURS | 336 (fortnightly)         | interval between provider-feed refreshes  |
@@ -62,6 +70,45 @@ struct Config {
     // Path to the day-key SQLite database (see DayKeyStore). Empty means day-key auth is not
     // configured, so every PATCH request fails closed with 500 regardless of CPROXY_ALLOWED_METHODS.
     std::string daykey_db_path;
+
+    // --- JWT credential (0.10.0) --------------------------------------------------------------
+    // The frontend presents `Authorization: Bearer <HS512 JWT>` instead of the raw X-Day-Guid
+    // header. The token's `server` claim carries the same day-key the header did (DayKeyStore stays
+    // the authority on it) and its `user` claim carries Users.prime * Users_Prime.prime for today,
+    // which UserPrimeStore re-derives from the account mirror. See jwt_verifier.hpp.
+    //
+    // Shared HS512 secret, matching the frontend's FishApi:JwtKey. EMPTY DISABLES JWT ENTIRELY —
+    // the gate then behaves exactly as it did before 0.10.0 (X-Day-Guid only), which is what makes
+    // this shippable without coordinating the two deploys.
+    std::string jwt_secret;
+    // When true, a valid JWT is the ONLY accepted credential: a bare X-Day-Guid header no longer
+    // clears the gate. Default false so the two services can be deployed in either order and the
+    // existing tooling (add-fish, Postman) keeps working; flip it once every caller mints tokens.
+    bool jwt_required = false;
+    // When true, a `user` claim is REQUIRED on every write (POST/PATCH) and, wherever one is
+    // present, must resolve to a live, non-suspended, non-deleted account in the mirror. A gated
+    // READ may still be anonymous — /news/featured and /news/more are the public home page, and the
+    // gate on them exists to stop anonymous scraping, not anonymous reading.
+    //
+    // Default false because the mirror is fed by the RabbitMQ users-sync pipeline: turning this on
+    // against an unpopulated mirror refuses every write and every signed-in visitor's reads. Turn it
+    // on only once the mirror is known to be current (the startup log reports how many accounts it
+    // loaded).
+    bool jwt_require_user = false;
+    // Claims the token must carry, "" meaning "do not check". Defaults match the platform's minter
+    // (fishfind-frontend/doc/envfish-jwt.html).
+    std::string jwt_issuer = "envfish";
+    std::string jwt_audience = "fishfind.info";
+    std::string jwt_subject = "cproxy";
+    // Clock-skew allowance on exp/iat, seconds. The token lives one day; a few minutes of slack
+    // between two independently-clocked hosts costs nothing.
+    int jwt_leeway_seconds = 300;
+    // How long a UserPrimeStore snapshot is reused before it is rebuilt from the mirror. A
+    // suspension or deletion takes at most this long to bite.
+    int jwt_user_cache_seconds = 60;
+
+    /** True when CPROXY_JWT_SECRET is set and Bearer tokens are verified at all. */
+    bool jwt_enabled() const { return !jwt_secret.empty(); }
 
     // --- Datacenter / cloud-provider IP blocking (mirrors the frontend's CloudProviderIpRange) ---
     // Path to the SQLite range database. Empty => the feature is off entirely: no blocking, and the

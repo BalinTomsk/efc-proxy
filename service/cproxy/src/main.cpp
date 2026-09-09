@@ -96,7 +96,7 @@ int main() {
         "\"listen\":\"{}:{}\",\"route_prefix\":\"{}\",\"docapi_upstream\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
-        "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
+        "\"jwt\":\"{}\",\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.auth_required() ? "true" : "false",
         cfg.allowed_methods.empty() ? "ALL" : "restricted",
@@ -107,6 +107,12 @@ int main() {
             : std::string("disabled"),
         cfg.upstream_retry,
         cfg.daykey_db_path.empty() ? "(unconfigured, PATCH always 500s)" : cfg.daykey_db_path,
+        // The secret itself is never logged, only which of the three states the gate is in — the one
+        // thing an operator needs from this line after a rollout step.
+        !cfg.jwt_enabled() ? std::string("off (X-Day-Guid only)")
+                           : std::format("on ({}, user claim {})",
+                                         cfg.jwt_required ? "required" : "X-Day-Guid still accepted",
+                                         cfg.jwt_require_user ? "enforced" : "ignored"),
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
     if (!server.listen(cfg.listen_addr, cfg.listen_port)) {
