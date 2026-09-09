@@ -275,6 +275,62 @@ void daykey_paths_are_configurable_and_can_be_cleared() {
     CHECK(empty.daykey_required("GET", "/api/v1/news/more"));
 }
 
+void jwt_is_off_until_a_secret_is_configured() {
+    Config c = load_config(make_env({}));
+    CHECK(!c.jwt_enabled());
+    CHECK(!c.jwt_required);
+    CHECK(!c.jwt_require_user);
+    // Defaults match what the frontend mints (doc/envfish-jwt.html); a mismatch here rejects every
+    // real token, so pin them.
+    CHECK(c.jwt_issuer == "envfish");
+    CHECK(c.jwt_audience == "fishfind.info");
+    CHECK(c.jwt_subject == "cproxy");
+    CHECK(c.jwt_leeway_seconds == 300);
+    CHECK(c.jwt_user_cache_seconds == 60);
+    CHECK(validate_config(c).empty());
+}
+
+void jwt_settings_are_read_and_claim_checks_can_be_switched_off() {
+    Config c = load_config(make_env({{"CPROXY_JWT_SECRET", "s3cr3t"},
+                                     {"CPROXY_JWT_REQUIRED", "true"},
+                                     {"CPROXY_JWT_REQUIRE_USER", "yes"},
+                                     {"CPROXY_JWT_LEEWAY_SECONDS", "30"},
+                                     {"CPROXY_JWT_USER_CACHE_SECONDS", "5"},
+                                     {"CPROXY_JWT_ISSUER", "elsewhere"},
+                                     {"CPROXY_JWT_AUDIENCE", "NONE"},
+                                     {"CPROXY_JWT_SUBJECT", " none "}}));
+    CHECK(c.jwt_enabled());
+    CHECK(c.jwt_required);
+    CHECK(c.jwt_require_user);
+    CHECK(c.jwt_leeway_seconds == 30);
+    CHECK(c.jwt_user_cache_seconds == 5);
+    CHECK(c.jwt_issuer == "elsewhere");
+    CHECK(c.jwt_audience.empty());  // "NONE" = do not check this claim
+    CHECK(c.jwt_subject.empty());   // and it survives the casing an operator actually types
+    CHECK(validate_config(c).empty());
+}
+
+void a_jwt_switch_without_a_secret_is_a_startup_error() {
+    // Both switches mean "refuse callers that do not present a token". With no secret there is
+    // nothing to verify one against, so the service would go on accepting the very credential the
+    // operator was retiring — a silent no-op is the worst possible outcome, so it is fatal.
+    CHECK(!validate_config(load_config(make_env({{"CPROXY_JWT_REQUIRED", "true"}}))).empty());
+    CHECK(!validate_config(load_config(make_env({{"CPROXY_JWT_REQUIRE_USER", "true"}}))).empty());
+
+    // The user check additionally needs the mirror it reads.
+    Config no_mirror = load_config(make_env({{"CPROXY_JWT_SECRET", "s"},
+                                             {"CPROXY_JWT_REQUIRE_USER", "true"}}));
+    no_mirror.account_mirror_db_path.clear();
+    CHECK(!validate_config(no_mirror).empty());
+
+    CHECK(validate_config(load_config(make_env({{"CPROXY_JWT_SECRET", "s"},
+                                                {"CPROXY_JWT_REQUIRED", "true"}})))
+              .empty());
+    CHECK(!validate_config(load_config(make_env({{"CPROXY_JWT_SECRET", "s"},
+                                                 {"CPROXY_JWT_USER_CACHE_SECONDS", "0"}})))
+               .empty());
+}
+
 }  // namespace
 
 int main() {
@@ -289,6 +345,9 @@ int main() {
     payload_limit_is_read_with_default();
     daykey_paths_gate_reads_by_default();
     daykey_paths_are_configurable_and_can_be_cleared();
+    jwt_is_off_until_a_secret_is_configured();
+    jwt_settings_are_read_and_claim_checks_can_be_switched_off();
+    a_jwt_switch_without_a_secret_is_a_startup_error();
     std::cout << "config_test: all assertions passed\n";
     return 0;
 }

@@ -17,7 +17,9 @@
 #include "breaker.hpp"
 #include "cloud_range_store.hpp"
 #include "day_key_store.hpp"
+#include "jwt_verifier.hpp"
 #include "log.hpp"
+#include "user_prime_store.hpp"
 #include "version.hpp"
 
 namespace cproxy {
@@ -69,6 +71,11 @@ struct ProxyState {
     // surface, so a load failure here just leaves this empty — every gated request then fails closed
     // (500) rather than the whole process refusing to start. See proxy_to_docapi's day-key gate.
     std::optional<DayKeyStore> daykey_store;
+    // Per-account primes out of the RabbitMQ account mirror, used only to check a JWT's `user`
+    // claim. Constructed only when CPROXY_JWT_REQUIRE_USER is on: the store is cheap but the mirror
+    // it reads is optional infrastructure, and an unpopulated mirror matching nothing is exactly the
+    // fail-closed behaviour that switch is asking for.
+    std::optional<UserPrimeStore> user_prime_store;
     // Datacenter / cloud-provider ranges. Load failures leave this EMPTY, which blocks nothing —
     // the opposite of the day-key store's fail-closed stance, and deliberate: a missing range file
     // must never turn into "refuse all traffic". The frontend takes the same position by starting
@@ -96,6 +103,19 @@ struct ProxyState {
                     "\"msg\":\"day-key database failed to load, PATCH will 500: {}\"}}",
                     ex.what()));
             }
+        }
+        if (cfg.jwt_require_user && !cfg.account_mirror_db_path.empty()) {
+            user_prime_store.emplace(cfg.account_mirror_db_path, cfg.jwt_user_cache_seconds);
+            // Force the first snapshot here so a mirror that is missing, empty, or still dormant is
+            // visible in the startup log rather than only as an unexplained wall of 500s. An empty
+            // set is the fail-closed state, not an error the constructor can throw on.
+            user_prime_store->refresh(std::chrono::system_clock::now());
+            const std::string load_error = user_prime_store->last_error();
+            log_raw(std::format(
+                "{{\"service\":\"cproxy\",\"level\":\"{}\",\"msg\":\"user-prime store loaded\","
+                "\"accounts\":{},\"error\":\"{}\"}}",
+                (load_error.empty() && user_prime_store->size() > 0) ? "INFO" : "ERROR",
+                user_prime_store->size(), load_error));
         }
         if (!cfg.cloudrange_db_path.empty()) {
             try {
@@ -225,6 +245,78 @@ bool is_retryable_method(const std::string& method) {
     return method == "GET" || method == "HEAD" || method == "OPTIONS";
 }
 
+/** Outcome of the gated-surface credential check: `ok`, plus a short reason for the LOG only. */
+struct CredentialCheck {
+    bool ok = false;
+    std::string reason;
+};
+
+/**
+ * The credential for the gated surface, in its 0.10.0 shape: an `Authorization: Bearer <HS512 JWT>`
+ * whose `server` claim carries the day-key and whose `user` claim carries this account's
+ * `Users.prime * Users_Prime.prime` for today, with the pre-0.10.0 raw `X-Day-Guid` header still
+ * accepted underneath until `CPROXY_JWT_REQUIRED` is turned on.
+ *
+ * Three rules worth stating, because each one is a decision rather than an accident:
+ *
+ * - **A token that is present but bad is always fatal**, even while `jwt_required` is false. Falling
+ *   back to the header on a failed signature would hand an attacker a downgrade: present a garbage
+ *   token, then win on a day-key harvested from anywhere. The fallback exists for callers that send
+ *   NO token, not for tokens that fail.
+ * - **The day-key is still checked from the token's `server` claim.** The JWT proves the caller holds
+ *   the signing secret; the claim proves they also hold today's rotating key. Dropping the second
+ *   check would make a leaked signing secret permanent access, which is the exact property the
+ *   day-key rotation exists to deny.
+ * - **The reason never reaches the caller.** Every failure here answers the same generic 500 as
+ *   before (see proxy_to_docapi), so a prober cannot tell a bad signature from an expired token from
+ *   an unknown account — or from an ordinary server error.
+ */
+CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
+                                      const httplib::Request& req,
+                                      std::chrono::system_clock::time_point now) {
+    const std::string token = bearer_token(req.get_header_value("Authorization"));
+
+    if (cfg.jwt_enabled() && !token.empty()) {
+        JwtVerifyOptions opts;
+        opts.secret = cfg.jwt_secret;
+        opts.issuer = cfg.jwt_issuer;
+        opts.audience = cfg.jwt_audience;
+        opts.subject = cfg.jwt_subject;
+        opts.leeway_seconds = cfg.jwt_leeway_seconds;
+
+        const JwtResult verified = verify_hs512(token, opts, now);
+        if (!verified.ok) return {false, "jwt rejected: " + verified.error};
+
+        if (!state.daykey_store.has_value() || !state.daykey_store->is_valid(verified.claims.server, now)) {
+            return {false, "jwt server claim is not a current day-key"};
+        }
+        if (cfg.jwt_require_user) {
+            // A WRITE must name an account; a gated READ need not. /news/featured and /news/more are
+            // the home page, served to anonymous visitors, so demanding a `user` claim there would
+            // put the whole front page behind a login — the gate exists to stop anonymous SCRAPING
+            // of an expensive endpoint, not anonymous READING of it. Whenever a claim IS present it
+            // is checked, read or write, so a stale or revoked account never rides along unnoticed.
+            const bool is_write = iequals(req.method, "POST") || iequals(req.method, "PATCH");
+            if (verified.claims.user.empty()) {
+                if (is_write) return {false, "jwt carries no user claim on a write"};
+            } else if (!state.user_prime_store.has_value() ||
+                       !state.user_prime_store->is_valid(verified.claims.user, now)) {
+                return {false, "jwt user claim does not match a live account"};
+            }
+        }
+        return {true, {}};
+    }
+
+    if (cfg.jwt_required) {
+        return {false, token.empty() ? "no bearer token presented" : "jwt not configured"};
+    }
+
+    // Pre-0.10.0 path, unchanged: the raw rotating GUID in its own header.
+    const bool ok = state.daykey_store.has_value() &&
+                    state.daykey_store->is_valid(req.get_header_value("X-Day-Guid"), now);
+    return {ok, ok ? std::string{} : "day-key check failed"};
+}
+
 /** Forwards one request to the docapi upstream and copies the response back. */
 void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Request& req,
                      httplib::Response& res) {
@@ -284,10 +376,11 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         return;
     }
 
-    // The write surface (POST, PATCH) plus any path in CPROXY_DAYKEY_PATHS additionally requires a
-    // per-day rotating credential — see DayKeyStore. Deliberately answered with a generic 500, not
-    // 401/403: a wrong or missing day-key must not read any differently from an ordinary server
-    // error to a caller probing it.
+    // The write surface (POST, PATCH) plus any path in CPROXY_DAYKEY_PATHS additionally requires the
+    // gateway credential — a Bearer JWT carrying the day-key, or the bare day-key header while the
+    // migration is in flight; see check_gate_credential. Deliberately answered with a generic 500,
+    // not 401/403: a wrong or missing credential must not read any differently from an ordinary
+    // server error to a caller probing it.
     // POST joined PATCH here when docapi's regulation endpoints (insert, not just merge-patch) were
     // fronted through cproxy — every method that mutates docapi state must clear the same gate, not
     // just PATCH. The path arm came later, to put READ endpoints behind the same credential
@@ -295,12 +388,11 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // acceptable. Both the decoded path and the raw target are tested, and either one matching
     // gates the request — the union is the fail-secure direction.
     if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
-        const bool ok = state.daykey_store.has_value() &&
-                        state.daykey_store->is_valid(req.get_header_value("X-Day-Guid"),
-                                                     std::chrono::system_clock::now());
-        if (!ok) {
+        const CredentialCheck credential =
+            check_gate_credential(cfg, state, req, std::chrono::system_clock::now());
+        if (!credential.ok) {
             write_error(res, 500, "internal_error", "Internal error");
-            log_request(std::format("{} {} -> 500 (day-key check failed)", req.method, req.path),
+            log_request(std::format("{} {} -> 500 ({})", req.method, req.path, credential.reason),
                         req.remote_addr, rid);
             return;
         }

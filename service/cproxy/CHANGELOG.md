@@ -9,6 +9,144 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-08: **0.10.0 — the gateway credential becomes a signed JWT; the day-key rides inside it.
+  DEPLOYED** (digest `sha256:fed02125…517a`; `/health` → `0.10.0`; startup logs
+  `"jwt":"on (X-Day-Guid still accepted, user claim ignored)"`, which is also the proof that
+  `CPROXY_JWT_SECRET` decrypted out of the volume's encrypted dotenv). **`CPROXY_JWT_REQUIRED` and
+  `CPROXY_JWT_REQUIRE_USER` are both still OFF** — see the rollout note below; the migration is at
+  step 2 of 4. The header `X-Day-Guid: <guid>` is replaced by
+  `Authorization: Bearer <HS512 JWT>`, minted by the frontend (`aspnet/Account/FishApiJwt.cs`) with
+  the claim set in `fishfind-frontend/doc/envfish-jwt.html`:
+
+  ```
+  { "iss":"envfish", "iat":…, "exp":<end of the current UTC day>, "aud":"fishfind.info",
+    "sub":"cproxy", "server":"<dbo.day_keys.guid for today>",
+    "user":"<Users.prime * Users_Prime.prime for today>" }
+  ```
+
+  **What this actually buys, and what it does not.** The bare header put the day-key on the wire with
+  nothing binding it to this site or to a moment in time: anyone who saw one request could replay the
+  GUID from anywhere for the rest of the day. The token binds it to a signature, an audience, and an
+  expiry. It is **not** a replacement for the rotation — `server` is still checked against
+  `DayKeyStore` exactly as the header was, so a leaked signing secret alone buys nothing without
+  today's GUID, and vice versa. Both halves are required.
+
+  - **`src/jwt_verifier.hpp/.cpp`** — compact-JWS parse + verify, **HS512 pinned**. The header's
+    `alg` is never obeyed: honouring it is how `"alg":"none"` and algorithm-confusion forgeries get
+    in. `exp` is mandatory (an unbounded token would reintroduce the "leaked credential is valid
+    forever" property the rotation exists to deny); `iss`/`aud`/`sub` are checked when configured;
+    the MAC is compared with `CRYPTO_memcmp` before any claim is read. OpenSSL only — no new
+    dependency, same posture as `secret_codec.cpp`.
+  - **`src/user_prime_store.hpp/.cpp`** — resolves the `user` claim against cproxy's OWN account
+    mirror (`users_sync` ⋈ `user_prime_sync`), never MSSQL. Both factors are primes issued once
+    globally, so the product names one account on one day while revealing neither factor.
+    **Compared as decimal TEXT in 128-bit arithmetic**: the two bigints multiply past 2^63 and a
+    wrapped `long` would not fail loudly, it would silently authorise a different number. Suspended,
+    deleted, unallocated (`prime = 0`) and prime-expired accounts do not match; the snapshot is
+    rebuilt every `CPROXY_JWT_USER_CACHE_SECONDS` (default 60), which is also how long a revocation
+    takes to bite.
+  - **Rollout is a three-step switch, and every step is reversible.** `CPROXY_JWT_SECRET` empty ⇒
+    0.9.x behaviour exactly (header only), so this ships without coordinating the two deploys. With
+    the secret set, both credentials are accepted. `CPROXY_JWT_REQUIRED=true` retires the header —
+    **until that is on, nothing has been taken away from someone who has the day-key.** Order:
+    frontend deploy → gateway secret → frontend `FishApi:JwtOnly=true` → gateway
+    `CPROXY_JWT_REQUIRED=true`.
+  - **`CPROXY_JWT_REQUIRE_USER` defaults to false, and that is not timidity.** The mirror it reads is
+    fed by the users-sync RabbitMQ pipeline; turning this on against an unpopulated mirror refuses
+    every write and every signed-in visitor's reads. The startup log now reports how many accounts
+    loaded — check that line before flipping it. When on: a write must carry a `user` claim, a gated
+    READ need not (`/news/featured` and `/news/more` are the public home page — the gate there is
+    against anonymous *scraping*, not anonymous *reading*), and any claim that IS present is checked
+    either way.
+  - **A present-but-invalid token is always fatal, even while the header is still accepted.** Falling
+    back on a failed signature would hand an attacker the downgrade: send garbage, win on a harvested
+    day-key. The fallback is for callers that send NO token.
+  - **Failure is still the same opaque 500** — bad signature, expired, unknown account, and an
+    ordinary server error are indistinguishable to a prober. The reason goes to the log only;
+    `proxy_test` asserts it does not reach the body.
+  - **Tests.** `jwt_verifier_test` (15 cases: forged signature, tampered payload, `alg:none`, HS256
+    downgrade, expiry + leeway, missing `exp`, claim mismatches, array `aud`, malformed input,
+    Bearer parsing, base64url); `user_prime_store_test` (9 cases: the product match, a product past
+    2^63, suspended/deleted/unallocated/expired exclusion, the three-day window, the year-boundary
+    wrap, the leap-day clamp to day 365, a missing mirror failing closed, TTL revocation);
+    `proxy_test` gains two end-to-end cases through real HTTP — token and legacy header both
+    accepted, a forged token fatal even with a good header alongside, and `jwt_required` retiring the
+    header; `config_test` gains three. **9/9 suites pass.** Verified failing first: deleting the
+    `jwt_required` arm from `check_gate_credential` (so the code falls through to the legacy header)
+    produces `CHECK failed: cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}})->status
+    == 500` at `proxy_test.cpp:481`, with the other eight suites still green — the new tests fail for
+    the reason they exist, not incidentally.
+  - Frontend half in the same change: `aspnet/Account/FishApiJwt.cs` (mint + cache to UTC midnight),
+    `Default.aspx.cs` (sends `Authorization`, its private `GetTodaysDayGuid` moved into the new
+    class), `Profile.aspx` (admin-only "Gateway token" section, `Save jwt.txt`), `Web.config`
+    (`FishApi:JwtKey` → secrets.config, `FishApi:JwtOnly`).
+  - **Verified live after the deploy**, from the allowlisted workstation, with a token minted by the
+    deployed `FishTracker.dll` itself:
+
+    | request | result |
+    |---|---|
+    | `GET /fish/search` (ungated, no creds) | `200` |
+    | `GET /news/more` **no creds** | `500` — log: `day-key check failed`; body is cproxy's own `{"error":…}` |
+    | `GET /news/more` **valid Bearer JWT** | cleared the gate — body is docapi's `{"data":…,"meta":…}` envelope |
+    | `GET /news/more` **valid X-Day-Guid** | cleared the gate, same envelope (the legacy path still works) |
+    | `GET /news/more` **tampered token** | `500` — log: `jwt rejected: signature mismatch` |
+    | `GET /river/unfished`, `/fish/search`, `/news/list` **with JWT** | `200` — the add-fish surface works on the token |
+
+    **Read the two 500 bodies, not the two 500 statuses.** cproxy's gate refusal is
+    `{"error":{"code":"internal_error"}}`; what the valid credentials got back is docapi's
+    `{"data":null,"error":…,"meta":{"timestamp":…}}`. The three assembled-home-page endpoints
+    (`/news/default`, `/news/featured`, `/news/more`) are failing **upstream in docapi** — a
+    **pre-existing fault unrelated to this change**, proven by the untouched `X-Day-Guid` path
+    failing identically while every other docapi endpoint returns 200. Worth a separate look;
+    nothing here caused it and nothing here can fix it.
+  - **Rollout COMPLETE, 2026-09-09** (all four steps; the last two landed the same night as the
+    first two, on the user's instruction). `FishApi:JwtOnly=true` went to prod first so the frontend
+    stopped sending the bare header, then `CPROXY_JWT_REQUIRED: "true"` in `compose.yml` here.
+    Startup now reads `"jwt":"on (required, user claim ignored)"`.
+
+    **Verified after the flip**, on the new UTC day's key (day_year 252, so the daily rollover was
+    exercised too):
+
+    | request | result |
+    |---|---|
+    | `GET /news/more` **X-Day-Guid only** | `500`, cproxy's `{"error":…}` — **the bare day-key is now refused** |
+    | `GET /news/more` **Bearer JWT** | cleared the gate (docapi's envelope) |
+    | `PATCH /river/fish/{zero-guid}` **no creds** | `500`, cproxy's `{"error":…}` |
+    | `PATCH /river/fish/{zero-guid}` **X-Day-Guid only** | `500`, cproxy's `{"error":…}` — writes closed to the header too |
+    | `PATCH /river/fish/{zero-guid}` **Bearer JWT** | `400 invalid_document` **from docapi** — cleared the gate |
+    | `GET /fish/search` (ungated) | `200`, still open |
+
+    The write check used an all-zero GUID and an empty `[]` body deliberately: the gate decides
+    before anything is forwarded, so it proves the write surface without being able to change a row.
+  - **What this actually bought.** Only now is a leaked day-key worthless on its own — for the two
+    days the migration sat at step 2, the header was still a complete credential. The remaining
+    exposure is the signing secret, which unlike the day-key is not handed to anyone and does not
+    travel on the wire.
+  - **`CPROXY_JWT_REQUIRE_USER=true` as well, later the same night.** It had been held off because
+    the account mirror was empty; once `envfish-db`'s `sp_user_prime_sync_backfill` filled it (1095
+    `user_prime_sync` rows / 3 accounts) the switch became viable. Startup now reads
+    `"jwt":"on (required, user claim enforced)"` and, crucially,
+    `"msg":"user-prime store loaded","accounts":9,"error":""` — 3 accounts × the 3-day window, and
+    an empty `error`, which is also the proof that the READ-ONLY open of the WAL mirror works from
+    inside the container.
+
+    Full matrix verified on prod, again **reading the body, not the status**:
+
+    | request | result |
+    |---|---|
+    | `PATCH` **valid user claim** | `400 invalid_document` from docapi — cleared the gate |
+    | `PATCH` **no user claim** | `500`, log: `jwt carries no user claim on a write` |
+    | `PATCH` **bogus user claim** | `500`, log: `jwt user claim does not match a live account` |
+    | gated `GET` **no user claim** | docapi's envelope — **anonymous read still allowed**, as designed |
+    | gated `GET` **valid user claim** | docapi's envelope — cleared |
+    | gated `GET` **bogus user claim** | `500`, log: `jwt user claim does not match a live account` |
+    | ungated `GET` no credentials | `200`, untouched |
+
+    The add-fish skill was re-run unchanged against the stricter gate: reads `200`, and its write
+    reaches docapi. Pre-flight before flipping replicated `UserPrimeStore`'s exact query against the
+    mirror — including the `prime_expired` filter, which nothing had checked until then
+    (`2027-09-05`, comfortably valid).
+
 - 2026-09-03: **0.9.1 — `/news/featured` and `/news/more` join `/news/default` behind the day-key.
   DEPLOYED.** Closes an unauthenticated bypass that this stack opened itself.
 

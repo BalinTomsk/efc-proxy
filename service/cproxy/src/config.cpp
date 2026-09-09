@@ -80,6 +80,12 @@ bool get_bool(const EnvLookup& env, const char* name, bool fallback) {
     return fallback;
 }
 
+/** The "NONE" off-sentinel, shared by the three JWT claim checks. See load_config for why the off
+ *  switch cannot be an empty string. */
+std::string none_to_empty(const std::string& value) {
+    return to_upper(value) == "NONE" ? std::string{} : value;
+}
+
 std::string normalize_gate_path(std::string s) {
     s = to_lower(trim(s));
     if (s.empty()) return s;
@@ -150,6 +156,22 @@ Config load_config(const EnvLookup& env) {
     cfg.daykey_db_path = get_str(env, "CPROXY_DAYKEY_DB", cfg.daykey_db_path);
     cfg.external_admin = get_str(env, "EXTERNAL_ADMIN", cfg.external_admin);
     cfg.external_frontend = get_str(env, "EXTERNAL_FRONTEND", cfg.external_frontend);
+
+    // --- JWT credential -----------------------------------------------------------------------
+    // The secret is typically an enc:v1: value in the dotenv (see secret_codec), so it arrives here
+    // already decrypted. Empty leaves JWT verification off entirely and the gate on X-Day-Guid.
+    cfg.jwt_secret = get_str(env, "CPROXY_JWT_SECRET", cfg.jwt_secret);
+    cfg.jwt_required = get_bool(env, "CPROXY_JWT_REQUIRED", cfg.jwt_required);
+    cfg.jwt_require_user = get_bool(env, "CPROXY_JWT_REQUIRE_USER", cfg.jwt_require_user);
+    cfg.jwt_leeway_seconds = get_int(env, "CPROXY_JWT_LEEWAY_SECONDS", cfg.jwt_leeway_seconds);
+    cfg.jwt_user_cache_seconds =
+        get_int(env, "CPROXY_JWT_USER_CACHE_SECONDS", cfg.jwt_user_cache_seconds);
+    // "NONE" switches an individual claim check off. A sentinel again rather than "": system_env
+    // reports an empty variable as unset, so CPROXY_JWT_ISSUER= would silently leave the default
+    // "envfish" requirement standing — the opposite of what an operator typing it means.
+    cfg.jwt_issuer = none_to_empty(get_str(env, "CPROXY_JWT_ISSUER", cfg.jwt_issuer));
+    cfg.jwt_audience = none_to_empty(get_str(env, "CPROXY_JWT_AUDIENCE", cfg.jwt_audience));
+    cfg.jwt_subject = none_to_empty(get_str(env, "CPROXY_JWT_SUBJECT", cfg.jwt_subject));
 
     // "NONE" turns file logging off (console only); anything else is the rolling-log directory.
     // The off switch is a sentinel rather than an empty string for the same reason as
@@ -270,6 +292,19 @@ std::vector<std::string> validate_config(const Config& cfg) {
         errors.push_back("CPROXY_ROUTE_PREFIX must start with '/'");
     if (cfg.docapi_upstream.rfind("http://", 0) != 0 && cfg.docapi_upstream.rfind("https://", 0) != 0)
         errors.push_back("CPROXY_DOCAPI_UPSTREAM must be scheme://host[:port] with http or https");
+    if (cfg.jwt_leeway_seconds < 0)
+        errors.push_back("CPROXY_JWT_LEEWAY_SECONDS must be >= 0");
+    if (cfg.jwt_user_cache_seconds <= 0)
+        errors.push_back("CPROXY_JWT_USER_CACHE_SECONDS must be positive");
+    // Fatal rather than a warning: both switches are ways of saying "refuse callers that do not
+    // present a token", and with no secret configured there is nothing to verify one against, so the
+    // service would silently keep accepting the credential the operator just tried to retire.
+    if (cfg.jwt_required && !cfg.jwt_enabled())
+        errors.push_back("CPROXY_JWT_REQUIRED needs CPROXY_JWT_SECRET to be set");
+    if (cfg.jwt_require_user && !cfg.jwt_enabled())
+        errors.push_back("CPROXY_JWT_REQUIRE_USER needs CPROXY_JWT_SECRET to be set");
+    if (cfg.jwt_require_user && cfg.account_mirror_db_path.empty())
+        errors.push_back("CPROXY_JWT_REQUIRE_USER needs CPROXY_ACCOUNT_MIRROR_DB to be set");
     // RabbitMQ settings are deliberately NOT checked here — see rabbitmq_config_problems().
     return errors;
 }

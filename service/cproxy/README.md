@@ -59,6 +59,14 @@ probing is visible.
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
 | `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ Bearer tokens are not verified and only `X-Day-Guid` is accepted |
+| `CPROXY_JWT_REQUIRED` | `false` | `true` ⇒ a valid token is the only accepted credential (retires `X-Day-Guid`) |
+| `CPROXY_JWT_REQUIRE_USER` | `false` | `true` ⇒ writes must carry a `user` claim, and any claim present must match a live account |
+| `CPROXY_JWT_ISSUER` | `envfish` | required `iss`; `NONE` skips the check |
+| `CPROXY_JWT_AUDIENCE` | `fishfind.info` | required `aud`; `NONE` skips the check |
+| `CPROXY_JWT_SUBJECT` | `cproxy` | required `sub`; `NONE` skips the check |
+| `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat` |
+| `CPROXY_JWT_USER_CACHE_SECONDS` | `60` | how long the account-prime snapshot is reused (also the revocation lag) |
 | `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
 | `CPROXY_BLOCK_CLOUD_IPS` | `true` | kill-switch — `false` keeps the data and refresh but refuses nothing |
 | `CPROXY_CLOUDRANGE_REFRESH_HOURS` | `336` | interval between provider-feed refreshes (fortnightly) |
@@ -279,11 +287,48 @@ The database is generated out-of-band (never from source) and deployed like any 
 `secret/daykeys.sqlite` (gitignored) and `CLAUDE.md` → "Day-key store" for the full design and deploy
 path.
 
+### JWT credential (0.10.0)
+
+As of 0.10.0 the day-key travels **inside a signed token** rather than on its own in a header.
+Callers send `Authorization: Bearer <HS512 JWT>`:
+
+```json
+{ "iss": "envfish", "iat": 1788880000, "exp": 1788911999, "aud": "fishfind.info",
+  "sub": "cproxy", "server": "<today's day-key GUID>", "user": "<Users.prime * Users_Prime.prime>" }
+```
+
+The token does **not** replace the rotation, it wraps it: `server` is still matched against the
+day-key store exactly as the header was, so a leaked signing secret is worthless without today's GUID
+and vice versa. What the signature adds is that the credential is bound to an issuer, an audience and
+an expiry, so a copied request is no longer replayable from anywhere for the rest of the day. `user`
+is the product of two primes issued once globally, which names one account on one day while revealing
+neither factor; the gateway re-derives it from its own account mirror and never queries the
+frontend's database.
+
+- `HS512` is **pinned** — the token's own `alg` header is never obeyed, and `exp` is mandatory.
+- A **present-but-invalid** token is refused even while the legacy header is still accepted; the
+  fallback is for callers that send *no* token, not for tokens that fail.
+- Failure is the same opaque `500` as before. Bad signature, expired, and unknown account are
+  indistinguishable from an ordinary server error.
+
+Rollout is three reversible switches: `CPROXY_JWT_SECRET` empty reproduces 0.9.x exactly (header
+only); with the secret set both credentials work; `CPROXY_JWT_REQUIRED=true` retires the header.
+Until that last step, nothing has been taken away from someone holding the day-key.
+`CPROXY_JWT_REQUIRE_USER=true` additionally demands a `user` claim on every write and checks any
+claim that is present — it reads the account mirror, so verify the startup line `user-prime store
+loaded` reports a non-zero account count before turning it on. Gated **reads** stay anonymous-capable
+either way: `/news/featured` and `/news/more` are the public home page, and the gate there is against
+scraping, not reading.
+
 ## Tests
 
-`ctest` runs five suites: `config_test` (config parsing — defaults, overrides, method allow-list,
-malformed-value fallback), `secret_codec_test`, `proxy_test`, `breaker_test`, and
-`day_key_store_test` (the yesterday/today/tomorrow window, both directions of the year boundary, the
-leap-day-366 clamp, and the fail-loud-on-a-bad-database cases). Proxy behaviour is also verified by
-running the container against a reachable echo upstream (see `docs/specification.md`).
+`ctest` runs nine suites: `config_test` (config parsing — defaults, overrides, method allow-list,
+malformed-value fallback), `secret_codec_test`, `proxy_test`, `breaker_test`, `day_key_store_test`
+(the yesterday/today/tomorrow window, both directions of the year boundary, the leap-day-366 clamp,
+and the fail-loud-on-a-bad-database cases), `cloud_range_store_test`, `account_mirror_store_test`,
+`jwt_verifier_test` (forged signature, tampered payload, `alg:none`, an HS256 downgrade, expiry and
+leeway, claim mismatches, malformed input), and `user_prime_store_test` (the prime product, a product
+past 2^63, revoked/expired accounts, the day window, and a missing mirror failing closed). Proxy
+behaviour is also verified by running the container against a reachable echo upstream (see
+`docs/specification.md`).
 
