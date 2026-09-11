@@ -406,6 +406,174 @@ std::string mint_token(const std::string& day_guid, const std::string& user = ""
     return signing_input + "." + b64url(std::string(reinterpret_cast<char*>(digest), length));
 }
 
+/**
+ * A token as it would look if cproxy's own clock were `host_behind_seconds` BEHIND the minter's.
+ * Shifting the token forward is exactly equivalent to shifting this process back, and it is the only
+ * one of the two a test can do -- so this is how "the two hosts disagree" is expressed here.
+ */
+std::string mint_skewed_token(const std::string& day_guid, long long host_behind_seconds,
+                              bool admin) {
+    const auto now = std::chrono::system_clock::now();
+    const long long real_now =
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    const auto end_of_day = std::chrono::floor<std::chrono::days>(now) + std::chrono::days{1};
+    const long long end_of_day_epoch =
+        std::chrono::duration_cast<std::chrono::seconds>(end_of_day.time_since_epoch()).count() - 1;
+
+    const long long iat = real_now + host_behind_seconds;
+    const long long exp = end_of_day_epoch + host_behind_seconds;
+
+    std::string payload = "{\"iss\":\"envfish\",\"iat\":" + std::to_string(iat) +
+                          ",\"exp\":" + std::to_string(exp) +
+                          ",\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"" + day_guid +
+                          "\"";
+    if (admin) payload += ",\"adm\":true";
+    payload += "}";
+
+    const std::string signing_input =
+        b64url("{\"typ\":\"JWT\",\"alg\":\"HS512\"}") + "." + b64url(payload);
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int length = 0;
+    HMAC(EVP_sha512(), kTestJwtSecret.data(), static_cast<int>(kTestJwtSecret.size()),
+         reinterpret_cast<const unsigned char*>(signing_input.data()), signing_input.size(), digest,
+         &length);
+    return signing_input + "." + b64url(std::string(reinterpret_cast<char*>(digest), length));
+}
+
+/** The epoch the caller would put in X-Client-Time given the same disagreement. */
+std::string client_time_for(long long host_behind_seconds) {
+    const long long real_now = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+    return std::to_string(real_now + host_behind_seconds);
+}
+
+/**
+ * A gated proxy config with a uniform day-key store and a 60s leeway. Each case builds its OWN
+ * server from this because the clock offset lives in that server's ProxyState -- sharing one would
+ * let an earlier case's correction decide a later case's result.
+ */
+struct ClockSyncFixture {
+    TestServer upstream;
+    TestServer proxy;
+    std::string db;
+    Config cfg;
+
+    ClockSyncFixture(const std::string& db_name, bool sync_enabled) : db(db_name) {
+        install_fake_upstream(upstream.server);
+        upstream.start();
+        write_uniform_day_key_db(db, "TEST-DAY-KEY");
+
+        cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(upstream.port);
+        cfg.daykey_db_path = db;
+        cfg.jwt_secret = kTestJwtSecret;
+        cfg.jwt_required = true;
+        cfg.jwt_leeway_seconds = 60;
+        cfg.jwt_clock_sync = sync_enabled;
+        cfg.jwt_clock_sync_threshold_seconds = 5;
+        cfg.jwt_clock_sync_max_seconds = 3600;
+
+        install_routes(proxy.server, cfg);
+        proxy.start();
+    }
+    ~ClockSyncFixture() { std::remove(db.c_str()); }
+};
+
+// The recovery arm, and the reason JwtResult separates "authentic" from "in time range": with the
+// host clock 40 minutes out, a leeway of 60s rejects the very token that could report the gap. An
+// admin token plus a fresh X-Client-Time corrects the offset and the retry succeeds.
+void an_admin_token_with_a_client_time_realigns_the_clock() {
+    ClockSyncFixture fx("proxy_test_clocksync_ok.sqlite", true);
+    const long long behind = 2400;
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    // Same skew, no admin claim: stays refused. Establishes that it is the `adm` claim doing the
+    // work here and not merely the presence of the header.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, false)},
+                   {"X-Client-Time", client_time_for(behind)}})
+              ->status == 500);
+
+    // Admin token + the reading -> aligned, retried, served.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, true)},
+                   {"X-Client-Time", client_time_for(behind)}})
+              ->status == 200);
+
+    // And the correction PERSISTS: an ordinary non-admin caller, still skewed, now clears the gate
+    // with no header of its own. That is the whole point -- one admin request repairs the gateway
+    // for every caller, which is also why the very first assertion above had to run first.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, false)}})
+              ->status == 200);
+}
+
+// The header is not optional. `iat` cannot stand in for it: FishApiJwt caches a minted token until
+// UTC midnight, so aligning to `iat` would drag the process backwards by however long ago the admin
+// downloaded jwt.txt.
+void an_admin_token_without_a_client_time_never_moves_the_clock() {
+    ClockSyncFixture fx("proxy_test_clocksync_noheader.sqlite", true);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)}})
+              ->status == 500);
+}
+
+// The security bound, end to end. A replayed admin token from a day ago would need to move the
+// clock ~24h to make its stale day-key current again; the ceiling refuses anything past an hour, so
+// the request stays refused.
+void a_skew_beyond_the_ceiling_is_refused_rather_than_partly_applied() {
+    ClockSyncFixture fx("proxy_test_clocksync_cap.sqlite", true);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    const long long far = 2 * 86400;
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", far, true)},
+                   {"X-Client-Time", client_time_for(far)}})
+              ->status == 500);
+
+    // The refusal must not have poisoned the offset: a token at a skew INSIDE the ceiling still
+    // works afterwards.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 600, true)},
+                   {"X-Client-Time", client_time_for(600)}})
+              ->status == 200);
+}
+
+// The kill-switch: CPROXY_JWT_CLOCK_SYNC=false pins cproxy to its host clock, and a token it
+// disagrees with is refused exactly as it was before 0.11.0.
+void the_clock_sync_switch_turns_the_whole_thing_off() {
+    ClockSyncFixture fx("proxy_test_clocksync_off.sqlite", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)},
+                   {"X-Client-Time", client_time_for(2400)}})
+              ->status == 500);
+}
+
+// A malformed reading must never be treated as a reading of zero -- that would look like a 56-year
+// skew and, clamped, would peg the offset at the ceiling on every such request.
+void a_junk_client_time_header_is_ignored_not_read_as_zero() {
+    ClockSyncFixture fx("proxy_test_clocksync_junk.sqlite", true);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    static const char* const junk[] = {"", "not-a-number", "17e9", "-1", "0", "1788900000x"};
+    for (const char* value : junk) {
+        CHECK(cli.Get("/api/v1/news/default",
+                      {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)},
+                       {"X-Client-Time", value}})
+                  ->status == 500);
+    }
+
+    // Offset untouched by all that, so a genuine reading still works.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)},
+                   {"X-Client-Time", client_time_for(2400)}})
+              ->status == 200);
+}
+
 // While CPROXY_JWT_REQUIRED is off, a token and the legacy header are both accepted — that overlap
 // is what lets the frontend and the gateway be deployed in either order. What must NOT work is a
 // broken token alongside a good header: falling back there would let an attacker downgrade past the
@@ -734,6 +902,11 @@ int main() {
     request_bodies_are_forwarded();
     content_type_is_forwarded();
     post_and_patch_require_day_key();
+    an_admin_token_with_a_client_time_realigns_the_clock();
+    an_admin_token_without_a_client_time_never_moves_the_clock();
+    a_skew_beyond_the_ceiling_is_refused_rather_than_partly_applied();
+    the_clock_sync_switch_turns_the_whole_thing_off();
+    a_junk_client_time_header_is_ignored_not_read_as_zero();
     gated_read_path_requires_day_key();
     bearer_jwt_clears_the_gate_alongside_the_legacy_header();
     jwt_required_retires_the_legacy_header();

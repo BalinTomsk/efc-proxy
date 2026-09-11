@@ -65,8 +65,11 @@ probing is visible.
 | `CPROXY_JWT_ISSUER` | `envfish` | required `iss`; `NONE` skips the check |
 | `CPROXY_JWT_AUDIENCE` | `fishfind.info` | required `aud`; `NONE` skips the check |
 | `CPROXY_JWT_SUBJECT` | `cproxy` | required `sub`; `NONE` skips the check |
-| `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat` |
+| `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat`/`nbf` (**prod sets 60**) |
 | `CPROXY_JWT_USER_CACHE_SECONDS` | `60` | how long the account-prime snapshot is reused (also the revocation lag) |
+| `CPROXY_JWT_CLOCK_SYNC` | `true` | allow an `adm` token + `X-Client-Time` to correct the credential clock offset (never the system clock) |
+| `CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS` | `5` | smallest disagreement worth correcting |
+| `CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS` | `3600` | ceiling on the TOTAL offset — the security bound on the feature |
 | `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
 | `CPROXY_BLOCK_CLOUD_IPS` | `true` | kill-switch — `false` keeps the data and refresh but refuses nothing |
 | `CPROXY_CLOUDRANGE_REFRESH_HOURS` | `336` | interval between provider-feed refreshes (fortnightly) |
@@ -294,7 +297,8 @@ Callers send `Authorization: Bearer <HS512 JWT>`:
 
 ```json
 { "iss": "envfish", "iat": 1788880000, "exp": 1788911999, "aud": "fishfind.info",
-  "sub": "cproxy", "server": "<today's day-key GUID>", "user": "<Users.prime * Users_Prime.prime>" }
+  "sub": "cproxy", "server": "<today's day-key GUID>", "user": "<Users.prime * Users_Prime.prime>",
+  "adm": true }
 ```
 
 The token does **not** replace the rotation, it wraps it: `server` is still matched against the

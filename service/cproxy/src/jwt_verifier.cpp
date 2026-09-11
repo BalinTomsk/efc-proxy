@@ -214,34 +214,41 @@ JwtResult verify_hs512(const std::string& token, const JwtVerifyOptions& opts,
         return result;
     }
 
-    const long long epoch_now =
-        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-
+    // The MAC held, so from here the payload is what the secret-holder wrote. Publish the claims
+    // before any further check: a caller may READ them on a failed result (see JwtResult::
+    // signature_ok), which is what lets an authentic-but-out-of-time-range token report the clock
+    // skew that rejected it.
     bool has_exp = false;
     const long long exp = claim_as_int(payload, "exp", has_exp);
+    bool has_nbf = false;
+    const long long nbf = claim_as_int(payload, "nbf", has_nbf);
+    bool has_iat = false;
+    const long long iat = claim_as_int(payload, "iat", has_iat);
+
+    result.claims.issuer = claim_as_string(payload, "iss");
+    result.claims.audience = payload.contains("aud") && payload["aud"].is_string()
+                                 ? payload["aud"].get<std::string>()
+                                 : opts.audience;
+    result.claims.subject = claim_as_string(payload, "sub");
+    result.claims.server = claim_as_string(payload, "server");
+    result.claims.user = claim_as_string(payload, "user");
+    result.claims.issued_at = iat;
+    result.claims.expires_at = exp;
+    // Strictly a JSON boolean. A string "true" or a 1 does not count -- the minter writes a real
+    // boolean, so anything else is a token this build does not understand, and the safe reading of
+    // "I don't understand this admin flag" is "not an admin".
+    result.claims.admin = payload.contains("adm") && payload["adm"].is_boolean() &&
+                          payload["adm"].get<bool>();
+    result.signature_ok = true;
+
     if (!has_exp) {
         result.error = "missing exp";
         return result;
     }
-    if (epoch_now > exp + opts.leeway_seconds) {
-        result.error = "token expired";
-        return result;
-    }
 
-    bool has_nbf = false;
-    const long long nbf = claim_as_int(payload, "nbf", has_nbf);
-    if (has_nbf && epoch_now + opts.leeway_seconds < nbf) {
-        result.error = "token not yet valid";
-        return result;
-    }
-
-    bool has_iat = false;
-    const long long iat = claim_as_int(payload, "iat", has_iat);
-    if (has_iat && iat > epoch_now + opts.leeway_seconds) {
-        result.error = "token issued in the future";
-        return result;
-    }
-
+    // Identity claims are checked BEFORE the time claims, so `time_rejected` can only be set on a
+    // token that is right about everything except the clock. A token from the wrong issuer or
+    // audience must never be able to reach the clock-alignment path, however authentic its MAC.
     if (!opts.issuer.empty() && claim_as_string(payload, "iss") != opts.issuer) {
         result.error = "issuer mismatch";
         return result;
@@ -255,15 +262,25 @@ JwtResult verify_hs512(const std::string& token, const JwtVerifyOptions& opts,
         return result;
     }
 
-    result.claims.issuer = claim_as_string(payload, "iss");
-    result.claims.audience = payload.contains("aud") && payload["aud"].is_string()
-                                 ? payload["aud"].get<std::string>()
-                                 : opts.audience;
-    result.claims.subject = claim_as_string(payload, "sub");
-    result.claims.server = claim_as_string(payload, "server");
-    result.claims.user = claim_as_string(payload, "user");
-    result.claims.issued_at = iat;
-    result.claims.expires_at = exp;
+    const long long epoch_now =
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+
+    if (epoch_now > exp + opts.leeway_seconds) {
+        result.error = "token expired";
+        result.time_rejected = true;
+        return result;
+    }
+    if (has_nbf && epoch_now + opts.leeway_seconds < nbf) {
+        result.error = "token not yet valid";
+        result.time_rejected = true;
+        return result;
+    }
+    if (has_iat && iat > epoch_now + opts.leeway_seconds) {
+        result.error = "token issued in the future";
+        result.time_rejected = true;
+        return result;
+    }
+
     result.ok = true;
     return result;
 }

@@ -96,7 +96,8 @@ int main() {
         "\"listen\":\"{}:{}\",\"route_prefix\":\"{}\",\"docapi_upstream\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
-        "\"jwt\":\"{}\",\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
+        "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\","
+        "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.auth_required() ? "true" : "false",
         cfg.allowed_methods.empty() ? "ALL" : "restricted",
@@ -113,6 +114,12 @@ int main() {
                            : std::format("on ({}, user claim {})",
                                          cfg.jwt_required ? "required" : "X-Day-Guid still accepted",
                                          cfg.jwt_require_user ? "enforced" : "ignored"),
+        cfg.jwt_leeway_seconds,
+        // The offset always starts at zero; this line reports the POLICY, so an operator reading a
+        // "clock aligned from admin token" WARN later can tell whether it was expected.
+        cfg.jwt_clock_sync ? std::format("on (>{}s, max {}s)", cfg.jwt_clock_sync_threshold_seconds,
+                                         cfg.jwt_clock_sync_max_seconds)
+                           : std::string("off (host clock only)"),
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
     if (!server.listen(cfg.listen_addr, cfg.listen_port)) {

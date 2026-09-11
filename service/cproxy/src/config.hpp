@@ -107,6 +107,25 @@ struct Config {
     // suspension or deletion takes at most this long to bite.
     int jwt_user_cache_seconds = 60;
 
+    // --- Clock alignment from an admin token (see ClockOffset) ---
+    // Lets cproxy correct its own notion of "now" (for credential validation ONLY, never the system
+    // clock) from a request carrying both an `adm` token and an X-Client-Time header.
+    //
+    // Default true is safe by construction rather than by trust: it is inert unless a token actually
+    // carries `adm`, which only the portal's minter sets and only for a configured admin account —
+    // so a deployment whose frontend predates that claim behaves exactly as before. Set false to
+    // pin cproxy to its host clock permanently.
+    bool jwt_clock_sync = true;
+    // Don't correct below this. Sub-threshold gaps are network latency and the one-second
+    // granularity of an epoch header, not drift, and chasing them would rewrite the offset on every
+    // admin request for no gain.
+    int jwt_clock_sync_threshold_seconds = 5;
+    // Ceiling on the TOTAL offset, in either direction. This is the security bound on the feature:
+    // a replayed admin token cannot move cproxy more than this, which is why an hour is the default
+    // and a day is not — a captured token would need ~24h to make its stale day-key current again,
+    // and anything under a day is already inside DayKeyStore's own +/-1-day window.
+    int jwt_clock_sync_max_seconds = 3600;
+
     /** True when CPROXY_JWT_SECRET is set and Bearer tokens are verified at all. */
     bool jwt_enabled() const { return !jwt_secret.empty(); }
 

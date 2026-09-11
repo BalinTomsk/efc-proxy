@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <map>
@@ -15,6 +17,7 @@
 #include <string>
 
 #include "breaker.hpp"
+#include "clock_offset.hpp"
 #include "cloud_range_store.hpp"
 #include "day_key_store.hpp"
 #include "jwt_verifier.hpp"
@@ -83,6 +86,10 @@ struct ProxyState {
     CloudRangeStore owned_ranges;
     // Points at owned_ranges, or at a store the caller shares with the refresh thread.
     CloudRangeStore* cloud_ranges = &owned_ranges;
+    // Correction applied to "now" when validating a credential, learned from admin requests. Starts
+    // at zero (the host clock) on every start — see ClockOffset for why this is an in-process offset
+    // and not the system clock.
+    ClockOffset clock;
 
     explicit ProxyState(const Config& cfg, CloudRangeStore* shared_ranges)
         : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
@@ -271,6 +278,70 @@ struct CredentialCheck {
  *   before (see proxy_to_docapi), so a prober cannot tell a bad signature from an expired token from
  *   an unknown account — or from an ordinary server error.
  */
+/**
+ * The caller's own clock, from `X-Client-Time` (epoch seconds). False when the header is absent,
+ * empty, non-numeric, or has trailing junk — a header we cannot read must never be treated as a
+ * reading of zero, which would look like a 56-year skew.
+ */
+bool client_time_header(const httplib::Request& req, long long& out) {
+    const std::string raw = req.get_header_value("X-Client-Time");
+    if (raw.empty()) return false;
+    const char* first = raw.data();
+    const char* last = raw.data() + raw.size();
+    long long value = 0;
+    const auto [ptr, ec] = std::from_chars(first, last, value);
+    if (ec != std::errc{} || ptr != last || value <= 0) return false;
+    out = value;
+    return true;
+}
+
+/**
+ * Corrects this process's clock offset from a request, when the request is entitled to do that.
+ * Returns true when the offset actually moved (so the caller knows to re-evaluate the token).
+ *
+ * Three conditions, all required, and the first two are the whole security argument:
+ *   - the token's MAC verified and it carries `"adm": true` — forging that needs the signing secret;
+ *   - the request carries `X-Client-Time`, because the token's own `iat` is cached until UTC
+ *     midnight and is therefore stale by design (see ClockOffset);
+ *   - the gap exceeds the configured threshold.
+ *
+ * `ClockOffset::adopt` bounds the result, so the worst a replayed admin token can do is move this
+ * process by `jwt_clock_sync_max_seconds`.
+ */
+bool align_clock_from_request(const Config& cfg, ProxyState& state, const httplib::Request& req,
+                              const JwtResult& verified,
+                              std::chrono::system_clock::time_point now) {
+    if (!cfg.jwt_clock_sync || !verified.signature_ok || !verified.claims.admin) return false;
+    // Only a token that is right about everything EXCEPT possibly the time. A malformed one (no
+    // `exp`) is authentic but not understood, and is not evidence of anything about the clock.
+    if (!verified.ok && !verified.time_rejected) return false;
+
+    long long client_epoch = 0;
+    if (!client_time_header(req, client_epoch)) return false;
+
+    const long long now_epoch =
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    const long long delta = client_epoch - now_epoch;
+    if (std::llabs(delta) < cfg.jwt_clock_sync_threshold_seconds) return false;
+
+    const long long before = state.clock.offset_seconds();
+    if (!state.clock.adopt(delta, cfg.jwt_clock_sync_max_seconds)) {
+        // Refused, or clamped to no change: the gap is real but correcting it fully would exceed the
+        // ceiling. WARN, because at this point the host clock is wrong by more than an operator
+        // should ever have to discover from a wall of 500s.
+        log_raw(std::format(
+            "{{\"service\":\"cproxy\",\"level\":\"WARN\",\"msg\":\"clock alignment refused\","
+            "\"delta\":{},\"offset\":{},\"max\":{}}}",
+            delta, before, cfg.jwt_clock_sync_max_seconds));
+        return false;
+    }
+    log_raw(std::format(
+        "{{\"service\":\"cproxy\",\"level\":\"WARN\",\"msg\":\"clock aligned from admin token\","
+        "\"delta\":{},\"offset_was\":{},\"offset_now\":{}}}",
+        delta, before, state.clock.offset_seconds()));
+    return true;
+}
+
 CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
                                       const httplib::Request& req,
                                       std::chrono::system_clock::time_point now) {
@@ -284,7 +355,17 @@ CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
         opts.subject = cfg.jwt_subject;
         opts.leeway_seconds = cfg.jwt_leeway_seconds;
 
-        const JwtResult verified = verify_hs512(token, opts, now);
+        JwtResult verified = verify_hs512(token, opts, now);
+
+        // An admin request may correct the clock — on a pass (keeping drift from ever growing into a
+        // failure) as well as on a time-only rejection (recovering from one that already has). The
+        // recovery arm re-verifies ONCE against the corrected clock; it cannot loop, because a
+        // second alignment from the same request would compute a delta of zero.
+        if (align_clock_from_request(cfg, state, req, verified, now)) {
+            now = state.clock.now();
+            verified = verify_hs512(token, opts, now);
+        }
+
         if (!verified.ok) return {false, "jwt rejected: " + verified.error};
 
         if (!state.daykey_store.has_value() || !state.daykey_store->is_valid(verified.claims.server, now)) {
@@ -389,7 +470,7 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // gates the request — the union is the fail-secure direction.
     if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const CredentialCheck credential =
-            check_gate_credential(cfg, state, req, std::chrono::system_clock::now());
+            check_gate_credential(cfg, state, req, state.clock.now());
         if (!credential.ok) {
             write_error(res, 500, "internal_error", "Internal error");
             log_request(std::format("{} {} -> 500 ({})", req.method, req.path, credential.reason),
