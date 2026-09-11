@@ -9,6 +9,68 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-11: **0.13.1 — base64url must be canonical.** Found live
+  on prod: an HS512 token whose 86-char signature ended in `w` still verified with that character
+  changed to `x`. 86 symbols carry 516 bits for a 64-byte MAC, so the last symbol holds only 2
+  significant bits and 4 unused ones, and `base64url_decode` silently dropped the unused ones — every
+  signature had 16 accepted spellings. No forgery was possible (the decoded MAC bytes are identical),
+  but the token was malleable, which strict JWS verifiers reject.
+
+  - **`base64url_decode` now requires the leftover bits to be zero** (RFC 4648 §3.5):
+    `(accumulator & ((1u << bits) - 1)) == 0` after the loop, alongside the existing
+    `symbols % 4 != 1` length check. A non-canonical segment fails as `base64url decode failed`,
+    before the MAC is compared. Padding `=` is still tolerated, unchanged.
+  - **The frontend is unaffected**: `FishApiJwt.Base64UrlEncode` is `Convert.ToBase64String` +
+    `TrimEnd('=')` + alphabet swap, which zero-fills. All three golden .NET-minted fixtures in
+    `jwt_verifier_test` still verify.
+  - Tests: new `a_signature_respelled_in_its_unused_low_bits_is_refused` (all 15 non-canonical
+    respellings of a minted token's last signature char refused at decode, `signature_ok` false);
+    `base64url_decoding_…` gains 2- and 3-symbol tail cases (`ww` ok / `wx`, `w_` refused; `QUI` ok /
+    `QUJ`, `QUL` refused; `aGVsbG8=` ok / `aGVsbG9=` refused); the 0.10.0 golden fixture respelled by
+    one bit is refused. 10/10 ctest suites (Docker build stage).
+  - **Verified the test catches the old behaviour:** with the check reverted to the old lenient return
+    in a throwaway container (and `CHECK` made non-fatal), all 15 respellings verified with
+    `signature_ok = true`, which reproduces the prod observation, and every new refusal check failed.
+
+  Ships as 0.13.1; `/health` will report `0.13.1` after the next image deploy.
+
+- 2026-09-11: **0.13.0 — the raw `X-Day-Guid` credential is removed; a Bearer JWT is the only way
+  through the gate.** User request: stop authenticating with the bare day-key GUID and take it from
+  the JWT instead. The header had been *refused* since 2026-09-09 (`CPROXY_JWT_REQUIRED=true`), but
+  the code that could accept it was still there one config flip away. Now it is gone.
+
+  - **`check_gate_credential`** reads only `Authorization: Bearer`. No secret ⇒ `jwt not configured`,
+    no token ⇒ `no bearer token presented`, then verify → day-key from the `server` claim → `user`
+    claim. The `X-Day-Guid` branch and the "token present but bad is fatal even while not required"
+    special case are both deleted — with one credential there is nothing to downgrade to.
+  - **`CPROXY_JWT_REQUIRED` removed** (`Config::jwt_required`, its parsing, its `validate_config`
+    check). A leftover value is ignored; `main` logs a WARN if it is set so `"false"` is never
+    mistaken for a rollback. The startup `jwt` field now reads `on (bearer only, user claim …)` or
+    `off (CPROXY_JWT_SECRET unset, gated requests always 500)`.
+  - **An unset `CPROXY_JWT_SECRET` shuts the gated surface** instead of falling back to the header —
+    every POST/PATCH and `CPROXY_DAYKEY_PATHS` read 500s and startup logs an ERROR. Deliberately not
+    fatal: the ungated reads keep serving, same stance as a missing day-key store.
+  - **Rollback is no longer config-only.** Going back to header auth means redeploying the 0.12.0
+    digest (`sha256:e9f6563b…ea23`); `compose.yml`'s old comment promising `CPROXY_JWT_REQUIRED:
+    "false"` as a rollback was rewritten.
+  - Tests: `proxy_test` `gated_read_path_requires_day_key` → `…_requires_a_bearer_token`;
+    `bearer_jwt_clears_the_gate_alongside_the_legacy_header` + `jwt_required_retires_the_legacy_header`
+    → `the_day_key_header_is_never_a_credential` (today's key in the header is refused on a read and
+    a PATCH; a forged or wrong-day token is not rescued by a correct header; `Basic` is not a token)
+    and `no_secret_shuts_the_gated_surface`. `config_test` gains
+    `the_retired_jwt_required_switch_is_ignored`. 10/10 ctest suites.
+  - **Verified the test catches a regression:** a copy with a header fallback re-inserted into
+    `check_gate_credential` fails `proxy_test` at the header-read assertion and nowhere else.
+
+  **Deployed 2026-09-11**, digest `sha256:fa491894ef517b53d7c25d4b462597ad325ca26af47de6058063530205f125af`.
+  Startup: `"jwt":"on (bearer only, user claim enforced)"`, `user-prime store loaded accounts 9
+  admins 6`, no ERROR/WARN. A probe of every fronted route before (0.12.0) and after (0.13.0) was
+  identical; bare `X-Day-Guid` carrying today's real key → 500 `no bearer token presented`.
+
+  Not in this image: a concurrent, separate change making `base64url_decode` reject non-canonical
+  trailing bits (`jwt_verifier.cpp`/`jwt_verifier_test.cpp`) landed in the working tree after this
+  image was built.
+
 - 2026-09-11: **0.12.0 — admin is looked up in the account mirror; the `adm` token claim is gone.**
   0.11.0 decided "may this request correct the clock?" from an `"adm": true` claim the frontend minted.
   The user decoded a live token, saw it, and rejected the design as insecure — rightly: a role claim

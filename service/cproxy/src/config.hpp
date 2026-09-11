@@ -28,10 +28,9 @@ namespace cproxy {
  * | CPROXY_UPSTREAM_RETRY       | 1 (0 = off)                   | retry idempotent requests once on transport failure |
  * | CPROXY_LOG_DIR              | logs                          | rolling-log directory ("NONE" = stdout only) |
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
- * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; POST/PATCH always 500 while empty |
- * | CPROXY_DAYKEY_PATHS         | /news/default,/news/featured,/news/more | CSV of paths day-key gated on EVERY method, GET included ("NONE" disables) |
- * | CPROXY_JWT_SECRET           | (empty)                       | HS512 shared secret; empty = Bearer tokens not verified, X-Day-Guid only |
- * | CPROXY_JWT_REQUIRED         | false                         | true = a valid JWT is the only accepted credential |
+ * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; every gated request 500s while empty |
+ * | CPROXY_DAYKEY_PATHS         | /news/default,/news/featured,/news/more | CSV of paths gated on EVERY method, GET included ("NONE" disables) |
+ * | CPROXY_JWT_SECRET           | (empty)                       | HS512 shared secret; empty = every gated request 500s (no other credential exists) |
  * | CPROXY_JWT_REQUIRE_USER     | false                         | true = writes must name an account, and any `user` claim must match the mirror |
  * | CPROXY_JWT_ISSUER           | envfish                       | required `iss` ("" = do not check)        |
  * | CPROXY_JWT_AUDIENCE         | fishfind.info                 | required `aud` ("" = do not check)        |
@@ -67,24 +66,22 @@ struct Config {
     std::string log_dir = "logs";
     int log_max_history = 7;  // days of rolled log files to keep
 
-    // Path to the day-key SQLite database (see DayKeyStore). Empty means day-key auth is not
-    // configured, so every PATCH request fails closed with 500 regardless of CPROXY_ALLOWED_METHODS.
+    // Path to the day-key SQLite database (see DayKeyStore). Empty means the day-key cannot be
+    // checked, so every gated request fails closed with 500 regardless of CPROXY_ALLOWED_METHODS.
     std::string daykey_db_path;
 
-    // --- JWT credential (0.10.0) --------------------------------------------------------------
-    // The frontend presents `Authorization: Bearer <HS512 JWT>` instead of the raw X-Day-Guid
-    // header. The token's `server` claim carries the same day-key the header did (DayKeyStore stays
-    // the authority on it) and its `user` claim carries Users.prime * Users_Prime.prime for today,
-    // which UserPrimeStore re-derives from the account mirror. See jwt_verifier.hpp.
+    // --- JWT credential (0.10.0; the only credential since 0.13.0) ----------------------------
+    // Callers present `Authorization: Bearer <HS512 JWT>`. The token's `server` claim carries the
+    // day-key (DayKeyStore stays the authority on it) and its `user` claim carries
+    // Users.prime * Users_Prime.prime for today, which UserPrimeStore re-derives from the account
+    // mirror. See jwt_verifier.hpp.
     //
-    // Shared HS512 secret, matching the frontend's FishApi:JwtKey. EMPTY DISABLES JWT ENTIRELY —
-    // the gate then behaves exactly as it did before 0.10.0 (X-Day-Guid only), which is what makes
-    // this shippable without coordinating the two deploys.
+    // Shared HS512 secret, matching the frontend's FishApi:JwtKey. EMPTY SHUTS THE GATED SURFACE:
+    // with nothing to verify a token against, every POST/PATCH and every CPROXY_DAYKEY_PATHS read
+    // answers 500. There is no fallback credential — the raw X-Day-Guid header, and the
+    // CPROXY_JWT_REQUIRED switch that used to decide whether it was still honoured, were removed in
+    // 0.13.0. A leftover CPROXY_JWT_REQUIRED in the environment is ignored (main logs a WARN).
     std::string jwt_secret;
-    // When true, a valid JWT is the ONLY accepted credential: a bare X-Day-Guid header no longer
-    // clears the gate. Default false so the two services can be deployed in either order and the
-    // existing tooling (add-fish, Postman) keeps working; flip it once every caller mints tokens.
-    bool jwt_required = false;
     // When true, a `user` claim is REQUIRED on every write (POST/PATCH) and, wherever one is
     // present, must resolve to a live, non-suspended, non-deleted account in the mirror. A gated
     // READ may still be anonymous — /news/featured and /news/more are the public home page, and the
@@ -128,7 +125,7 @@ struct Config {
     // and anything under a day is already inside DayKeyStore's own +/-1-day window.
     int jwt_clock_sync_max_seconds = 3600;
 
-    /** True when CPROXY_JWT_SECRET is set and Bearer tokens are verified at all. */
+    /** True when CPROXY_JWT_SECRET is set, i.e. the gated surface can be opened at all. */
     bool jwt_enabled() const { return !jwt_secret.empty(); }
 
     // --- Datacenter / cloud-provider IP blocking (mirrors the frontend's CloudProviderIpRange) ---
@@ -191,8 +188,9 @@ struct Config {
     bool method_allowed(const std::string& method) const;
 
     /**
-     * True when this request must present a valid X-Day-Guid: the whole write surface (POST/PATCH)
-     * regardless of path, plus any path in daykey_paths regardless of method.
+     * True when this request must present the gateway credential (a Bearer JWT carrying the day-key):
+     * the whole write surface (POST/PATCH) regardless of path, plus any path in daykey_paths
+     * regardless of method.
      */
     bool daykey_required(const std::string& method, const std::string& path) const;
 

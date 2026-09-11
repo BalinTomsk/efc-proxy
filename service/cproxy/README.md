@@ -59,8 +59,7 @@ probing is visible.
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
 | `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
-| `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ Bearer tokens are not verified and only `X-Day-Guid` is accepted |
-| `CPROXY_JWT_REQUIRED` | `false` | `true` ⇒ a valid token is the only accepted credential (retires `X-Day-Guid`) |
+| `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ every gated request always `500` (the Bearer token is the only credential) |
 | `CPROXY_JWT_REQUIRE_USER` | `false` | `true` ⇒ writes must carry a `user` claim, and any claim present must match a live account |
 | `CPROXY_JWT_ISSUER` | `envfish` | required `iss`; `NONE` skips the check |
 | `CPROXY_JWT_AUDIENCE` | `fishfind.info` | required `aud`; `NONE` skips the check |
@@ -256,9 +255,10 @@ and the log/secret bind mounts — replacing the previous hand-typed `docker run
 Some requests are gated by a **second, independent** control on top of
 `CPROXY_API_KEY`/`CPROXY_ALLOWED_METHODS`: a per-day rotating GUID read from a small read-only SQLite
 database at `CPROXY_DAYKEY_DB` (`day_keys(stamp TEXT PRIMARY KEY, guid TEXT NOT NULL)`, one row per
-calendar date). A caller sends the current UTC day's GUID in `X-Day-Guid` (a ±1-day window is
-accepted); a wrong or missing value answers a plain `500`, never `401` — the failure looks identical
-to an ordinary server error to anyone probing it.
+calendar date). A caller presents the current UTC day's GUID as the `server` claim of a signed Bearer
+JWT (see below; a ±1-day window is accepted); a wrong or missing value answers a plain `500`, never
+`401` — the failure looks identical to an ordinary server error to anyone probing it. Until 0.9.x the
+GUID was sent bare in an `X-Day-Guid` header; since 0.13.0 that header is not read at all.
 
 **Keyed by real date since 0.9.0.** It previously held exactly 365 rows indexed by day-of-year and
 reused them annually, which could not represent the generated key set (date-keyed, spanning years) —
@@ -290,10 +290,10 @@ The database is generated out-of-band (never from source) and deployed like any 
 `secret/daykeys.sqlite` (gitignored) and `CLAUDE.md` → "Day-key store" for the full design and deploy
 path.
 
-### JWT credential (0.10.0)
+### JWT credential (0.10.0; the only credential since 0.13.0)
 
-As of 0.10.0 the day-key travels **inside a signed token** rather than on its own in a header.
-Callers send `Authorization: Bearer <HS512 JWT>`:
+The day-key travels **inside a signed token**, never on its own in a header. Callers send
+`Authorization: Bearer <HS512 JWT>`:
 
 ```json
 { "iss": "envfish", "iat": 1788880000, "exp": 1788911999, "aud": "fishfind.info",
@@ -309,14 +309,17 @@ neither factor; the gateway re-derives it from its own account mirror and never 
 frontend's database.
 
 - `HS512` is **pinned** — the token's own `alg` header is never obeyed, and `exp` is mandatory.
-- A **present-but-invalid** token is refused even while the legacy header is still accepted; the
-  fallback is for callers that send *no* token, not for tokens that fail.
+- Each segment must be **canonical base64url** (after 0.13.0): non-zero unused bits in a segment's
+  last character are refused, so a token is accepted only exactly as minted, not in one of the
+  equivalent spellings a lenient decoder would also map to the same bytes.
+- **The token is the only credential.** The bare `X-Day-Guid` header (0.6.1–0.9.x, accepted
+  alongside tokens through 0.12.0 until switched off) was removed in 0.13.0 together with the
+  `CPROXY_JWT_REQUIRED` switch that governed it — a request carrying only the header, even with the
+  correct key, is refused like one carrying nothing. With `CPROXY_JWT_SECRET` unset the gated surface
+  is shut (startup logs an ERROR); ungated reads keep serving.
 - Failure is the same opaque `500` as before. Bad signature, expired, and unknown account are
   indistinguishable from an ordinary server error.
 
-Rollout is three reversible switches: `CPROXY_JWT_SECRET` empty reproduces 0.9.x exactly (header
-only); with the secret set both credentials work; `CPROXY_JWT_REQUIRED=true` retires the header.
-Until that last step, nothing has been taken away from someone holding the day-key.
 `CPROXY_JWT_REQUIRE_USER=true` additionally demands a `user` claim on every write and checks any
 claim that is present — it reads the account mirror, so verify the startup line `user-prime store
 loaded` reports a non-zero account count before turning it on. Gated **reads** stay anonymous-capable

@@ -279,7 +279,6 @@ void daykey_paths_are_configurable_and_can_be_cleared() {
 void jwt_is_off_until_a_secret_is_configured() {
     Config c = load_config(make_env({}));
     CHECK(!c.jwt_enabled());
-    CHECK(!c.jwt_required);
     CHECK(!c.jwt_require_user);
     // Defaults match what the frontend mints (doc/envfish-jwt.html); a mismatch here rejects every
     // real token, so pin them.
@@ -293,7 +292,6 @@ void jwt_is_off_until_a_secret_is_configured() {
 
 void jwt_settings_are_read_and_claim_checks_can_be_switched_off() {
     Config c = load_config(make_env({{"CPROXY_JWT_SECRET", "s3cr3t"},
-                                     {"CPROXY_JWT_REQUIRED", "true"},
                                      {"CPROXY_JWT_REQUIRE_USER", "yes"},
                                      {"CPROXY_JWT_LEEWAY_SECONDS", "30"},
                                      {"CPROXY_JWT_USER_CACHE_SECONDS", "5"},
@@ -301,7 +299,6 @@ void jwt_settings_are_read_and_claim_checks_can_be_switched_off() {
                                      {"CPROXY_JWT_AUDIENCE", "NONE"},
                                      {"CPROXY_JWT_SUBJECT", " none "}}));
     CHECK(c.jwt_enabled());
-    CHECK(c.jwt_required);
     CHECK(c.jwt_require_user);
     CHECK(c.jwt_leeway_seconds == 30);
     CHECK(c.jwt_user_cache_seconds == 5);
@@ -312,10 +309,8 @@ void jwt_settings_are_read_and_claim_checks_can_be_switched_off() {
 }
 
 void a_jwt_switch_without_a_secret_is_a_startup_error() {
-    // Both switches mean "refuse callers that do not present a token". With no secret there is
-    // nothing to verify one against, so the service would go on accepting the very credential the
-    // operator was retiring — a silent no-op is the worst possible outcome, so it is fatal.
-    CHECK(!validate_config(load_config(make_env({{"CPROXY_JWT_REQUIRED", "true"}}))).empty());
+    // Account checks on tokens, with no secret to verify tokens with, cannot mean what the operator
+    // intended, so it is fatal.
     CHECK(!validate_config(load_config(make_env({{"CPROXY_JWT_REQUIRE_USER", "true"}}))).empty());
 
     // The user check additionally needs the mirror it reads.
@@ -324,21 +319,34 @@ void a_jwt_switch_without_a_secret_is_a_startup_error() {
     no_mirror.account_mirror_db_path.clear();
     CHECK(!validate_config(no_mirror).empty());
 
-    CHECK(validate_config(load_config(make_env({{"CPROXY_JWT_SECRET", "s"},
-                                                {"CPROXY_JWT_REQUIRED", "true"}})))
-              .empty());
+    CHECK(validate_config(load_config(make_env({{"CPROXY_JWT_SECRET", "s"}}))).empty());
     CHECK(!validate_config(load_config(make_env({{"CPROXY_JWT_SECRET", "s"},
                                                  {"CPROXY_JWT_USER_CACHE_SECONDS", "0"}})))
                .empty());
 }
 
+// 0.13.0 removed CPROXY_JWT_REQUIRED along with the X-Day-Guid header it governed. A compose file
+// that still sets it -- to either value -- must neither fail startup nor change anything, and a
+// missing secret on its own is not fatal (it shuts only the gated surface; see check_gate_credential).
+void the_retired_jwt_required_switch_is_ignored() {
+    for (const char* value : {"true", "false"}) {
+        const Config with = load_config(make_env({{"CPROXY_JWT_SECRET", "s"},
+                                                  {"CPROXY_JWT_REQUIRED", value}}));
+        const Config without = load_config(make_env({{"CPROXY_JWT_SECRET", "s"}}));
+        CHECK(validate_config(with).empty());
+        CHECK(with.jwt_enabled() == without.jwt_enabled());
+        CHECK(with.jwt_require_user == without.jwt_require_user);
+    }
+    CHECK(validate_config(load_config(make_env({{"CPROXY_JWT_REQUIRED", "false"}}))).empty());
+    CHECK(validate_config(load_config(make_env({}))).empty());
+}
 
 // --- Clock alignment knobs (0.11.0) -------------------------------------------------------------
 
 void clock_sync_defaults_are_the_documented_ones() {
     const Config cfg = load_config(make_env({}));
-    // On by default, but inert until a token carries `adm` -- so a deployment whose frontend
-    // predates that claim behaves exactly as it did before.
+    // On by default, but inert until the account mirror holds a live access = 255 account whose
+    // token arrives with an X-Client-Time header (0.12.0: admin is looked up, never claimed).
     CHECK(cfg.jwt_clock_sync);
     CHECK(cfg.jwt_clock_sync_threshold_seconds == 5);
     CHECK(cfg.jwt_clock_sync_max_seconds == 3600);
@@ -411,6 +419,7 @@ int main() {
     jwt_is_off_until_a_secret_is_configured();
     jwt_settings_are_read_and_claim_checks_can_be_switched_off();
     a_jwt_switch_without_a_secret_is_a_startup_error();
+    the_retired_jwt_required_switch_is_ignored();
     clock_sync_defaults_are_the_documented_ones();
     clock_sync_reads_its_env_vars();
     an_empty_clock_sync_variable_reads_as_unset_not_as_off();

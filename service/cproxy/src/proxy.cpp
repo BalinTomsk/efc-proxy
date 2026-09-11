@@ -107,7 +107,7 @@ struct ProxyState {
             } catch (const std::exception& ex) {
                 log_raw(std::format(
                     "{{\"service\":\"cproxy\",\"level\":\"ERROR\","
-                    "\"msg\":\"day-key database failed to load, PATCH will 500: {}\"}}",
+                    "\"msg\":\"day-key database failed to load, every gated request will 500: {}\"}}",
                     ex.what()));
             }
         }
@@ -267,26 +267,6 @@ struct CredentialCheck {
 };
 
 /**
- * The credential for the gated surface, in its 0.10.0 shape: an `Authorization: Bearer <HS512 JWT>`
- * whose `server` claim carries the day-key and whose `user` claim carries this account's
- * `Users.prime * Users_Prime.prime` for today, with the pre-0.10.0 raw `X-Day-Guid` header still
- * accepted underneath until `CPROXY_JWT_REQUIRED` is turned on.
- *
- * Three rules worth stating, because each one is a decision rather than an accident:
- *
- * - **A token that is present but bad is always fatal**, even while `jwt_required` is false. Falling
- *   back to the header on a failed signature would hand an attacker a downgrade: present a garbage
- *   token, then win on a day-key harvested from anywhere. The fallback exists for callers that send
- *   NO token, not for tokens that fail.
- * - **The day-key is still checked from the token's `server` claim.** The JWT proves the caller holds
- *   the signing secret; the claim proves they also hold today's rotating key. Dropping the second
- *   check would make a leaked signing secret permanent access, which is the exact property the
- *   day-key rotation exists to deny.
- * - **The reason never reaches the caller.** Every failure here answers the same generic 500 as
- *   before (see proxy_to_docapi), so a prober cannot tell a bad signature from an expired token from
- *   an unknown account — or from an ordinary server error.
- */
-/**
  * The caller's own clock, from `X-Client-Time` (epoch seconds). False when the header is absent,
  * empty, non-numeric, or has trailing junk — a header we cannot read must never be treated as a
  * reading of zero, which would look like a 56-year skew.
@@ -359,60 +339,72 @@ bool align_clock_from_request(const Config& cfg, ProxyState& state, const httpli
     return true;
 }
 
+/**
+ * The credential for the gated surface: an `Authorization: Bearer <HS512 JWT>` whose `server` claim
+ * carries the day-key and whose `user` claim carries this account's `Users.prime * Users_Prime.prime`
+ * for today. It is the ONLY credential. The raw `X-Day-Guid` header that preceded it (0.6–0.9, and
+ * accepted alongside the token until `CPROXY_JWT_REQUIRED` was turned on) was removed in 0.13.0; a
+ * request carrying that header is judged exactly as one carrying nothing, so there is no switch left
+ * that can put a bare day-key back into service.
+ *
+ * Rules worth stating, because each one is a decision rather than an accident:
+ *
+ * - **The day-key is checked from the token's `server` claim, never from a header.** The JWT proves
+ *   the caller holds the signing secret; the claim proves they also hold today's rotating key.
+ *   Dropping the second check would make a leaked signing secret permanent access, which is the
+ *   exact property the day-key rotation exists to deny.
+ * - **No secret configured means the gate is shut**, not open and not header-based: every gated
+ *   request fails closed, exactly like a missing day-key store. The ungated GET surface is untouched.
+ * - **The reason never reaches the caller.** Every failure here answers the same generic 500 (see
+ *   proxy_to_docapi), so a prober cannot tell a bad signature from an expired token from an unknown
+ *   account — or from an ordinary server error.
+ */
 CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
                                       const httplib::Request& req,
                                       std::chrono::system_clock::time_point now) {
+    if (!cfg.jwt_enabled()) return {false, "jwt not configured (CPROXY_JWT_SECRET unset)"};
+
     const std::string token = bearer_token(req.get_header_value("Authorization"));
+    if (token.empty()) return {false, "no bearer token presented"};
 
-    if (cfg.jwt_enabled() && !token.empty()) {
-        JwtVerifyOptions opts;
-        opts.secret = cfg.jwt_secret;
-        opts.issuer = cfg.jwt_issuer;
-        opts.audience = cfg.jwt_audience;
-        opts.subject = cfg.jwt_subject;
-        opts.leeway_seconds = cfg.jwt_leeway_seconds;
+    JwtVerifyOptions opts;
+    opts.secret = cfg.jwt_secret;
+    opts.issuer = cfg.jwt_issuer;
+    opts.audience = cfg.jwt_audience;
+    opts.subject = cfg.jwt_subject;
+    opts.leeway_seconds = cfg.jwt_leeway_seconds;
 
-        JwtResult verified = verify_hs512(token, opts, now);
+    JwtResult verified = verify_hs512(token, opts, now);
 
-        // An admin request may correct the clock — on a pass (keeping drift from ever growing into a
-        // failure) as well as on a time-only rejection (recovering from one that already has). The
-        // recovery arm re-verifies ONCE against the corrected clock; it cannot loop, because a
-        // second alignment from the same request would compute a delta of zero.
-        if (align_clock_from_request(cfg, state, req, verified, now)) {
-            now = state.clock.now();
-            verified = verify_hs512(token, opts, now);
-        }
-
-        if (!verified.ok) return {false, "jwt rejected: " + verified.error};
-
-        if (!state.daykey_store.has_value() || !state.daykey_store->is_valid(verified.claims.server, now)) {
-            return {false, "jwt server claim is not a current day-key"};
-        }
-        if (cfg.jwt_require_user) {
-            // A WRITE must name an account; a gated READ need not. /news/featured and /news/more are
-            // the home page, served to anonymous visitors, so demanding a `user` claim there would
-            // put the whole front page behind a login — the gate exists to stop anonymous SCRAPING
-            // of an expensive endpoint, not anonymous READING of it. Whenever a claim IS present it
-            // is checked, read or write, so a stale or revoked account never rides along unnoticed.
-            const bool is_write = iequals(req.method, "POST") || iequals(req.method, "PATCH");
-            if (verified.claims.user.empty()) {
-                if (is_write) return {false, "jwt carries no user claim on a write"};
-            } else if (!state.user_prime_store.has_value() ||
-                       !state.user_prime_store->is_valid(verified.claims.user, now)) {
-                return {false, "jwt user claim does not match a live account"};
-            }
-        }
-        return {true, {}};
+    // An admin request may correct the clock — on a pass (keeping drift from ever growing into a
+    // failure) as well as on a time-only rejection (recovering from one that already has). The
+    // recovery arm re-verifies ONCE against the corrected clock; it cannot loop, because a second
+    // alignment from the same request would compute a delta of zero.
+    if (align_clock_from_request(cfg, state, req, verified, now)) {
+        now = state.clock.now();
+        verified = verify_hs512(token, opts, now);
     }
 
-    if (cfg.jwt_required) {
-        return {false, token.empty() ? "no bearer token presented" : "jwt not configured"};
-    }
+    if (!verified.ok) return {false, "jwt rejected: " + verified.error};
 
-    // Pre-0.10.0 path, unchanged: the raw rotating GUID in its own header.
-    const bool ok = state.daykey_store.has_value() &&
-                    state.daykey_store->is_valid(req.get_header_value("X-Day-Guid"), now);
-    return {ok, ok ? std::string{} : "day-key check failed"};
+    if (!state.daykey_store.has_value() || !state.daykey_store->is_valid(verified.claims.server, now)) {
+        return {false, "jwt server claim is not a current day-key"};
+    }
+    if (cfg.jwt_require_user) {
+        // A WRITE must name an account; a gated READ need not. /news/featured and /news/more are the
+        // home page, served to anonymous visitors, so demanding a `user` claim there would put the
+        // whole front page behind a login — the gate exists to stop anonymous SCRAPING of an
+        // expensive endpoint, not anonymous READING of it. Whenever a claim IS present it is checked,
+        // read or write, so a stale or revoked account never rides along unnoticed.
+        const bool is_write = iequals(req.method, "POST") || iequals(req.method, "PATCH");
+        if (verified.claims.user.empty()) {
+            if (is_write) return {false, "jwt carries no user claim on a write"};
+        } else if (!state.user_prime_store.has_value() ||
+                   !state.user_prime_store->is_valid(verified.claims.user, now)) {
+            return {false, "jwt user claim does not match a live account"};
+        }
+    }
+    return {true, {}};
 }
 
 /** Forwards one request to the docapi upstream and copies the response back. */
@@ -475,8 +467,8 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     }
 
     // The write surface (POST, PATCH) plus any path in CPROXY_DAYKEY_PATHS additionally requires the
-    // gateway credential — a Bearer JWT carrying the day-key, or the bare day-key header while the
-    // migration is in flight; see check_gate_credential. Deliberately answered with a generic 500,
+    // gateway credential — a Bearer JWT carrying the day-key in its `server` claim; see
+    // check_gate_credential. Deliberately answered with a generic 500,
     // not 401/403: a wrong or missing credential must not read any differently from an ordinary
     // server error to a caller probing it.
     // POST joined PATCH here when docapi's regulation endpoints (insert, not just merge-patch) were

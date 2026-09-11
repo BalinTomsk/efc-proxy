@@ -17,7 +17,7 @@ namespace cproxy {
  *
  * Forwarding preserves method, the raw request target, headers (minus hop-by-hop and any inbound
  * X-Forwarded or X-Request-Id), and body; adds the standard X-Forwarded headers and a correlation
- * id; enforces the optional API key, method allow-list, and (for POST/PATCH) the day-key credential;
+ * id; enforces the optional API key, method allow-list, and (for POST/PATCH) the Bearer JWT credential;
  * rejects path traversal; and maps an unreachable/timed-out upstream to a clean 502. Upstream
  * connections are pooled per worker thread, guarded by a consecutive-failure circuit breaker that
  * fails fast during an outage.
@@ -26,9 +26,9 @@ namespace cproxy {
  * `CPROXY_DAYKEY_PATHS`. As of 0.10.0 that credential is an `Authorization: Bearer <HS512 JWT>` whose
  * `server` claim carries the current UTC day's key (yesterday/today/tomorrow window) from
  * `cfg.daykey_db_path` — see DayKeyStore and jwt_verifier.hpp — and whose `user` claim is checked
- * against the account mirror when `CPROXY_JWT_REQUIRE_USER` is on (UserPrimeStore). The pre-0.10.0
- * raw `X-Day-Guid` header still clears the gate until `CPROXY_JWT_REQUIRED` is turned on, so the two
- * services can be deployed in either order. A missing/wrong credential is answered with a generic
+ * against the account mirror when `CPROXY_JWT_REQUIRE_USER` is on (UserPrimeStore). The token is the
+ * ONLY credential: the pre-0.10.0 raw `X-Day-Guid` header was removed in 0.13.0 and is ignored, and an
+ * unset `CPROXY_JWT_SECRET` shuts the gated surface. A missing/wrong credential is answered with a generic
  * 500, not 401, so it reads no differently from an ordinary server error to anyone probing the
  * endpoint. This is orthogonal to CPROXY_ALLOWED_METHODS: POST/PATCH must still be in the allow-list
  * for a request to reach this check at all.
