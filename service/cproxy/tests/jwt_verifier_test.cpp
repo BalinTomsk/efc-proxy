@@ -20,9 +20,10 @@ namespace {
 
 const std::string kSecret = "a-test-signing-secret-that-is-comfortably-long-enough-for-hs512";
 
+const std::string kB64UrlAlphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
 std::string base64url_encode(const std::string& bytes) {
-    static const char* const alphabet =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     std::string out;
     int bits = 0;
     unsigned int accumulator = 0;
@@ -31,11 +32,26 @@ std::string base64url_encode(const std::string& bytes) {
         bits += 8;
         while (bits >= 6) {
             bits -= 6;
-            out.push_back(alphabet[(accumulator >> bits) & 0x3F]);
+            out.push_back(kB64UrlAlphabet[(accumulator >> bits) & 0x3F]);
         }
     }
-    if (bits > 0) out.push_back(alphabet[(accumulator << (6 - bits)) & 0x3F]);
+    if (bits > 0) out.push_back(kB64UrlAlphabet[(accumulator << (6 - bits)) & 0x3F]);
     return out;  // unpadded, as RFC 7515 requires
+}
+
+/**
+ * `encoded` with the final symbol of its last `.`-separated segment re-spelled: same significant
+ * high bits, `low` OR-ed into the unused low bits (4 of them after a 2-symbol tail, 2 after a
+ * 3-symbol one). The bytes a lenient decoder yields are unchanged; only the spelling differs.
+ */
+std::string respell_last_symbol(const std::string& encoded, unsigned low) {
+    const std::size_t segment_at = encoded.rfind('.') + 1;  // npos + 1 == 0: no dot, whole string
+    const std::size_t tail = (encoded.size() - segment_at) % 4;
+    const unsigned unused_bits = tail == 2 ? 4 : tail == 3 ? 2 : 0;
+    std::string out = encoded;
+    const unsigned symbol = static_cast<unsigned>(kB64UrlAlphabet.find(out.back()));
+    out.back() = kB64UrlAlphabet[symbol | (low & ((1u << unused_bits) - 1))];
+    return out;
 }
 
 std::string hmac512(const std::string& key, const std::string& data) {
@@ -114,6 +130,12 @@ void a_token_minted_by_the_real_frontend_verifies() {
     CHECK(result.claims.server == "20C23A17-841D-44E7-AD0F-B26FA6E8968E");
     CHECK(result.claims.user == "104729314187");  // 1000003 * 104729, as BigInteger produced it
     CHECK(result.claims.expires_at == 1788911999);
+
+    // The frontend encodes canonically (Convert.ToBase64String zero-fills the unused bits), so the
+    // spelling above is the only one of its 16 that may verify — see the respelling case below.
+    CHECK(!verify_hs512(respell_last_symbol(minted_by_dotnet, 1), default_options(),
+                        at_epoch(1788900000))
+               .ok);
 }
 
 void a_token_signed_with_a_different_secret_is_rejected() {
@@ -252,6 +274,44 @@ void base64url_decoding_accepts_the_unpadded_form_and_rejects_junk() {
     CHECK(base64url_decode("aGVsbG8=", out) && out == "hello");  // padding tolerated
     CHECK(!base64url_decode("a+/b", out));                        // standard-base64 characters
     CHECK(!base64url_decode("abcde", out));                       // impossible length
+
+    // Non-zero unused low bits in the final symbol: non-canonical, so refused (RFC 4648 §3.5).
+    CHECK(base64url_decode("ww", out) && out == "\xC3");  // 2-symbol tail, 4 unused bits, all 0
+    CHECK(!base64url_decode("wx", out));                   // ...the prod case, 'w' -> 'x'
+    CHECK(!base64url_decode("w_", out));
+    CHECK(base64url_decode("QUI", out) && out == "AB");   // 3-symbol tail, 2 unused bits, all 0
+    CHECK(!base64url_decode("QUJ", out));
+    CHECK(!base64url_decode("QUL", out));
+    CHECK(base64url_decode("aGVsbG8=", out) && out == "hello");
+    CHECK(!base64url_decode("aGVsbG9=", out));  // padding does not excuse a non-canonical tail
+}
+
+void a_signature_respelled_in_its_unused_low_bits_is_refused() {
+    // Seen live on prod 2026-09-11: an HS512 token whose signature ended in 'w' still verified with
+    // that char changed to 'x'. 86 symbols carry 516 bits for a 512-bit MAC, so the last symbol has 4
+    // unused low bits; the decoder used to throw them away, and all 16 spellings decoded to the same
+    // MAC. Not a forgery — the MAC bytes are identical — but a malleable token, which a strict JWS
+    // verifier refuses. Every respelling must now fail at decode, before the MAC is even compared.
+    const std::string token = mint(kHs512Header, platform_payload(1788900000));
+    const std::size_t signature_at = token.rfind('.') + 1;
+    const std::string signature = token.substr(signature_at);
+    std::string mac;
+    CHECK(signature.size() == 86);
+    CHECK(base64url_decode(signature, mac) && mac.size() == 64);
+    CHECK(verify_hs512(token, default_options(), at_epoch(1788890000)).ok);
+
+    for (unsigned low = 1; low < 16; ++low) {
+        const std::string respelled = respell_last_symbol(signature, low);
+        CHECK(respelled != signature);
+        CHECK(respelled.substr(0, 85) == signature.substr(0, 85));
+        CHECK(!base64url_decode(respelled, mac));
+
+        const JwtResult result = verify_hs512(token.substr(0, signature_at) + respelled,
+                                              default_options(), at_epoch(1788890000));
+        CHECK(!result.ok);
+        CHECK(!result.signature_ok);
+        CHECK(result.error == "base64url decode failed");
+    }
 }
 
 
@@ -392,6 +452,7 @@ int main() {
     verification_is_off_entirely_without_a_secret();
     bearer_extraction_handles_the_shapes_a_client_actually_sends();
     base64url_decoding_accepts_the_unpadded_form_and_rejects_junk();
+    a_signature_respelled_in_its_unused_low_bits_is_refused();
     a_token_carrying_any_adm_claim_still_verifies_and_the_claim_is_ignored();
     a_token_from_the_0_11_frontend_with_adm_still_verifies();
     an_expired_token_still_reports_its_claims_so_the_skew_can_be_measured();

@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:e9f6563b5e1911f152a22be4a3a63e65fb9d5a02cdce9b766d4498bf2f3fea23  # 0.12.0 pinned by digest
+    image: ghcr.io/balintomsk/cproxy@sha256:fa491894ef517b53d7c25d4b462597ad325ca26af47de6058063530205f125af  # 0.13.0 pinned by digest
     container_name: cproxy
     restart: unless-stopped
     ports:
@@ -17,8 +17,8 @@ services:
       # the volume, /mnt/volume_cnode/cproxy/.env, alongside EXTERNAL_ADMIN / EXTERNAL_FRONTEND.
       # A real process env var would win over the dotenv, which is why this must stay unset.
       CPROXY_ROUTE_PREFIX: /api/
-      CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the day-key below, not open
-      CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating credential for POST/PATCH (see DayKeyStore)
+      CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the Bearer JWT below, not open
+      CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating key the JWT's `server` claim must match (see DayKeyStore)
       CPROXY_DOTENV_PATH: /etc/cproxy/.env
       FF_MASTER_KEY_FILE: /etc/cproxy/master.key
       # Datacenter/cloud-provider blocking. The path MUST be on a writable bind mount: the rootfs is
@@ -42,13 +42,15 @@ services:
       # Gateway JWT (0.10.0). CPROXY_JWT_SECRET is secret and comes from the volume's .env, same as
       # the two above -- it must equal FishApi:JwtKey in the frontend's secrets.config byte for byte.
       #
-      # The bare X-Day-Guid header is NO LONGER ACCEPTED as of 2026-09-09: a signed token is the only
-      # credential for the gated surface. This is the step where the migration actually buys
-      # something -- before it, a leaked day-key was still a working credential on its own. Every
-      # caller must present Authorization: Bearer <token>; for a human that means
-      # Profile -> Gateway token -> Save jwt.txt on the portal. Rollback is setting this to "false"
-      # and re-running compose up -d (no rebuild, no image change).
-      CPROXY_JWT_REQUIRED: "true"
+      # A signed token is the ONLY credential for the gated surface. Every caller presents
+      # Authorization: Bearer <token>, and the day-key is read from the token's `server` claim; for a
+      # human that means Profile -> Gateway token -> Save jwt.txt on the portal. The bare X-Day-Guid
+      # header was refused from 2026-09-09 (CPROXY_JWT_REQUIRED=true) and the code that could accept
+      # it was REMOVED in 0.13.0 (2026-09-11), together with CPROXY_JWT_REQUIRED itself -- so there is
+      # no config-only rollback to the header any more. Do not add CPROXY_JWT_REQUIRED back: 0.13.0
+      # ignores it and logs a WARN. Going back to the header means redeploying the 0.12.0 digest.
+      # If CPROXY_JWT_SECRET is ever missing from the dotenv, every gated request answers 500
+      # (startup logs an ERROR saying so); ungated reads keep serving.
       #
       # The `user` claim is now enforced too (2026-09-09): a POST/PATCH must carry one, and any claim
       # present -- on a read as well -- must resolve to a live, non-suspended, non-deleted, unexpired

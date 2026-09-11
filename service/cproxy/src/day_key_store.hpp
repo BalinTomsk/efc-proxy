@@ -12,7 +12,8 @@ namespace cproxy {
  * Generated out-of-band and never rebuilt from source — this is a rotating credential, not
  * application data.
  *
- * A caller presents the current UTC day's GUID in the `X-Day-Guid` header; a three-day window
+ * A caller presents the current UTC day's GUID as the `server` claim of its signed Bearer JWT (the
+ * raw `X-Day-Guid` header that used to carry it was removed in 0.13.0); a three-day window
  * (yesterday/today/tomorrow) is accepted so a request straddling the UTC midnight boundary is never
  * spuriously rejected.
  *

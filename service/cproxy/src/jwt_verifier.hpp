@@ -12,9 +12,9 @@ namespace cproxy {
  *     "sub":"cproxy", "server":"<dbo.day_keys.guid for today>",
  *     "user":"<Users.prime * Users_Prime.prime for today>" }
  *
- * `server` carries exactly the credential the `X-Day-Guid` header used to carry, so the day-key store
- * stays the authority on it; `user` is the per-account product cproxy re-derives from its own mirror
- * (see UserPrimeStore). Both are kept as strings: `user` is a product of two bigints and overflows
+ * `server` carries exactly the credential the retired `X-Day-Guid` header used to carry (the header
+ * itself is no longer read anywhere, as of 0.13.0), so the day-key store stays the authority on it;
+ * `user` is the per-account product cproxy re-derives from its own mirror (see UserPrimeStore). Both are kept as strings: `user` is a product of two bigints and overflows
  * double, so a JSON number would be silently rounded by any parser that reads it as one.
  */
 struct JwtClaims {
@@ -95,7 +95,8 @@ JwtResult verify_hs512(const std::string& token, const JwtVerifyOptions& opts,
 std::string bearer_token(const std::string& authorization_header);
 
 /** base64url (RFC 4648 §5, padding optional) -> bytes. Returns false on any character outside the
- *  alphabet or a length that cannot be a base64 group. Exposed for tests. */
+ *  alphabet, a length that cannot be a base64 group, or a final symbol whose unused low bits are not
+ *  zero (non-canonical, RFC 4648 §3.5). Exposed for tests. */
 bool base64url_decode(const std::string& input, std::string& out);
 
 }  // namespace cproxy

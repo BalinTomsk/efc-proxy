@@ -47,13 +47,13 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
   honoring `CPROXY_CONNECT_TIMEOUT_MS` / `CPROXY_READ_TIMEOUT_MS`.
 - **Optional guards:** if `CPROXY_API_KEY` is set, a request lacking a matching `X-API-Key` → `401`;
   if `CPROXY_ALLOWED_METHODS` is a non-empty CSV, a method not in it → `405`.
-- **Day-key guard:** independent of the two guards above — a gated request additionally requires the
-  current UTC date's credential from the `CPROXY_DAYKEY_DB` SQLite database, presented since 0.10.0
-  as the `server` claim of an `Authorization: Bearer <HS512 JWT>` (see "JWT credential" below) or, in
-  the pre-0.10.0 form still accepted until `CPROXY_JWT_REQUIRED` is on, in the header `X-Day-Guid`
-  matching that same value from the `CPROXY_DAYKEY_DB` SQLite database
-  (`day_keys(stamp TEXT PRIMARY KEY, guid TEXT NOT NULL)`, one row per calendar date; ±1 day window);
-  a wrong or missing value → `500` (deliberately not `401`, so it reads no
+- **Gate (day-key in a Bearer JWT):** independent of the two guards above — a gated request
+  additionally requires `Authorization: Bearer <HS512 JWT>` (see "JWT credential" below) whose
+  `server` claim is the current UTC date's credential from the `CPROXY_DAYKEY_DB` SQLite database
+  (`day_keys(stamp TEXT PRIMARY KEY, guid TEXT NOT NULL)`, one row per calendar date; ±1 day window).
+  **That token is the only credential (0.13.0):** the pre-0.10.0 bare `X-Day-Guid` header, and the
+  `CPROXY_JWT_REQUIRED` switch that governed it, no longer exist — a request carrying only that
+  header is judged as carrying nothing. A wrong or missing token → `500` (deliberately not `401`, so it reads no
   differently from an ordinary server error). Two arms, either one gates: **every POST/PATCH**
   whatever the path, and **every method on a path in `CPROXY_DAYKEY_PATHS`** (default
   `/news/default`, `/news/featured` and `/news/more` — this is how a *read* is put behind the
@@ -75,8 +75,7 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV method allow-list |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
 | `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more` | CSV of paths day-key gated on **every** method, GET included; `NONE` disables (an empty value reads as unset) |
-| `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ Bearer tokens are not verified and only `X-Day-Guid` is accepted |
-| `CPROXY_JWT_REQUIRED` | `false` | `true` ⇒ a valid token is the only accepted credential |
+| `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ every gated request always `500` (startup ERROR), ungated reads unaffected. Removed in 0.13.0: `CPROXY_JWT_REQUIRED` (ignored with a WARN if set) |
 | `CPROXY_JWT_REQUIRE_USER` | `false` | `true` ⇒ writes must carry a `user` claim; any claim present must match a live account |
 | `CPROXY_JWT_ISSUER` / `_AUDIENCE` / `_SUBJECT` | `envfish` / `fishfind.info` / `cproxy` | required claims; `NONE` skips one |
 | `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat`/`nbf` (**prod sets 60**) |
@@ -130,8 +129,11 @@ tests/
   jwt_verifier_test.cpp    forged/tampered tokens, alg:none, HS256 downgrade, expiry, claim checks
   user_prime_store_test.cpp  prime product incl. past 2^63, revoked accounts, day window, fail-closed
   proxy_test.cpp           real HTTP through install_routes(); includes the gated-read cases
-                           (/news/default, /news/featured, /news/more all 500 without a key,
-                            502 through with one, siblings open) and the JWT gate end to end
+                           (/news/default, /news/featured, /news/more all 500 without a token,
+                            through with one, siblings open), the JWT gate end to end, and
+                           the_day_key_header_is_never_a_credential / no_secret_shuts_the_gated_surface
+  clock_offset_test.cpp    offset adoption, clamping of the TOTAL offset
+  account_mirror_store_test.cpp  RabbitMQ users_sync / user_prime_sync mirror, schema migration
 ```
 
 ## Day-key store (0.9.0: date-keyed)
@@ -159,10 +161,10 @@ never re-queried per request. `is_valid(guid, now)` accepts yesterday / today / 
   version rejects the other's schema. Upload the file next to the *running* container (which holds
   its keys in memory and is unaffected), then recreate once.
 
-## JWT credential (0.10.0)
+## JWT credential (0.10.0; the only credential since 0.13.0)
 
-`jwt_verifier.hpp/.cpp` + `user_prime_store.hpp/.cpp`. The day-key now travels inside a signed token
-rather than on its own in a header. Callers send `Authorization: Bearer <HS512 JWT>`, minted by the
+`jwt_verifier.hpp/.cpp` + `user_prime_store.hpp/.cpp`. The day-key travels inside a signed token,
+never on its own in a header. Callers send `Authorization: Bearer <HS512 JWT>`, minted by the
 frontend (`aspnet/Account/FishApiJwt.cs`):
 
 ```json
@@ -170,8 +172,14 @@ frontend (`aspnet/Account/FishApiJwt.cs`):
   "sub": "cproxy", "server": "<today's day-key GUID>", "user": "<Users.prime * Users_Prime.prime>" }
 ```
 
+- **`check_gate_credential` order (0.13.0):** no secret configured → refuse (`jwt not configured`);
+  no `Bearer` token → refuse (`no bearer token presented`) — any `X-Day-Guid` header is simply not
+  read; verify (with at most one clock-align re-verify) → `server` against `DayKeyStore` → `user`
+  claim when `CPROXY_JWT_REQUIRE_USER`. There is no fallback branch, so the old rule "a present-but-bad
+  token is fatal even while the header is accepted" no longer needs stating: nothing is accepted
+  instead of a token.
 - **The token wraps the rotation, it does not replace it.** `server` is checked against `DayKeyStore`
-  exactly as `X-Day-Guid` was. A leaked signing secret alone is worthless without today's GUID, and a
+  exactly as the retired `X-Day-Guid` header was. A leaked signing secret alone is worthless without today's GUID, and a
   harvested GUID is worthless without the secret; both are required. What the signature adds is that
   the credential is bound to an issuer, an audience and an expiry, so a copied request is no longer
   replayable from anywhere for the rest of the day.
@@ -179,9 +187,11 @@ frontend (`aspnet/Account/FishApiJwt.cs`):
   (`"alg":"none"`; an RS256 verifier HMACing with a public key). `exp` is mandatory — an unbounded
   token would reintroduce the property the rotation exists to deny. The MAC is compared with
   `CRYPTO_memcmp` before any claim is read.
-- **A present-but-invalid token is fatal even while `CPROXY_JWT_REQUIRED` is off.** The header
-  fallback exists for callers that send *no* token; falling back on a failed one would allow a
-  downgrade past the signature with a day-key harvested from anywhere.
+- **base64url is decoded strictly** (after 0.13.0): a final symbol whose unused low bits (4 after a
+  2-symbol tail, 2 after a 3-symbol one) are not zero is refused as `base64url decode failed`, so each
+  segment has exactly one accepted spelling. A lenient decoder let an HS512 signature's last character
+  be swapped for any of 16 variants and still verify — no forgery, but a malleable token. Padding `=`
+  is still tolerated.
 - **`user` is a product of two primes, compared as decimal TEXT in 128-bit arithmetic.**
   `UserPrimeStore` re-derives `users_sync.prime × user_prime_sync.prime` for the day from cproxy's own
   account mirror (never MSSQL) and matches strings. The two bigints multiply past 2^63, and a wrapped
@@ -230,10 +240,10 @@ frontend (`aspnet/Account/FishApiJwt.cs`):
   close enough not to need it. Identity claims (`iss`/`aud`/`sub`) are therefore checked *before*
   the time claims — a token for another audience must never reach this path.
 - **Failure is the same opaque `500`** as a failed day-key. The reason goes to the log only.
-- **Rollout, three reversible switches:** `CPROXY_JWT_SECRET` empty ⇒ 0.9.x behaviour exactly →
-  set the secret (both credentials accepted) → frontend `FishApi:JwtOnly=true` → gateway
-  `CPROXY_JWT_REQUIRED=true`. Until the last step nothing has been taken away from someone holding
-  the day-key.
+- **Rollout history (complete):** 0.10.0 with the secret empty (0.9.x behaviour) → secret set, both
+  credentials accepted → frontend `FishApi:JwtOnly=true` → gateway `CPROXY_JWT_REQUIRED=true`
+  (2026-09-09) → **0.13.0 deletes the header path and the switch** (2026-09-11). Going back to header
+  auth now requires redeploying the 0.12.0 image; no config value does it.
 
 ## Datacenter / cloud-provider IP blocking (0.8.0)
 
@@ -371,4 +381,14 @@ main (PR #85). Prod and git are in sync. Only `README.md` is tracked in `service
 - Guards: `CPROXY_API_KEY` → 401 without / 200 with `X-API-Key`; `CPROXY_ALLOWED_METHODS=GET` → 405
   on other methods; on a PATCH additionally in the allow-list, `CPROXY_DAYKEY_DB` unset/wrong
   `X-Day-Guid` → 500, the current UTC day's guid → forwarded normally
-  on POST.
+  on POST. *(Historical — as of 0.13.0 the day-key is accepted only inside a Bearer JWT; see the
+  2026-09-11 verification below.)*
+
+## Verification (2026-09-11, prod, 0.13.0)
+
+- 10/10 ctest suites in the Docker build stage. A copy with an `X-Day-Guid` fallback re-inserted
+  into `check_gate_credential` fails `proxy_test` at the header assertion.
+- Deployed digest `sha256:fa491894…25af`; startup `"jwt":"on (bearer only, user claim enforced)"`.
+- Every fronted route and guard probed before (0.12.0) and after (0.13.0): identical status and
+  responder on all of them. Bare `X-Day-Guid` with today's real key → 500 on a gated GET and on a
+  PATCH (logged `no bearer token presented`).

@@ -120,7 +120,13 @@ bool base64url_decode(const std::string& input, std::string& out) {
         }
     }
     // 1 leftover symbol carries 6 bits, which cannot be a byte — that length is always corruption.
-    return (symbols % 4) != 1;
+    if ((symbols % 4) == 1) return false;
+    // The 2 or 4 bits left over after the last whole byte must be zero (RFC 4648 §3.5). Discarding
+    // them instead made every final symbol one of up to 16 interchangeable spellings: an 86-char HS512
+    // signature ending in 'w' verified just as well ending in 'x' (seen live on prod, 2026-09-11).
+    // Nothing is forgeable that way — the decoded bytes are identical — but the token is malleable,
+    // and strict JWS verifiers refuse exactly that. Canonical encoders always emit zeros here.
+    return (accumulator & ((1u << bits) - 1)) == 0;
 }
 
 std::string bearer_token(const std::string& authorization_header) {

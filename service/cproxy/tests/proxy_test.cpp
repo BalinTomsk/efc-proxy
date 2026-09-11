@@ -270,7 +270,7 @@ void content_type_is_forwarded() {
 // The write surface's day-key gate (see proxy_to_docapi) now covers POST as well as PATCH, since
 // docapi's regulation endpoints add a genuine insert (POST), not just merge-patch (PATCH). Neither
 // method reaches the upstream without a configured day-key store — this proves both fail closed
-// (500, the same generic error a wrong/missing X-Day-Guid produces) rather than silently falling
+// (500, the same generic error a wrong/missing credential produces) rather than silently falling
 // back to PATCH-only gating.
 void post_and_patch_require_day_key() {
     TestServer up;
@@ -299,64 +299,9 @@ void post_and_patch_require_day_key() {
     CHECK(patch->body.find("internal_error") != std::string::npos);
 }
 
-// GET /news/default is day-key gated by config default: the credential is no longer only about
-// mutating state, it also fences off a read that is expensive to assemble upstream. Everything here
-// is a GET, so nothing in the method arm of the gate is doing the work.
-void gated_read_path_requires_day_key() {
-    TestServer up;
-    install_fake_upstream(up.server);
-    up.start();
-
-    const std::string db = "proxy_test_day_keys.sqlite";
-    write_uniform_day_key_db(db, "TEST-DAY-KEY");
-
-    Config cfg;  // daykey_paths defaults to {"/news/default"}
-    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
-    cfg.daykey_db_path = db;
-    TestServer proxy;
-    install_routes(proxy.server, cfg);
-    proxy.start();
-
-    httplib::Client cli("127.0.0.1", proxy.port);
-
-    // No key, wrong key: the generic 500, indistinguishable from an ordinary server error.
-    auto bare = cli.Get("/api/v1/news/default");
-    CHECK(bare && bare->status == 500);
-    CHECK(bare->body.find("internal_error") != std::string::npos);
-    CHECK(bare->body.find("day") == std::string::npos);  // the reason must not leak into the body
-    auto wrong = cli.Get("/api/v1/news/default", {{"X-Day-Guid", "nope"}});
-    CHECK(wrong && wrong->status == 500);
-
-    // The current day's key gets through, and the request still reaches the upstream intact.
-    auto ok = cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}});
-    CHECK(ok && ok->status == 200);
-    CHECK(ok->body == "upstream:/api/v1/news/default");
-
-    // Trailing slash, casing, a query string, and a nested sub-path are all still gated.
-    CHECK(cli.Get("/api/v1/news/default/")->status == 500);
-    CHECK(cli.Get("/api/v1/News/Default")->status == 500);
-    CHECK(cli.Get("/api/v1/news/default?country=CA")->status == 500);
-    CHECK(cli.Get("/api/v1/news/default/extra")->status == 500);
-
-    // Traversal must not be able to re-point a request past the gate: the tail here is "/default",
-    // which would clear a naive suffix match, but a Spring upstream normalizes it straight back to
-    // the gated endpoint. The dot-dot rejection runs first, so it never reaches the gate at all.
-    auto dodge = cli.Get("/api/v1/news/default/../default");
-    CHECK(dodge && dodge->status == 400);
-
-    // Sibling news reads are untouched — no key, still served.
-    auto list = cli.Get("/api/v1/news/list?country=CA");
-    CHECK(list && list->status == 200);
-    CHECK(list->body == "upstream:/api/v1/news/list?country=CA");
-    auto fish = cli.Get("/api/v1/fish?water=fresh");
-    CHECK(fish && fish->status == 200);
-
-    std::remove(db.c_str());
-}
-
-// --- JWT credential (0.10.0) -------------------------------------------------------------------
-// The day-key now travels inside a signed token instead of on its own in a header. These tests drive
-// the gate end to end through real HTTP; jwt_verifier_test covers the token format itself.
+// --- JWT credential (0.10.0; the only credential since 0.13.0) ----------------------------------
+// The day-key travels inside a signed token, never on its own in a header. These tests drive the
+// gate end to end through real HTTP; jwt_verifier_test covers the token format itself.
 
 const std::string kTestJwtSecret = "proxy-test-signing-secret-long-enough-for-hs512-use";
 
@@ -404,6 +349,64 @@ std::string mint_token(const std::string& day_guid, const std::string& user = ""
          reinterpret_cast<const unsigned char*>(signing_input.data()), signing_input.size(), digest,
          &length);
     return signing_input + "." + b64url(std::string(reinterpret_cast<char*>(digest), length));
+}
+
+std::string bearer(const std::string& token) { return "Bearer " + token; }
+
+// GET /news/default is gated by config default: the credential is not only about mutating state, it
+// also fences off a read that is expensive to assemble upstream. Everything here is a GET, so nothing
+// in the method arm of the gate is doing the work.
+void gated_read_path_requires_a_bearer_token() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    const std::string db = "proxy_test_day_keys.sqlite";
+    write_uniform_day_key_db(db, "TEST-DAY-KEY");
+
+    Config cfg;  // daykey_paths defaults to the three news home-page paths
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    cfg.daykey_db_path = db;
+    cfg.jwt_secret = kTestJwtSecret;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+
+    // No credential: the generic 500, indistinguishable from an ordinary server error.
+    auto bare = cli.Get("/api/v1/news/default");
+    CHECK(bare && bare->status == 500);
+    CHECK(bare->body.find("internal_error") != std::string::npos);
+    CHECK(bare->body.find("day") == std::string::npos);  // the reason must not leak into the body
+    CHECK(bare->body.find("jwt") == std::string::npos);
+
+    // A token carrying the current day's key gets through, and the request reaches the upstream
+    // intact.
+    auto ok = cli.Get("/api/v1/news/default", {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}});
+    CHECK(ok && ok->status == 200);
+    CHECK(ok->body == "upstream:/api/v1/news/default");
+
+    // Trailing slash, casing, a query string, and a nested sub-path are all still gated.
+    CHECK(cli.Get("/api/v1/news/default/")->status == 500);
+    CHECK(cli.Get("/api/v1/News/Default")->status == 500);
+    CHECK(cli.Get("/api/v1/news/default?country=CA")->status == 500);
+    CHECK(cli.Get("/api/v1/news/default/extra")->status == 500);
+
+    // Traversal must not be able to re-point a request past the gate: the tail here is "/default",
+    // which would clear a naive suffix match, but a Spring upstream normalizes it straight back to
+    // the gated endpoint. The dot-dot rejection runs first, so it never reaches the gate at all.
+    auto dodge = cli.Get("/api/v1/news/default/../default");
+    CHECK(dodge && dodge->status == 400);
+
+    // Sibling news reads are untouched — no credential, still served.
+    auto list = cli.Get("/api/v1/news/list?country=CA");
+    CHECK(list && list->status == 200);
+    CHECK(list->body == "upstream:/api/v1/news/list?country=CA");
+    auto fish = cli.Get("/api/v1/fish?water=fresh");
+    CHECK(fish && fish->status == 200);
+
+    std::remove(db.c_str());
 }
 
 // Account products in the clock-sync fixtures' mirror. Fixed primes, and the same day prime on every
@@ -515,7 +518,6 @@ struct ClockSyncFixture {
         cfg.daykey_db_path = db;
         cfg.account_mirror_db_path = mirror;
         cfg.jwt_secret = kTestJwtSecret;
-        cfg.jwt_required = true;
         cfg.jwt_leeway_seconds = 60;
         cfg.jwt_clock_sync = sync_enabled;
         cfg.jwt_clock_sync_threshold_seconds = 5;
@@ -641,13 +643,15 @@ void a_junk_client_time_header_is_ignored_not_read_as_zero() {
               ->status == 200);
 }
 
-// While CPROXY_JWT_REQUIRED is off, a token and the legacy header are both accepted — that overlap
-// is what lets the frontend and the gateway be deployed in either order. What must NOT work is a
-// broken token alongside a good header: falling back there would let an attacker downgrade past the
-// signature check with a day-key harvested from anywhere.
-void bearer_jwt_clears_the_gate_alongside_the_legacy_header() {
+// 0.13.0: the bare X-Day-Guid header is not a credential in ANY configuration. It used to clear the
+// gate until CPROXY_JWT_REQUIRED was turned on; that switch is gone, so there is no setting left that
+// can put a harvested day-key back into service. The header is judged exactly as if it were absent.
+void the_day_key_header_is_never_a_credential() {
     TestServer up;
     install_fake_upstream(up.server);
+    up.server.Patch(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("patched", "text/plain");
+    });
     up.start();
 
     const std::string db = "proxy_test_jwt_day_keys.sqlite";
@@ -663,61 +667,78 @@ void bearer_jwt_clears_the_gate_alongside_the_legacy_header() {
 
     httplib::Client cli("127.0.0.1", proxy.port);
 
-    auto with_token =
-        cli.Get("/api/v1/news/default", {{"Authorization", "Bearer " + mint_token("TEST-DAY-KEY")}});
-    CHECK(with_token && with_token->status == 200);
-    CHECK(with_token->body == "upstream:/api/v1/news/default");
+    // The current day's key, in the header it used to travel in: refused on a gated read AND on a
+    // write, with the same opaque 500 as no credential at all.
+    auto header_read = cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}});
+    CHECK(header_read && header_read->status == 500);
+    CHECK(header_read->body.find("internal_error") != std::string::npos);
+    auto header_write =
+        cli.Patch("/api/v1/river/fish/x", {{"X-Day-Guid", "TEST-DAY-KEY"}}, "[]", "application/json");
+    CHECK(header_write && header_write->status == 500);
 
-    // Case-insensitive on the day-key, exactly as the header path has always been.
-    CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_token("test-day-key")}})
+    // The token clears both.
+    auto token_read =
+        cli.Get("/api/v1/news/default", {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}});
+    CHECK(token_read && token_read->status == 200);
+    CHECK(token_read->body == "upstream:/api/v1/news/default");
+    auto token_write = cli.Patch("/api/v1/river/fish/x",
+                                 {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}}, "[]",
+                                 "application/json");
+    CHECK(token_write && token_write->status == 200);
+    CHECK(token_write->body == "patched");
+
+    // Case-insensitive on the day-key inside the token.
+    CHECK(cli.Get("/api/v1/news/default", {{"Authorization", bearer(mint_token("test-day-key"))}})
               ->status == 200);
 
-    // Legacy header, still good.
-    CHECK(cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}})->status == 200);
-
-    // A token signed with the wrong secret is fatal even though a perfectly good day-key header
-    // rides along with it. No downgrade.
+    // A forged token is fatal, and a perfectly good day-key header riding along does not rescue it.
     auto forged = cli.Get("/api/v1/news/default",
-                          {{"Authorization", "Bearer " + mint_token("TEST-DAY-KEY", "", "wrong")},
+                          {{"Authorization", bearer(mint_token("TEST-DAY-KEY", "", "wrong"))},
                            {"X-Day-Guid", "TEST-DAY-KEY"}});
     CHECK(forged && forged->status == 500);
     CHECK(forged->body.find("jwt") == std::string::npos);  // the reason stays in the log
 
     // A valid signature over the wrong day-key is refused too: the token proves who minted it, the
-    // `server` claim proves they hold today's rotating credential, and both are required.
+    // `server` claim proves they hold today's rotating credential, and both are required -- even
+    // when the header next to it names the right key.
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_token("NOT-TODAYS-KEY")}})
+                  {{"Authorization", bearer(mint_token("NOT-TODAYS-KEY"))},
+                   {"X-Day-Guid", "TEST-DAY-KEY"}})
+              ->status == 500);
+
+    // A non-Bearer Authorization scheme is no token at all.
+    CHECK(cli.Get("/api/v1/news/default", {{"Authorization", "Basic " + mint_token("TEST-DAY-KEY")}})
               ->status == 500);
 
     std::remove(db.c_str());
 }
 
-// The end state of the migration: CPROXY_JWT_REQUIRED retires the bare header. Until this is turned
-// on, nothing has actually been taken away from an attacker who has the day-key.
-void jwt_required_retires_the_legacy_header() {
+// With no CPROXY_JWT_SECRET there is nothing to verify a token against and -- since 0.13.0 -- no other
+// credential to fall back on, so the gated surface is SHUT. It must not fail open, and it must not
+// revert to the header. The ungated surface keeps serving.
+void no_secret_shuts_the_gated_surface() {
     TestServer up;
     install_fake_upstream(up.server);
     up.start();
 
-    const std::string db = "proxy_test_jwt_required_day_keys.sqlite";
+    const std::string db = "proxy_test_nosecret_day_keys.sqlite";
     write_uniform_day_key_db(db, "TEST-DAY-KEY");
 
-    Config cfg;
+    Config cfg;  // jwt_secret deliberately left empty
     cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
     cfg.daykey_db_path = db;
-    cfg.jwt_secret = kTestJwtSecret;
-    cfg.jwt_required = true;
     TestServer proxy;
     install_routes(proxy.server, cfg);
     proxy.start();
 
     httplib::Client cli("127.0.0.1", proxy.port);
     CHECK(cli.Get("/api/v1/news/default", {{"X-Day-Guid", "TEST-DAY-KEY"}})->status == 500);
+    CHECK(cli.Get("/api/v1/news/default", {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}})
+              ->status == 500);
     CHECK(cli.Get("/api/v1/news/default")->status == 500);
-    CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_token("TEST-DAY-KEY")}})
-              ->status == 200);
+    // Ungated reads are unaffected.
+    auto list = cli.Get("/api/v1/news/list?country=CA");
+    CHECK(list && list->status == 200);
 
     std::remove(db.c_str());
 }
@@ -975,9 +996,9 @@ int main() {
     a_skew_beyond_the_ceiling_is_refused_rather_than_partly_applied();
     the_clock_sync_switch_turns_the_whole_thing_off();
     a_junk_client_time_header_is_ignored_not_read_as_zero();
-    gated_read_path_requires_day_key();
-    bearer_jwt_clears_the_gate_alongside_the_legacy_header();
-    jwt_required_retires_the_legacy_header();
+    gated_read_path_requires_a_bearer_token();
+    the_day_key_header_is_never_a_credential();
+    no_secret_shuts_the_gated_surface();
     gated_read_path_can_be_disabled();
     datacenter_ip_is_refused_with_500();
     datacenter_block_has_escape_hatches();

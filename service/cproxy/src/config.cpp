@@ -159,9 +159,9 @@ Config load_config(const EnvLookup& env) {
 
     // --- JWT credential -----------------------------------------------------------------------
     // The secret is typically an enc:v1: value in the dotenv (see secret_codec), so it arrives here
-    // already decrypted. Empty leaves JWT verification off entirely and the gate on X-Day-Guid.
+    // already decrypted. Empty shuts the gated surface (there is no other credential). The retired
+    // CPROXY_JWT_REQUIRED is deliberately not read: no value of it can bring X-Day-Guid back.
     cfg.jwt_secret = get_str(env, "CPROXY_JWT_SECRET", cfg.jwt_secret);
-    cfg.jwt_required = get_bool(env, "CPROXY_JWT_REQUIRED", cfg.jwt_required);
     cfg.jwt_require_user = get_bool(env, "CPROXY_JWT_REQUIRE_USER", cfg.jwt_require_user);
     cfg.jwt_leeway_seconds = get_int(env, "CPROXY_JWT_LEEWAY_SECONDS", cfg.jwt_leeway_seconds);
     cfg.jwt_user_cache_seconds =
@@ -310,11 +310,12 @@ std::vector<std::string> validate_config(const Config& cfg) {
     if (cfg.jwt_clock_sync && cfg.jwt_clock_sync_max_seconds < cfg.jwt_clock_sync_threshold_seconds)
         errors.push_back(
             "CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS must be >= CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS");
-    // Fatal rather than a warning: both switches are ways of saying "refuse callers that do not
-    // present a token", and with no secret configured there is nothing to verify one against, so the
-    // service would silently keep accepting the credential the operator just tried to retire.
-    if (cfg.jwt_required && !cfg.jwt_enabled())
-        errors.push_back("CPROXY_JWT_REQUIRED needs CPROXY_JWT_SECRET to be set");
+    // Fatal rather than a warning: an operator who asked for account checks on tokens but gave no
+    // secret to verify tokens with has a config that cannot mean what they intended.
+    //
+    // A missing secret on its own is NOT fatal: it shuts only the gated surface (every gated request
+    // 500s, like a missing day-key store) while the ungated GET surface keeps serving. main() logs it
+    // at ERROR. Refusing to start would turn a credential mistake into a whole-edge outage.
     if (cfg.jwt_require_user && !cfg.jwt_enabled())
         errors.push_back("CPROXY_JWT_REQUIRE_USER needs CPROXY_JWT_SECRET to be set");
     if (cfg.jwt_require_user && cfg.account_mirror_db_path.empty())

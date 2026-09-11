@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.12.0 LANGUAGES CXX)
+project(cproxy VERSION 0.13.1 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)

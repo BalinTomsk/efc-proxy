@@ -45,7 +45,8 @@ int main() {
         return 1;
     }
 
-    cproxy::Config cfg = cproxy::load_config(cproxy::make_env_lookup(dotenv));
+    const cproxy::EnvLookup env = cproxy::make_env_lookup(dotenv);
+    cproxy::Config cfg = cproxy::load_config(env);
 
     // Fail fast on nonsense config (port 0, negative timeout, prefix without '/') instead of
     // limping into listen() with values that can only misbehave.
@@ -107,12 +108,11 @@ int main() {
             ? std::format("{} fails / {}ms", cfg.breaker_threshold, cfg.breaker_cooldown_ms)
             : std::string("disabled"),
         cfg.upstream_retry,
-        cfg.daykey_db_path.empty() ? "(unconfigured, PATCH always 500s)" : cfg.daykey_db_path,
-        // The secret itself is never logged, only which of the three states the gate is in — the one
-        // thing an operator needs from this line after a rollout step.
-        !cfg.jwt_enabled() ? std::string("off (X-Day-Guid only)")
-                           : std::format("on ({}, user claim {})",
-                                         cfg.jwt_required ? "required" : "X-Day-Guid still accepted",
+        cfg.daykey_db_path.empty() ? "(unconfigured, gated requests always 500)" : cfg.daykey_db_path,
+        // The secret itself is never logged, only whether the gate can open and how strictly — the
+        // one thing an operator needs from this line after a change.
+        !cfg.jwt_enabled() ? std::string("off (CPROXY_JWT_SECRET unset, gated requests always 500)")
+                           : std::format("on (bearer only, user claim {})",
                                          cfg.jwt_require_user ? "enforced" : "ignored"),
         cfg.jwt_leeway_seconds,
         // The offset always starts at zero; this line reports the POLICY, so an operator reading a
@@ -121,6 +121,22 @@ int main() {
                                          cfg.jwt_clock_sync_max_seconds)
                            : std::string("off (host clock only)"),
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
+
+    // Without a secret no token can be verified, and since 0.13.0 there is no other credential, so
+    // the whole gated surface (every write, the news home-page reads) is shut. Not fatal -- the
+    // ungated reads keep serving -- but loud, because otherwise it only shows as a wall of 500s.
+    if (!cfg.jwt_enabled()) {
+        cproxy::log_raw(
+            "{\"service\":\"cproxy\",\"level\":\"ERROR\",\"msg\":\"CPROXY_JWT_SECRET is unset: "
+            "every gated request (POST, PATCH, CPROXY_DAYKEY_PATHS) will answer 500\"}");
+    }
+    // The switch that used to decide whether the bare X-Day-Guid header was still honoured is gone.
+    // Say so if a leftover compose file still sets it, so nobody mistakes "false" for a rollback.
+    if (env("CPROXY_JWT_REQUIRED").has_value()) {
+        cproxy::log_raw(
+            "{\"service\":\"cproxy\",\"level\":\"WARN\",\"msg\":\"CPROXY_JWT_REQUIRED is set but "
+            "ignored: X-Day-Guid was removed in 0.13.0 and a bearer JWT is the only credential\"}");
+    }
 
     if (!server.listen(cfg.listen_addr, cfg.listen_port)) {
         rabbit_events.stop();
