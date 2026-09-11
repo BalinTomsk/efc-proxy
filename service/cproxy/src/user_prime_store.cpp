@@ -68,6 +68,12 @@ std::size_t UserPrimeStore::size() const {
     return products_.size();
 }
 
+std::size_t UserPrimeStore::admin_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return static_cast<std::size_t>(std::count_if(
+        products_.begin(), products_.end(), [](const auto& entry) { return entry.second; }));
+}
+
 std::string UserPrimeStore::last_error() const {
     std::lock_guard<std::mutex> lock(mu_);
     return last_error_;
@@ -81,6 +87,15 @@ bool UserPrimeStore::is_valid(const std::string& product,
     refresh_if_stale(now);
     std::lock_guard<std::mutex> lock(mu_);
     return products_.count(product) > 0;
+}
+
+bool UserPrimeStore::is_admin(const std::string& product,
+                              std::chrono::system_clock::time_point now) {
+    if (!all_digits(product)) return false;
+    refresh_if_stale(now);
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = products_.find(product);
+    return it != products_.end() && it->second;
 }
 
 void UserPrimeStore::refresh_if_stale(std::chrono::system_clock::time_point now) {
@@ -102,7 +117,7 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
     const int tomorrow = day_of_year(now + one_day);
     const std::string today_date = utc_date(now);
 
-    std::unordered_set<std::string> products;
+    std::unordered_map<std::string, bool> products;
     std::string error;
 
     SqliteDb handle;
@@ -117,8 +132,11 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
         // prime_expired is a calendar date stored verbatim as "yyyy-MM-dd", so a lexicographic
         // comparison IS a chronological one; NULL means the column predates the mirror event that
         // carries it and must not exclude the account.
+        // `s.access` rides along so the admin bit comes from the same row, under the same
+        // suspended/deleted/expired filters, as the validity answer — an account that stops being
+        // live stops being an admin in the same snapshot. Still no `s.id`: see the class comment.
         static const char* const sql =
-            "SELECT s.prime, p.prime "
+            "SELECT s.prime, p.prime, s.access "
             "FROM user_prime_sync p "
             "JOIN users_sync s ON s.id = p.user_id "
             "WHERE p.day_year IN (?, ?, ?) "
@@ -136,8 +154,16 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
 
             int rc;
             while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-                products.insert(product_decimal(sqlite3_column_int64(stmt, 0),
-                                                sqlite3_column_int64(stmt, 1)));
+                const bool admin = sqlite3_column_int(stmt, 2) == kSuperAdminAccess;
+                auto [it, inserted] = products.emplace(
+                    product_decimal(sqlite3_column_int64(stmt, 0), sqlite3_column_int64(stmt, 1)),
+                    admin);
+                // Two rows yielding the same product would need two accounts whose primes swap
+                // roles (A's account prime is B's day prime and vice versa) — impossible while the
+                // day sequence stays below the account sequence's 1000003 floor, but not forever.
+                // If it ever happens, the product is an admin only if EVERY row behind it is: a
+                // collision must never lend one account another's privilege.
+                if (!inserted) it->second = it->second && admin;
             }
             sqlite3_finalize(stmt);
             if (rc != SQLITE_DONE) {

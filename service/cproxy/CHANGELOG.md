@@ -9,6 +9,44 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-11: **0.12.0 — admin is looked up in the account mirror; the `adm` token claim is gone.**
+  0.11.0 decided "may this request correct the clock?" from an `"adm": true` claim the frontend minted.
+  The user decoded a live token, saw it, and rejected the design as insecure — rightly: a role claim
+  puts the authority in whoever holds the signing secret, and advertises the holder's privilege to
+  anyone who base64-decodes a token. Privilege is now decided HERE.
+
+  - **`UserPrimeStore::is_admin(product, now)`** — true when the account behind the token's `user`
+    product has `users_sync.access == 255` (superAdmin, per `dbo.Users.access` in envfish-db). Read in
+    the same query, from the same row, under the same live/suspended/deleted/expired filters as
+    validity, so an account that stops being live stops being an admin in the same snapshot. The query
+    still never selects the account id. Exact match, not `>=`: a stray larger value is a data error,
+    and data errors must not grant privilege. If two rows ever yield one product (possible only once
+    the day-prime sequence climbs past the account sequence's 1000003 floor), it is an admin only if
+    every row behind it is.
+  - **No new column or RabbitMQ event was needed.** `access` already rode the users-sync stream end to
+    end (trigger → outbox → dispatcher → queue → `users_sync.access`). Checked against prod
+    before building: both portal admins hold 255 in `dbo.Users`, nobody else does, and the mirror
+    already had both at 255 with 365 day-primes each.
+  - **`JwtClaims` has no admin field**; the verifier never reads `adm`. A token that still carries it
+    (the frontend before its DLL redeploy) verifies exactly as one without it — accepted, claim
+    ignored — so this ships first with no coordination.
+  - **The store is now also built for clock sync alone** (`CPROXY_JWT_CLOCK_SYNC` with
+    `CPROXY_JWT_REQUIRE_USER` off). Its startup line gains `"admins"` (a product count over the
+    3-day window, like `"accounts"`); an empty store is ERROR only when REQUIRE_USER would refuse
+    traffic on it, WARN otherwise.
+
+  **Verified the test catches the old behaviour:** the new `proxy_test` case "an ordinary account's
+  token carrying `adm: true` is still refused" was run against the unmodified 0.11.0 source and FAILED
+  there — 0.11.0 logged `clock aligned from admin token delta=2400` and served the request — then
+  passed on 0.12.0. Tests 10/10: `user_prime_store_test` gains four admin cases (255 vs 254/256/1,
+  suspended/deleted/expired admins, missing mirror); `proxy_test`'s clock-sync fixture now builds a
+  real mirror with one admin and one plain account and adds an anonymous-token case.
+
+  Two definitions of admin now coexist and must be kept in step: the portal's `AdminUserIds` GUID list,
+  and `Users.access = 255` here. An account on the list without 255 is a portal admin but not a
+  gateway admin — the fail-safe direction. envfish-db's `script01_createTable.sql` now says so on the
+  column.
+
 - 2026-09-10: **0.11.0 — clock tolerance tightened to 60s, plus admin-driven self-alignment.**
   Two halves of one change, at the user's request.
 

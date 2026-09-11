@@ -255,35 +255,26 @@ void base64url_decoding_accepts_the_unpadded_form_and_rejects_junk() {
 }
 
 
-// --- `adm` and the authentic-but-out-of-time-range signals (clock alignment, 0.11.0) -------------
+// --- Authentic-but-out-of-time-range signals (clock alignment, 0.11.0) -------------------------
+// and the `adm` claim, which 0.12.0 stopped reading (privilege now comes from the account mirror).
 
-void the_adm_claim_is_read_only_as_a_real_json_boolean() {
-    // The claim is permission to move this process's clock, so anything that is not literally `true`
-    // must read as "not an admin" -- absent, false, the STRING "true", and the number 1 alike. A
-    // minter that sends one of those is a version this build does not understand, and the safe
-    // reading of that is the lesser privilege.
-    struct Case {
-        const char* adm_json;
-        bool expected;
+void a_token_carrying_any_adm_claim_still_verifies_and_the_claim_is_ignored() {
+    // A frontend minted `adm` between 0.11.0 and 0.12.0, and prod keeps doing so until its DLL is
+    // redeployed -- so a token carrying it, in any shape, must still verify exactly as one without it.
+    // JwtClaims has no admin field at all, so there is nothing here that could read it: the only
+    // thing left to pin is that its presence is harmless, not fatal.
+    static const char* const adm_variants[] = {
+        "", ",\"adm\":true", ",\"adm\":false", ",\"adm\":\"true\"", ",\"adm\":1", ",\"adm\":null",
     };
-    static const Case cases[] = {
-        {"", false},          // claim absent entirely
-        {",\"adm\":true", true},
-        {",\"adm\":false", false},
-        {",\"adm\":\"true\"", false},
-        {",\"adm\":1", false},
-        {",\"adm\":null", false},
-    };
-
-    for (const Case& c : cases) {
+    for (const char* adm : adm_variants) {
         const std::string payload =
             "{\"iss\":\"envfish\",\"iat\":1788880000,\"exp\":1788900000,"
             "\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"20C23A17-DEAD-BEEF\""
-            + std::string(c.adm_json) + "}";
+            + std::string(adm) + "}";
         const JwtResult result = verify_hs512(mint(kHs512Header, payload), default_options(),
                                               at_epoch(1788890000));
         CHECK(result.ok);
-        CHECK(result.claims.admin == c.expected);
+        CHECK(result.claims.server == "20C23A17-DEAD-BEEF");
     }
 }
 
@@ -304,13 +295,12 @@ void an_expired_token_still_reports_its_claims_so_the_skew_can_be_measured() {
     CHECK(result.error == "token expired");
     CHECK(result.signature_ok);
     CHECK(result.time_rejected);
-    CHECK(result.claims.admin);      // readable despite ok == false
-    CHECK(result.claims.expires_at == 1788900000);
+    CHECK(result.claims.expires_at == 1788900000);  // readable despite ok == false
 }
 
 void a_forged_token_reports_neither_signature_ok_nor_time_rejected() {
     // The other half of the contract: nothing about a token that failed its MAC may be believed, so
-    // a forgery can never reach the clock-alignment path however admin it claims to be.
+    // a forgery can never reach the clock-alignment path whatever it claims.
     const std::string token =
         mint(kHs512Header,
              "{\"iss\":\"envfish\",\"iat\":1788880000,\"exp\":1788900000,"
@@ -321,7 +311,6 @@ void a_forged_token_reports_neither_signature_ok_nor_time_rejected() {
     CHECK(!result.ok);
     CHECK(!result.signature_ok);
     CHECK(!result.time_rejected);
-    CHECK(!result.claims.admin);
 }
 
 void a_wrong_audience_is_not_a_time_rejection_even_when_also_expired() {
@@ -353,33 +342,21 @@ void a_token_missing_exp_is_authentic_but_never_a_time_rejection() {
 }
 
 
-void an_admin_token_minted_by_the_real_frontend_carries_adm() {
-    // GOLDEN CROSS-LANGUAGE FIXTURE, admin variant — the same discipline as
-    // a_token_minted_by_the_real_frontend_verifies above, extended to the `adm` claim, because that
-    // claim is the one thing in the token that can move this process's clock. Produced by the
-    // shipped C# minter (FishTracker.FishApiJwt.Build, by reflection on the built FishTracker.dll,
-    // 2026-09-10) with admin=true and the same test secret.
+void a_token_from_the_0_11_frontend_with_adm_still_verifies() {
+    // GOLDEN CROSS-LANGUAGE FIXTURES from the shipped C# minter (FishTracker.FishApiJwt.Build, by
+    // reflection on the built FishTracker.dll, 2026-09-10) with the same test secret: one minted for
+    // an admin, carrying `"adm":true`, and one for an ordinary account a moment earlier.
     //
-    // What it pins is that .NET writes `adm` as a real JSON boolean. cproxy reads it strictly —
-    // "true" the string and 1 the number both read as NOT an admin — so a Newtonsoft change that
-    // started serialising it as anything else would silently drop admins to ordinary callers and
-    // clock alignment would quietly stop working. That failure has no other symptom.
+    // 0.12.0 ignores `adm`, so the two must now verify IDENTICALLY -- both ok, same claims. This is
+    // the compatibility guarantee for the rollout window: production's frontend keeps minting `adm`
+    // until its DLL is redeployed, and those tokens must keep working through a gateway that no
+    // longer believes them.
     const std::string admin_minted_by_dotnet =
         "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9."
         "eyJpc3MiOiJlbnZmaXNoIiwiaWF0IjoxNzg5MDEzOTM1LCJleHAiOjE3ODkwODQ3OTksImF1ZCI6ImZpc2hmaW5kLmlu"
         "Zm8iLCJzdWIiOiJjcHJveHkiLCJzZXJ2ZXIiOiIyMEMyM0ExNy1ERUFELUJFRUYiLCJ1c2VyIjoiMjM5MjQ3MzkyNDcy"
         "Mzk4NCIsImFkbSI6dHJ1ZX0."
         "1JI8B6Qo892XrfjWhSRTMMQcenpoqwkKWHuyvuOcChkATH7VP75IUNE3eXLds414At3vYxfUVQmxmGj1zt3wCA";
-
-    const JwtResult result =
-        verify_hs512(admin_minted_by_dotnet, default_options(), at_epoch(1789020000));
-    CHECK(result.ok);
-    CHECK(result.claims.admin);
-    CHECK(result.claims.server == "20C23A17-DEAD-BEEF");
-    CHECK(result.claims.expires_at == 1789084799);
-
-    // And the non-admin token the same build produced a moment earlier omits the claim entirely —
-    // so "admin" is a property of the account, not of the minter's version.
     const std::string plain_minted_by_dotnet =
         "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9."
         "eyJpc3MiOiJlbnZmaXNoIiwiaWF0IjoxNzg5MDEzOTM1LCJleHAiOjE3ODkwODQ3OTksImF1ZCI6ImZpc2hmaW5kLmlu"
@@ -387,10 +364,13 @@ void an_admin_token_minted_by_the_real_frontend_carries_adm() {
         "Mzk4NCJ9."
         "jsSHuFQrbGvSod5Yl2ZQSfd_G4T2KMgp94NPbMzu-ed51UaD24VFTbrqVdBr0kNg3Fb-oIpnhtNYBH4zWi_LnA";
 
-    const JwtResult plain =
-        verify_hs512(plain_minted_by_dotnet, default_options(), at_epoch(1789020000));
+    const JwtResult admin = verify_hs512(admin_minted_by_dotnet, default_options(), at_epoch(1789020000));
+    const JwtResult plain = verify_hs512(plain_minted_by_dotnet, default_options(), at_epoch(1789020000));
+    CHECK(admin.ok);
     CHECK(plain.ok);
-    CHECK(!plain.claims.admin);
+    CHECK(admin.claims.user == plain.claims.user);
+    CHECK(admin.claims.server == plain.claims.server);
+    CHECK(admin.claims.expires_at == plain.claims.expires_at);
 }
 
 }  // namespace
@@ -412,8 +392,8 @@ int main() {
     verification_is_off_entirely_without_a_secret();
     bearer_extraction_handles_the_shapes_a_client_actually_sends();
     base64url_decoding_accepts_the_unpadded_form_and_rejects_junk();
-    the_adm_claim_is_read_only_as_a_real_json_boolean();
-    an_admin_token_minted_by_the_real_frontend_carries_adm();
+    a_token_carrying_any_adm_claim_still_verifies_and_the_claim_is_ignored();
+    a_token_from_the_0_11_frontend_with_adm_still_verifies();
     an_expired_token_still_reports_its_claims_so_the_skew_can_be_measured();
     a_forged_token_reports_neither_signature_ok_nor_time_rejected();
     a_wrong_audience_is_not_a_time_rejection_even_when_also_expired();

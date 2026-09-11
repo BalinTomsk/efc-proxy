@@ -234,11 +234,7 @@ JwtResult verify_hs512(const std::string& token, const JwtVerifyOptions& opts,
     result.claims.user = claim_as_string(payload, "user");
     result.claims.issued_at = iat;
     result.claims.expires_at = exp;
-    // Strictly a JSON boolean. A string "true" or a 1 does not count -- the minter writes a real
-    // boolean, so anything else is a token this build does not understand, and the safe reading of
-    // "I don't understand this admin flag" is "not an admin".
-    result.claims.admin = payload.contains("adm") && payload["adm"].is_boolean() &&
-                          payload["adm"].get<bool>();
+    // An `adm` claim, if present, is not read: see the note on JwtClaims.
     result.signature_ok = true;
 
     if (!has_exp) {

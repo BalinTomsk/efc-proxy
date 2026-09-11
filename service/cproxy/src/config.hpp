@@ -109,12 +109,14 @@ struct Config {
 
     // --- Clock alignment from an admin token (see ClockOffset) ---
     // Lets cproxy correct its own notion of "now" (for credential validation ONLY, never the system
-    // clock) from a request carrying both an `adm` token and an X-Client-Time header.
+    // clock) from a request carrying both an admin ACCOUNT's token and an X-Client-Time header.
+    // "Admin" is looked up in the account mirror (users_sync.access == 255) by the token's `user`
+    // product -- never read from the token (0.12.0; see UserPrimeStore::is_admin).
     //
-    // Default true is safe by construction rather than by trust: it is inert unless a token actually
-    // carries `adm`, which only the portal's minter sets and only for a configured admin account —
-    // so a deployment whose frontend predates that claim behaves exactly as before. Set false to
-    // pin cproxy to its host clock permanently.
+    // Default true is safe by construction rather than by trust: it is inert unless the mirror holds
+    // a live superAdmin whose token arrives with the header. Setting it true also makes cproxy open
+    // the mirror even when CPROXY_JWT_REQUIRE_USER is off. Set false to pin cproxy to its host clock
+    // permanently.
     bool jwt_clock_sync = true;
     // Don't correct below this. Sub-threshold gaps are network latency and the one-second
     // granularity of an epoch header, not drift, and chasing them would rewrite the offset on every

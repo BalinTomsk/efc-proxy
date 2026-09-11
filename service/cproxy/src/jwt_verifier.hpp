@@ -25,12 +25,12 @@ struct JwtClaims {
     std::string user;      // decimal product, empty when the caller is not a registered user
     long long issued_at = 0;
     long long expires_at = 0;
-    // `adm` — true only in a token the portal minted for one of its configured admin accounts
-    // (Profile -> Gateway token). It grants nothing extra on the proxy surface; its ONE use is
-    // permission to correct this process's clock offset (see ClockOffset and check_gate_credential).
-    // Trustworthy for the same reason `server` is: it is inside the HMAC, so forging it needs the
-    // signing secret.
-    bool admin = false;
+    // There is deliberately NO admin field. 0.11.0 read an `"adm": true` claim here; 0.12.0 removed
+    // it. Privilege is looked up from the account mirror by the `user` product
+    // (UserPrimeStore::is_admin), never taken from the token: a claim puts the authority in whoever
+    // holds the signing secret, and advertises the holder's role to anyone who base64-decodes it. A
+    // token that still carries `adm` (a frontend not yet redeployed) is accepted, and the claim is
+    // ignored. Do not add it back.
 };
 
 /**

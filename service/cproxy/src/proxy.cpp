@@ -111,18 +111,26 @@ struct ProxyState {
                     ex.what()));
             }
         }
-        if (cfg.jwt_require_user && !cfg.account_mirror_db_path.empty()) {
+        // Two consumers: the `user` claim check (CPROXY_JWT_REQUIRE_USER) and, since 0.12.0, the
+        // admin lookup that gates clock alignment (CPROXY_JWT_CLOCK_SYNC). Either one needs the store;
+        // with neither, it is never built and the mirror is never opened.
+        const bool store_needed =
+            cfg.jwt_enabled() && (cfg.jwt_require_user || cfg.jwt_clock_sync);
+        if (store_needed && !cfg.account_mirror_db_path.empty()) {
             user_prime_store.emplace(cfg.account_mirror_db_path, cfg.jwt_user_cache_seconds);
             // Force the first snapshot here so a mirror that is missing, empty, or still dormant is
             // visible in the startup log rather than only as an unexplained wall of 500s. An empty
             // set is the fail-closed state, not an error the constructor can throw on.
             user_prime_store->refresh(std::chrono::system_clock::now());
             const std::string load_error = user_prime_store->last_error();
+            // ERROR only where an empty store refuses traffic (REQUIRE_USER). For clock sync alone,
+            // an empty store just means nobody may align the clock -- worth seeing, not an outage.
+            const bool degraded = !load_error.empty() || user_prime_store->size() == 0;
             log_raw(std::format(
                 "{{\"service\":\"cproxy\",\"level\":\"{}\",\"msg\":\"user-prime store loaded\","
-                "\"accounts\":{},\"error\":\"{}\"}}",
-                (load_error.empty() && user_prime_store->size() > 0) ? "INFO" : "ERROR",
-                user_prime_store->size(), load_error));
+                "\"accounts\":{},\"admins\":{},\"error\":\"{}\"}}",
+                degraded ? (cfg.jwt_require_user ? "ERROR" : "WARN") : "INFO",
+                user_prime_store->size(), user_prime_store->admin_count(), load_error));
         }
         if (!cfg.cloudrange_db_path.empty()) {
             try {
@@ -300,7 +308,10 @@ bool client_time_header(const httplib::Request& req, long long& out) {
  * Returns true when the offset actually moved (so the caller knows to re-evaluate the token).
  *
  * Three conditions, all required, and the first two are the whole security argument:
- *   - the token's MAC verified and it carries `"adm": true` — forging that needs the signing secret;
+ *   - the token's MAC verified AND its `user` product belongs, in THIS service's account mirror, to
+ *     a live account with `access == 255` (superAdmin). The privilege is looked up here, never read
+ *     from the token — an `adm` claim is ignored (0.12.0; see JwtClaims). So a signing-secret leak
+ *     alone is not enough: the forger would also need a real admin's primes for today;
  *   - the request carries `X-Client-Time`, because the token's own `iat` is cached until UTC
  *     midnight and is therefore stale by design (see ClockOffset);
  *   - the gap exceeds the configured threshold.
@@ -311,13 +322,19 @@ bool client_time_header(const httplib::Request& req, long long& out) {
 bool align_clock_from_request(const Config& cfg, ProxyState& state, const httplib::Request& req,
                               const JwtResult& verified,
                               std::chrono::system_clock::time_point now) {
-    if (!cfg.jwt_clock_sync || !verified.signature_ok || !verified.claims.admin) return false;
+    if (!cfg.jwt_clock_sync || !verified.signature_ok) return false;
     // Only a token that is right about everything EXCEPT possibly the time. A malformed one (no
     // `exp`) is authentic but not understood, and is not evidence of anything about the clock.
     if (!verified.ok && !verified.time_rejected) return false;
-
+    // The header check is cheap and rules out almost every request, so it runs before the store.
     long long client_epoch = 0;
     if (!client_time_header(req, client_epoch)) return false;
+    // Looked up at `now` -- the clock being corrected. That is safe: the product is matched over a
+    // yesterday/today/tomorrow window, and the offset is capped far below a day.
+    if (verified.claims.user.empty() || !state.user_prime_store.has_value() ||
+        !state.user_prime_store->is_admin(verified.claims.user, now)) {
+        return false;
+    }
 
     const long long now_epoch =
         std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();

@@ -406,13 +406,53 @@ std::string mint_token(const std::string& day_guid, const std::string& user = ""
     return signing_input + "." + b64url(std::string(reinterpret_cast<char*>(digest), length));
 }
 
+// Account products in the clock-sync fixtures' mirror. Fixed primes, and the same day prime on every
+// day_year, so the product is the same whatever date the test runs on.
+const std::string kAdminProduct = "104729314187";  // 1000003 * 104729, access = 255
+const std::string kPlainProduct = "104726455859";  // 1000033 * 104723, access = 0
+
+/**
+ * An account mirror with one superAdmin and one ordinary account, in the users_sync /
+ * user_prime_sync shape AccountMirrorStore creates. Every day_year is filled so the fixture does not
+ * depend on the date the suite runs.
+ */
+void write_admin_mirror(const std::string& path) {
+    std::remove(path.c_str());
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
+    auto exec = [db](const std::string& sql) {
+        CHECK(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    exec("CREATE TABLE users_sync (id TEXT PRIMARY KEY, users_id INTEGER NOT NULL DEFAULT 0,"
+         " user_name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '',"
+         " last_visit TEXT NOT NULL DEFAULT '', access INTEGER NOT NULL DEFAULT 0,"
+         " suspended INTEGER NOT NULL DEFAULT 0, auth_type TEXT NOT NULL DEFAULT '',"
+         " deleted INTEGER NOT NULL DEFAULT 0, deleted_utc TEXT NULL,"
+         " prime INTEGER NOT NULL DEFAULT 0, prime_expired TEXT NULL, updated_utc TEXT NOT NULL)");
+    exec("CREATE TABLE user_prime_sync (user_id TEXT NOT NULL, day_year INTEGER NOT NULL,"
+         " prime INTEGER NOT NULL DEFAULT 0, updated_utc TEXT NOT NULL,"
+         " PRIMARY KEY (user_id, day_year))");
+    exec("INSERT INTO users_sync (id, prime, access, updated_utc) VALUES"
+         " ('admin', 1000003, 255, 'x'), ('plain', 1000033, 0, 'x')");
+    exec("BEGIN");
+    for (int day = 1; day <= 365; ++day) {
+        exec("INSERT INTO user_prime_sync VALUES ('admin', " + std::to_string(day) + ", 104729, 'x')");
+        exec("INSERT INTO user_prime_sync VALUES ('plain', " + std::to_string(day) + ", 104723, 'x')");
+    }
+    exec("COMMIT");
+    sqlite3_close(db);
+}
+
 /**
  * A token as it would look if cproxy's own clock were `host_behind_seconds` BEHIND the minter's.
  * Shifting the token forward is exactly equivalent to shifting this process back, and it is the only
  * one of the two a test can do -- so this is how "the two hosts disagree" is expressed here.
+ *
+ * `adm_claim` adds the 0.11.0-era `"adm": true`, which 0.12.0 must IGNORE -- it exists here only so
+ * the tests can prove that a claim no longer grants anything.
  */
 std::string mint_skewed_token(const std::string& day_guid, long long host_behind_seconds,
-                              bool admin) {
+                              const std::string& user, bool adm_claim = false) {
     const auto now = std::chrono::system_clock::now();
     const long long real_now =
         std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
@@ -427,7 +467,8 @@ std::string mint_skewed_token(const std::string& day_guid, long long host_behind
                           ",\"exp\":" + std::to_string(exp) +
                           ",\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"" + day_guid +
                           "\"";
-    if (admin) payload += ",\"adm\":true";
+    if (!user.empty()) payload += ",\"user\":\"" + user + "\"";
+    if (adm_claim) payload += ",\"adm\":true";
     payload += "}";
 
     const std::string signing_input =
@@ -449,23 +490,30 @@ std::string client_time_for(long long host_behind_seconds) {
 }
 
 /**
- * A gated proxy config with a uniform day-key store and a 60s leeway. Each case builds its OWN
- * server from this because the clock offset lives in that server's ProxyState -- sharing one would
- * let an earlier case's correction decide a later case's result.
+ * A gated proxy with a uniform day-key store, the admin mirror above, and a 60s leeway. Each case
+ * builds its OWN server because the clock offset lives in that server's ProxyState -- sharing one
+ * would let an earlier case's correction decide a later case's result.
+ *
+ * CPROXY_JWT_REQUIRE_USER is left OFF on purpose: the mirror must be opened for clock sync alone,
+ * which is the 0.12.0 construction change this also covers.
  */
 struct ClockSyncFixture {
     TestServer upstream;
     TestServer proxy;
     std::string db;
+    std::string mirror;
     Config cfg;
 
-    ClockSyncFixture(const std::string& db_name, bool sync_enabled) : db(db_name) {
+    ClockSyncFixture(const std::string& name, bool sync_enabled)
+        : db(name + ".daykeys.sqlite"), mirror(name + ".mirror.sqlite") {
         install_fake_upstream(upstream.server);
         upstream.start();
         write_uniform_day_key_db(db, "TEST-DAY-KEY");
+        write_admin_mirror(mirror);
 
         cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(upstream.port);
         cfg.daykey_db_path = db;
+        cfg.account_mirror_db_path = mirror;
         cfg.jwt_secret = kTestJwtSecret;
         cfg.jwt_required = true;
         cfg.jwt_leeway_seconds = 60;
@@ -476,79 +524,98 @@ struct ClockSyncFixture {
         install_routes(proxy.server, cfg);
         proxy.start();
     }
-    ~ClockSyncFixture() { std::remove(db.c_str()); }
+    ~ClockSyncFixture() {
+        std::remove(db.c_str());
+        std::remove(mirror.c_str());
+    }
 };
 
-// The recovery arm, and the reason JwtResult separates "authentic" from "in time range": with the
-// host clock 40 minutes out, a leeway of 60s rejects the very token that could report the gap. An
-// admin token plus a fresh X-Client-Time corrects the offset and the retry succeeds.
-void an_admin_token_with_a_client_time_realigns_the_clock() {
-    ClockSyncFixture fx("proxy_test_clocksync_ok.sqlite", true);
+// The recovery arm: with the host clock 40 minutes out, a leeway of 60s rejects the very token that
+// could report the gap. An admin ACCOUNT's token plus a fresh X-Client-Time corrects the offset and
+// the retry succeeds.
+void an_admin_accounts_token_with_a_client_time_realigns_the_clock() {
+    ClockSyncFixture fx("proxy_test_clocksync_ok", true);
     const long long behind = 2400;
     httplib::Client cli("127.0.0.1", fx.proxy.port);
 
-    // Same skew, no admin claim: stays refused. Establishes that it is the `adm` claim doing the
-    // work here and not merely the presence of the header.
+    // An ordinary account with the header: refused. Establishes that it is the account's privilege
+    // doing the work, not the header.
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, false)},
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, kPlainProduct)},
                    {"X-Client-Time", client_time_for(behind)}})
               ->status == 500);
 
-    // Admin token + the reading -> aligned, retried, served.
+    // THE 0.12.0 PROPERTY: the same ordinary account, now with "adm": true in its token, is STILL
+    // refused. The claim is signed, but it is not the source of privilege any more -- the mirror is.
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, true)},
+                  {{"Authorization",
+                    "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, kPlainProduct, true)},
+                   {"X-Client-Time", client_time_for(behind)}})
+              ->status == 500);
+
+    // The admin account -- no `adm` claim at all -- aligns, retries, and is served.
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, kAdminProduct)},
                    {"X-Client-Time", client_time_for(behind)}})
               ->status == 200);
 
-    // And the correction PERSISTS: an ordinary non-admin caller, still skewed, now clears the gate
-    // with no header of its own. That is the whole point -- one admin request repairs the gateway
-    // for every caller, which is also why the very first assertion above had to run first.
+    // And the correction PERSISTS: the ordinary account, still skewed and with no header, now clears
+    // the gate. One admin request repairs the gateway for every caller.
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, false)}})
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", behind, kPlainProduct)}})
               ->status == 200);
+}
+
+// An anonymous token -- no `user` claim, so nothing to look up -- can never align, whatever else it
+// carries. The home-page reads are served anonymously, so this is the common case, not an edge one.
+void an_anonymous_token_never_moves_the_clock_even_claiming_adm() {
+    ClockSyncFixture fx("proxy_test_clocksync_anon", true);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    CHECK(cli.Get("/api/v1/news/default",
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, "", true)},
+                   {"X-Client-Time", client_time_for(2400)}})
+              ->status == 500);
 }
 
 // The header is not optional. `iat` cannot stand in for it: FishApiJwt caches a minted token until
 // UTC midnight, so aligning to `iat` would drag the process backwards by however long ago the admin
 // downloaded jwt.txt.
 void an_admin_token_without_a_client_time_never_moves_the_clock() {
-    ClockSyncFixture fx("proxy_test_clocksync_noheader.sqlite", true);
+    ClockSyncFixture fx("proxy_test_clocksync_noheader", true);
     httplib::Client cli("127.0.0.1", fx.proxy.port);
 
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)}})
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, kAdminProduct)}})
               ->status == 500);
 }
 
 // The security bound, end to end. A replayed admin token from a day ago would need to move the
-// clock ~24h to make its stale day-key current again; the ceiling refuses anything past an hour, so
-// the request stays refused.
+// clock ~24h to make its stale day-key current again; the ceiling refuses anything past an hour.
 void a_skew_beyond_the_ceiling_is_refused_rather_than_partly_applied() {
-    ClockSyncFixture fx("proxy_test_clocksync_cap.sqlite", true);
+    ClockSyncFixture fx("proxy_test_clocksync_cap", true);
     httplib::Client cli("127.0.0.1", fx.proxy.port);
 
     const long long far = 2 * 86400;
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", far, true)},
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", far, kAdminProduct)},
                    {"X-Client-Time", client_time_for(far)}})
               ->status == 500);
 
-    // The refusal must not have poisoned the offset: a token at a skew INSIDE the ceiling still
-    // works afterwards.
+    // The refusal must not have poisoned the offset: a skew INSIDE the ceiling still works after.
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 600, true)},
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 600, kAdminProduct)},
                    {"X-Client-Time", client_time_for(600)}})
               ->status == 200);
 }
 
-// The kill-switch: CPROXY_JWT_CLOCK_SYNC=false pins cproxy to its host clock, and a token it
-// disagrees with is refused exactly as it was before 0.11.0.
+// The kill-switch: CPROXY_JWT_CLOCK_SYNC=false pins cproxy to its host clock.
 void the_clock_sync_switch_turns_the_whole_thing_off() {
-    ClockSyncFixture fx("proxy_test_clocksync_off.sqlite", false);
+    ClockSyncFixture fx("proxy_test_clocksync_off", false);
     httplib::Client cli("127.0.0.1", fx.proxy.port);
 
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)},
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, kAdminProduct)},
                    {"X-Client-Time", client_time_for(2400)}})
               ->status == 500);
 }
@@ -556,20 +623,20 @@ void the_clock_sync_switch_turns_the_whole_thing_off() {
 // A malformed reading must never be treated as a reading of zero -- that would look like a 56-year
 // skew and, clamped, would peg the offset at the ceiling on every such request.
 void a_junk_client_time_header_is_ignored_not_read_as_zero() {
-    ClockSyncFixture fx("proxy_test_clocksync_junk.sqlite", true);
+    ClockSyncFixture fx("proxy_test_clocksync_junk", true);
     httplib::Client cli("127.0.0.1", fx.proxy.port);
 
     static const char* const junk[] = {"", "not-a-number", "17e9", "-1", "0", "1788900000x"};
     for (const char* value : junk) {
         CHECK(cli.Get("/api/v1/news/default",
-                      {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)},
+                      {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, kAdminProduct)},
                        {"X-Client-Time", value}})
                   ->status == 500);
     }
 
     // Offset untouched by all that, so a genuine reading still works.
     CHECK(cli.Get("/api/v1/news/default",
-                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, true)},
+                  {{"Authorization", "Bearer " + mint_skewed_token("TEST-DAY-KEY", 2400, kAdminProduct)},
                    {"X-Client-Time", client_time_for(2400)}})
               ->status == 200);
 }
@@ -902,7 +969,8 @@ int main() {
     request_bodies_are_forwarded();
     content_type_is_forwarded();
     post_and_patch_require_day_key();
-    an_admin_token_with_a_client_time_realigns_the_clock();
+    an_admin_accounts_token_with_a_client_time_realigns_the_clock();
+    an_anonymous_token_never_moves_the_clock_even_claiming_adm();
     an_admin_token_without_a_client_time_never_moves_the_clock();
     a_skew_beyond_the_ceiling_is_refused_rather_than_partly_applied();
     the_clock_sync_switch_turns_the_whole_thing_off();

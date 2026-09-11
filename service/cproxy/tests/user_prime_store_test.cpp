@@ -27,6 +27,7 @@ struct Account {
     int suspended = 0;
     int deleted = 0;
     const char* prime_expired = nullptr;  // nullptr => NULL
+    int access = 0;                       // dbo.Users.access; 255 = superAdmin
 };
 
 void exec(sqlite3* db, const std::string& sql) {
@@ -55,10 +56,11 @@ void write_mirror(const std::string& path, const std::vector<Account>& accounts)
          " prime INTEGER NOT NULL DEFAULT 0, updated_utc TEXT NOT NULL,"
          " PRIMARY KEY (user_id, day_year))");
     for (const Account& a : accounts) {
-        exec(db, "INSERT INTO users_sync (id, prime, suspended, deleted, prime_expired, updated_utc)"
-                 " VALUES ('" + a.id + "', " + std::to_string(a.user_prime) + ", " +
+        exec(db, "INSERT INTO users_sync (id, prime, suspended, deleted, prime_expired, access,"
+                 " updated_utc) VALUES ('" + a.id + "', " + std::to_string(a.user_prime) + ", " +
                      std::to_string(a.suspended) + ", " + std::to_string(a.deleted) + ", " +
-                     quoted_or_null(a.prime_expired) + ", '2026-09-08T00:00:00Z')");
+                     quoted_or_null(a.prime_expired) + ", " + std::to_string(a.access) +
+                     ", '2026-09-08T00:00:00Z')");
         exec(db, "INSERT INTO user_prime_sync (user_id, day_year, prime, updated_utc) VALUES ('" +
                      a.id + "', " + std::to_string(a.day_year) + ", " +
                      std::to_string(a.day_prime) + ", '2026-09-08T00:00:00Z')");
@@ -191,6 +193,70 @@ void a_revoked_account_disappears_once_the_snapshot_ttl_expires() {
     std::remove(path.c_str());
 }
 
+
+// --- Admin lookup (0.12.0) ----------------------------------------------------------------------
+// Privilege comes from the mirror's `access` column, keyed by the same product that proves the
+// account is live -- never from a claim in the token.
+
+void an_account_with_access_255_is_an_admin_and_others_are_not() {
+    const std::string path = "user_prime_store_test_admin.sqlite";
+    write_mirror(path, {{"admin", 1000003, 104729, kSep8, 0, 0, nullptr, 255},
+                        {"plain", 1000033, 104723, kSep8, 0, 0, nullptr, 0}});
+    UserPrimeStore store(path, 60);
+    const auto now = at(2026, 9, 8);
+
+    CHECK(store.is_valid("104729314187", now));   // 1000003 * 104729
+    CHECK(store.is_admin("104729314187", now));
+    CHECK(store.is_valid("104726455859", now));   // 1000033 * 104723
+    CHECK(!store.is_admin("104726455859", now));  // live, but not an admin
+    CHECK(!store.is_admin("999", now));           // unknown product
+    CHECK(!store.is_admin("", now));
+    CHECK(store.admin_count() == 1);
+    std::remove(path.c_str());
+}
+
+void only_exactly_255_is_superadmin() {
+    // Exact match, not >=: a stray larger value is a data error, and data errors must not grant
+    // privilege. 254 is the boundary on the other side.
+    const std::string path = "user_prime_store_test_admin_values.sqlite";
+    write_mirror(path, {{"a254", 1000003, 104729, kSep8, 0, 0, nullptr, 254},
+                        {"a256", 1000033, 104723, kSep8, 0, 0, nullptr, 256},
+                        {"a1", 1000037, 104717, kSep8, 0, 0, nullptr, 1}});
+    UserPrimeStore store(path, 60);
+    const auto now = at(2026, 9, 8);
+
+    CHECK(store.is_valid("104729314187", now));
+    CHECK(!store.is_admin("104729314187", now));
+    CHECK(!store.is_admin("104726455859", now));
+    CHECK(!store.is_admin(std::to_string(1000037LL * 104717LL), now));
+    CHECK(store.admin_count() == 0);
+    std::remove(path.c_str());
+}
+
+void a_suspended_or_deleted_admin_is_not_an_admin() {
+    // Same filters as validity, from the same row: an account that stops being live stops being an
+    // admin in the same snapshot, with no separate revocation path to forget.
+    const std::string path = "user_prime_store_test_admin_revoked.sqlite";
+    write_mirror(path, {{"susp", 1000003, 104729, kSep8, 1, 0, nullptr, 255},
+                        {"del", 1000033, 104723, kSep8, 0, 1, nullptr, 255},
+                        {"exp", 1000037, 104717, kSep8, 0, 0, "2026-09-01", 255}});
+    UserPrimeStore store(path, 60);
+    const auto now = at(2026, 9, 8);
+
+    CHECK(!store.is_admin("104729314187", now));
+    CHECK(!store.is_admin("104726455859", now));
+    CHECK(!store.is_admin(std::to_string(1000037LL * 104717LL), now));
+    CHECK(store.admin_count() == 0);
+    std::remove(path.c_str());
+}
+
+void a_missing_mirror_has_no_admins() {
+    // Fails closed for privilege exactly as it does for validity.
+    UserPrimeStore store("user_prime_store_test_does_not_exist.sqlite", 60);
+    CHECK(!store.is_admin("104729314187", at(2026, 9, 8)));
+    CHECK(store.admin_count() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -203,6 +269,10 @@ int main() {
     a_missing_mirror_matches_nothing_and_says_why();
     a_non_numeric_claim_is_refused_without_touching_the_snapshot();
     a_revoked_account_disappears_once_the_snapshot_ttl_expires();
+    an_account_with_access_255_is_an_admin_and_others_are_not();
+    only_exactly_255_is_superadmin();
+    a_suspended_or_deleted_admin_is_not_an_admin();
+    a_missing_mirror_has_no_admins();
     std::cout << "user_prime_store_test: all checks passed\n";
     return 0;
 }
