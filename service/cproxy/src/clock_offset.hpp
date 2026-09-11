@@ -28,8 +28,9 @@ namespace cproxy {
  *
  * ### What may move it
  * Only `check_gate_credential`, and only for a request that carries **both** a MAC-verified token
- * with `"adm": true` **and** an `X-Client-Time` header. The token authenticates the *caller*; the
- * header supplies the *reading*, because the token's own `iat` cannot: `FishApiJwt` caches a minted
+ * whose `user` product the account mirror maps to a live superAdmin (`access == 255`; the token
+ * itself carries no role -- see UserPrimeStore::is_admin) **and** an `X-Client-Time` header. The
+ * token authenticates the *caller*; the header supplies the *reading*, because the token's own `iat` cannot: `FishApiJwt` caches a minted
  * token until UTC midnight, so `iat` is routinely hours stale and aligning to it would drag this
  * process backwards by however long ago the admin downloaded `jwt.txt`.
  *

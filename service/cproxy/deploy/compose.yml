@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:374505127d87154e5578d88fe54b6a2b1bad3bed1fab59402581cf0315170075  # 0.11.0 pinned by digest
+    image: ghcr.io/balintomsk/cproxy@sha256:e9f6563b5e1911f152a22be4a3a63e65fb9d5a02cdce9b766d4498bf2f3fea23  # 0.12.0 pinned by digest
     container_name: cproxy
     restart: unless-stopped
     ports:
@@ -77,10 +77,13 @@ services:
       # regardless. This leeway is the binding constraint on the two clocks agreeing.
       CPROXY_JWT_LEEWAY_SECONDS: "60"
       #
-      # Self-repair for the above (0.11.0). A request carrying BOTH a token with `"adm": true` AND
-      # an X-Client-Time header may correct this process's clock offset when the two disagree by
-      # more than the threshold. Only the offset moves -- never the droplet's clock, which the
-      # container could not set anyway under cap_drop: ALL (see src/clock_offset.hpp).
+      # Self-repair for the above (0.11.0; admin lookup 0.12.0). A request carrying BOTH a token
+      # from an admin ACCOUNT AND an X-Client-Time header may correct this process's clock offset
+      # when the two disagree by more than the threshold. "Admin" is decided HERE, from the RabbitMQ
+      # account mirror (users_sync.access == 255, looked up by the token's `user` product) -- the
+      # token carries no role, and an `adm` claim from an older frontend is ignored. Only the
+      # offset moves -- never the droplet's clock, which the container could not set anyway under
+      # cap_drop: ALL (see src/clock_offset.hpp).
       #
       # The ceiling is the security bound: a replayed admin token would need to move the clock ~24h
       # to make its stale day-key current again, and this refuses anything past an hour. Set

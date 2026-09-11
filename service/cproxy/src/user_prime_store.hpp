@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <mutex>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace cproxy {
 
@@ -21,13 +21,29 @@ namespace cproxy {
  * Both factors are primes issued exactly once globally (`UK_Users_prime`, `UK_Users_Prime`), so the
  * product identifies one account on one day and reveals neither factor to whoever sees the token.
  *
- * **This class answers a yes/no question, not a who question, and that is deliberate.** `is_valid`
- * returns a bool and the query does not even select `users_sync.id`, so the most cproxy can ever
- * conclude is "this product belongs to SOME live account" — never "this is user X". The gateway
- * therefore does NOT identify the caller and attributes nothing: this is an authorization check, not
- * authentication. Making it identify the caller would mean returning the user id here AND deciding
- * what cproxy does with it (log it? forward it to docapi as a header?) — a real design change, not a
- * tweak, and one that would put an account identifier into logs that currently hold none.
+ * **This class answers yes/no questions, not a who question, and that is deliberate.** `is_valid`
+ * and `is_admin` return bools and the query does not even select `users_sync.id`, so the most cproxy
+ * can ever conclude is "this product belongs to SOME live account" (and, since 0.12.0, "...which is a
+ * superAdmin") — never "this is user X". The gateway therefore does NOT identify the caller and
+ * attributes nothing: this is an authorization check, not authentication. Making it identify the
+ * caller would mean returning the user id here AND deciding what cproxy does with it (log it? forward
+ * it to docapi as a header?) — a real design change, not a tweak, and one that would put an account
+ * identifier into logs that currently hold none.
+ *
+ * ### Admin comes from the mirror, never from the token (0.12.0)
+ * `is_admin` is true when the account behind the product has `users_sync.access == 255`, the
+ * superAdmin value documented on `dbo.Users.access` in envfish-db and delivered here by the same
+ * RabbitMQ users-sync stream as everything else in this table. 0.11.0 briefly trusted an `"adm": true`
+ * claim minted by the frontend instead; that put the authority in the token (so anyone holding the
+ * signing secret could self-promote) and advertised to every reader of a token that its holder was an
+ * admin. Now the claim is ignored and the token carries no such thing — the privilege is looked up
+ * here, from data this service already holds, keyed by a `user` product that a secret-holder cannot
+ * produce for a real admin without also knowing that admin's primes for today.
+ *
+ * Note the frontend decides "admin" differently — a GUID list (`AdminUserIds`) rather than `access` —
+ * and the two agree today only because both admin accounts hold 255. An account added to that list
+ * without `access = 255` is an admin on the portal but not here; that is the fail-safe direction (the
+ * only thing it loses is permission to correct cproxy's clock).
  *
  * **Compared as decimal TEXT, not as an integer.** Each factor is a bigint and the pair routinely
  * multiplies past 2^63, so an int64 product would wrap — silently turning one account's credential
@@ -57,11 +73,19 @@ namespace cproxy {
  */
 class UserPrimeStore {
 public:
+    /** `dbo.Users.access` value meaning superAdmin (envfish-db script01_createTable.sql). Exact match,
+     *  not `>=`: a stray larger value is a data error, and data errors must not grant privilege. */
+    static constexpr int kSuperAdminAccess = 255;
+
     UserPrimeStore(std::string db_path, int cache_seconds);
 
     /** True when `product` (decimal digits) belongs to an active account for one of the three days
      *  around `now`. Empty or non-numeric input is always false. */
     bool is_valid(const std::string& product, std::chrono::system_clock::time_point now);
+
+    /** True when `product` is valid (as `is_valid`) AND that account's `access` is superAdmin. Same
+     *  snapshot, same filters: a suspended, deleted, or expired admin is not an admin here. */
+    bool is_admin(const std::string& product, std::chrono::system_clock::time_point now);
 
     /** Rebuilds the snapshot now, ignoring the TTL. Startup calls this so a mirror that is missing,
      *  empty, or still dormant shows up in the log rather than only as a wall of unexplained 500s. */
@@ -69,6 +93,10 @@ public:
 
     /** Size of the current snapshot, for startup/diagnostic logging. Does not trigger a refresh. */
     std::size_t size() const;
+
+    /** How many products in the current snapshot are superAdmin, for the startup log — the one place
+     *  an operator can see "clock alignment has someone who may trigger it". Does not refresh. */
+    std::size_t admin_count() const;
 
     /** The last refresh's failure message, empty when it succeeded. For logging only. */
     std::string last_error() const;
@@ -84,7 +112,7 @@ private:
     std::chrono::seconds cache_ttl_;
 
     mutable std::mutex mu_;
-    std::unordered_set<std::string> products_;
+    std::unordered_map<std::string, bool> products_;  // product -> is superAdmin
     std::string last_error_;
     std::chrono::system_clock::time_point loaded_at_{};
     bool loaded_ = false;

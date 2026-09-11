@@ -81,7 +81,7 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
 | `CPROXY_JWT_ISSUER` / `_AUDIENCE` / `_SUBJECT` | `envfish` / `fishfind.info` / `cproxy` | required claims; `NONE` skips one |
 | `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat`/`nbf` (**prod sets 60**) |
 | `CPROXY_JWT_USER_CACHE_SECONDS` | `60` | account-prime snapshot lifetime (also the revocation lag) |
-| `CPROXY_JWT_CLOCK_SYNC` | `true` | allow an `adm` token + `X-Client-Time` to correct the credential clock offset (never the system clock) |
+| `CPROXY_JWT_CLOCK_SYNC` | `true` | allow an admin account's token (mirror `access = 255`) + `X-Client-Time` to correct the credential clock offset (never the system clock) |
 | `CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS` | `5` | smallest disagreement worth correcting |
 | `CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS` | `3600` | ceiling on the TOTAL offset — the security bound on the feature |
 | `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
@@ -200,8 +200,8 @@ frontend (`aspnet/Account/FishApiJwt.cs`):
   agreeing — the `server` day-key and the `user` claim's `day_year` each accept a
   yesterday/today/tomorrow window, so the day rollover itself tolerates ±1 day.
 
-  A request carrying **both** a MAC-verified token with `"adm": true` **and** an `X-Client-Time`
-  header (the caller's UTC epoch) may correct cproxy's clock: past
+  A request carrying **both** a MAC-verified token whose `user` product belongs, in cproxy's own account mirror, to a live account with `access = 255` (superAdmin) **and** an
+  `X-Client-Time` header (the caller's UTC epoch) may correct cproxy's clock: past
   `CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS` the offset is adopted and the token re-verified once.
   Three things are load-bearing here:
 
@@ -213,6 +213,12 @@ frontend (`aspnet/Account/FishApiJwt.cs`):
   - **`iat` cannot be the reference, and that is not an oversight.** `FishApiJwt` caches a minted
     token until UTC midnight, so `iat` is routinely hours stale; aligning to it would drag cproxy
     backwards by however long ago the admin downloaded `jwt.txt`. Hence the separate header.
+  - **Admin is looked up, never claimed (0.12.0).** `UserPrimeStore::is_admin` reads
+    `users_sync.access` from the same row, under the same live/suspended/deleted/expired filters, as
+    the `user` validity answer; the RabbitMQ users-sync stream already carries `access`, so no new
+    field was needed. 0.11.0 trusted an `"adm": true` claim instead — that put the authority in
+    whoever holds the signing secret and advertised the holder's role to anyone decoding a token.
+    The claim is now ignored, and `JwtClaims` has no field it could land in.
   - **The ceiling clamps the TOTAL offset, not the step**, so it cannot be walked past by repeating
     a request. That bound is what makes a replayed admin token uninteresting: it would need ~24h to
     make its stale day-key current again, and anything under a day is already inside the day-key
