@@ -166,6 +166,11 @@ Config load_config(const EnvLookup& env) {
     cfg.jwt_leeway_seconds = get_int(env, "CPROXY_JWT_LEEWAY_SECONDS", cfg.jwt_leeway_seconds);
     cfg.jwt_user_cache_seconds =
         get_int(env, "CPROXY_JWT_USER_CACHE_SECONDS", cfg.jwt_user_cache_seconds);
+    cfg.jwt_clock_sync = get_bool(env, "CPROXY_JWT_CLOCK_SYNC", cfg.jwt_clock_sync);
+    cfg.jwt_clock_sync_threshold_seconds = get_int(
+        env, "CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS", cfg.jwt_clock_sync_threshold_seconds);
+    cfg.jwt_clock_sync_max_seconds =
+        get_int(env, "CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS", cfg.jwt_clock_sync_max_seconds);
     // "NONE" switches an individual claim check off. A sentinel again rather than "": system_env
     // reports an empty variable as unset, so CPROXY_JWT_ISSUER= would silently leave the default
     // "envfish" requirement standing — the opposite of what an operator typing it means.
@@ -296,6 +301,15 @@ std::vector<std::string> validate_config(const Config& cfg) {
         errors.push_back("CPROXY_JWT_LEEWAY_SECONDS must be >= 0");
     if (cfg.jwt_user_cache_seconds <= 0)
         errors.push_back("CPROXY_JWT_USER_CACHE_SECONDS must be positive");
+    if (cfg.jwt_clock_sync_threshold_seconds < 1)
+        errors.push_back("CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS must be >= 1");
+    if (cfg.jwt_clock_sync_max_seconds < 0)
+        errors.push_back("CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS must be >= 0 (0 pins the host clock)");
+    // A ceiling below the trigger point could never be reached, so the feature would look enabled
+    // and silently never correct anything. Refuse the combination rather than ship that puzzle.
+    if (cfg.jwt_clock_sync && cfg.jwt_clock_sync_max_seconds < cfg.jwt_clock_sync_threshold_seconds)
+        errors.push_back(
+            "CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS must be >= CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS");
     // Fatal rather than a warning: both switches are ways of saying "refuse callers that do not
     // present a token", and with no secret configured there is nothing to verify one against, so the
     // service would silently keep accepting the credential the operator just tried to retire.

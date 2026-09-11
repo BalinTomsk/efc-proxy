@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:fed021258e114c4951634a9e6346e1d402a30d6b1869dac2ff0c32f9e905517a  # 0.10.0 pinned by digest
+    image: ghcr.io/balintomsk/cproxy@sha256:374505127d87154e5578d88fe54b6a2b1bad3bed1fab59402581cf0315170075  # 0.11.0 pinned by digest
     container_name: cproxy
     restart: unless-stopped
     ports:
@@ -66,6 +66,28 @@ services:
       # every signed-in read, with only an opaque 500 to show for it. Rollback is setting this to
       # "false" and re-running compose up -d.
       CPROXY_JWT_REQUIRE_USER: "true"
+      #
+      # Clock-skew allowance on exp/iat, tightened from the compiled default of 300 (2026-09-10, at
+      # the user's request). Measured skew between this droplet and the frontend at the time was
+      # ~2 seconds, so 60 leaves a 30x margin; the wider default existed only because nothing used
+      # to notice or repair drift, which CPROXY_JWT_CLOCK_SYNC below now does.
+      #
+      # Note what this number is NOT: the day-key `server` claim and the `user` claim's day_year
+      # each accept a yesterday/today/tomorrow window, so the day rollover tolerates +/-1 day
+      # regardless. This leeway is the binding constraint on the two clocks agreeing.
+      CPROXY_JWT_LEEWAY_SECONDS: "60"
+      #
+      # Self-repair for the above (0.11.0). A request carrying BOTH a token with `"adm": true` AND
+      # an X-Client-Time header may correct this process's clock offset when the two disagree by
+      # more than the threshold. Only the offset moves -- never the droplet's clock, which the
+      # container could not set anyway under cap_drop: ALL (see src/clock_offset.hpp).
+      #
+      # The ceiling is the security bound: a replayed admin token would need to move the clock ~24h
+      # to make its stale day-key current again, and this refuses anything past an hour. Set
+      # CPROXY_JWT_CLOCK_SYNC=false to pin the host clock permanently -- no rebuild, no image change.
+      CPROXY_JWT_CLOCK_SYNC: "true"
+      CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS: "5"
+      CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS: "3600"
       #   issuer/audience/subject       -- envfish / fishfind.info / cproxy, which is what the
       #                                    frontend mints; writing them here would just be a second
       #                                    place to keep in sync.

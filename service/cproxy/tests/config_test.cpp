@@ -5,6 +5,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "config.hpp"
 
@@ -331,6 +332,68 @@ void a_jwt_switch_without_a_secret_is_a_startup_error() {
                .empty());
 }
 
+
+// --- Clock alignment knobs (0.11.0) -------------------------------------------------------------
+
+void clock_sync_defaults_are_the_documented_ones() {
+    const Config cfg = load_config(make_env({}));
+    // On by default, but inert until a token carries `adm` -- so a deployment whose frontend
+    // predates that claim behaves exactly as it did before.
+    CHECK(cfg.jwt_clock_sync);
+    CHECK(cfg.jwt_clock_sync_threshold_seconds == 5);
+    CHECK(cfg.jwt_clock_sync_max_seconds == 3600);
+}
+
+void clock_sync_reads_its_env_vars() {
+    const Config cfg = load_config(make_env({{"CPROXY_JWT_CLOCK_SYNC", "false"},
+                                             {"CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS", "30"},
+                                             {"CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS", "900"}}));
+    CHECK(!cfg.jwt_clock_sync);
+    CHECK(cfg.jwt_clock_sync_threshold_seconds == 30);
+    CHECK(cfg.jwt_clock_sync_max_seconds == 900);
+}
+
+/**
+ * Through the REAL environment, per the rule this file already pins for CPROXY_LOG_DIR: the fake
+ * hands back a genuine empty string that a process environment never produces, so a switch asserted
+ * only through make_env can be a silent no-op in production while its unit test passes.
+ *
+ * The consequence to know here is that `-e CPROXY_JWT_CLOCK_SYNC=` does NOT turn the feature off --
+ * it reads as unset and leaves the default `true` standing. The off value is the word `false`.
+ */
+void an_empty_clock_sync_variable_reads_as_unset_not_as_off() {
+    put_real_env("CPROXY_JWT_CLOCK_SYNC", "");
+    CHECK(load_config(system_env).jwt_clock_sync);  // default survived -- NOT turned off
+
+    put_real_env("CPROXY_JWT_CLOCK_SYNC", "false");
+    CHECK(!load_config(system_env).jwt_clock_sync);
+
+    put_real_env("CPROXY_JWT_CLOCK_SYNC", nullptr);
+    CHECK(load_config(system_env).jwt_clock_sync);
+}
+
+void a_ceiling_below_the_threshold_is_refused() {
+    // Otherwise the feature looks enabled and can never correct anything: the trigger point sits
+    // above the largest correction the ceiling permits.
+    Config cfg = load_config(make_env({{"CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS", "600"},
+                                       {"CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS", "60"}}));
+    const std::vector<std::string> errors = validate_config(cfg);
+    CHECK(!errors.empty());
+
+    // ...but the same pair is fine once the feature is off, because nothing will read either value.
+    cfg.jwt_clock_sync = false;
+    CHECK(validate_config(cfg).empty());
+}
+
+void a_zero_ceiling_is_legal_and_pins_the_host_clock() {
+    // 0 is the "never move, but leave the plumbing in place" setting. It is only coherent with the
+    // feature off, which the cross-check above enforces -- so assert exactly that combination.
+    Config cfg = load_config(make_env({{"CPROXY_JWT_CLOCK_SYNC", "false"},
+                                       {"CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS", "0"}}));
+    CHECK(cfg.jwt_clock_sync_max_seconds == 0);
+    CHECK(validate_config(cfg).empty());
+}
+
 }  // namespace
 
 int main() {
@@ -348,6 +411,11 @@ int main() {
     jwt_is_off_until_a_secret_is_configured();
     jwt_settings_are_read_and_claim_checks_can_be_switched_off();
     a_jwt_switch_without_a_secret_is_a_startup_error();
+    clock_sync_defaults_are_the_documented_ones();
+    clock_sync_reads_its_env_vars();
+    an_empty_clock_sync_variable_reads_as_unset_not_as_off();
+    a_ceiling_below_the_threshold_is_refused();
+    a_zero_ceiling_is_legal_and_pins_the_host_clock();
     std::cout << "config_test: all assertions passed\n";
     return 0;
 }

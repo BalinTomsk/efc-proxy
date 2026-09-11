@@ -25,6 +25,12 @@ struct JwtClaims {
     std::string user;      // decimal product, empty when the caller is not a registered user
     long long issued_at = 0;
     long long expires_at = 0;
+    // `adm` — true only in a token the portal minted for one of its configured admin accounts
+    // (Profile -> Gateway token). It grants nothing extra on the proxy surface; its ONE use is
+    // permission to correct this process's clock offset (see ClockOffset and check_gate_credential).
+    // Trustworthy for the same reason `server` is: it is inside the HMAC, so forging it needs the
+    // signing secret.
+    bool admin = false;
 };
 
 /**
@@ -47,6 +53,22 @@ struct JwtResult {
     /** Why it failed, for the LOG only — the caller answers a generic 500 either way. */
     std::string error;
     JwtClaims claims;
+
+    /**
+     * The MAC verified, so `claims` came from the holder of the signing secret and may be READ even
+     * when `ok` is false. It is still not a pass — `ok` is the only thing that clears the gate.
+     */
+    bool signature_ok = false;
+    /**
+     * Set when `signature_ok` is true, every non-time claim matched, and the ONLY thing wrong was
+     * `exp`/`nbf`/`iat` — i.e. an authentic token that this host's clock disagrees with.
+     *
+     * This distinction is what makes clock alignment able to fire when it is actually needed. Skew
+     * larger than the leeway rejects the very tokens that could report it, so without separating
+     * "authentic but out of time range" from "forged", the correction could only ever run while the
+     * clocks were already close enough not to need it.
+     */
+    bool time_rejected = false;
 };
 
 /**

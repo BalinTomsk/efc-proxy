@@ -9,6 +9,53 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-10: **0.11.0 — clock tolerance tightened to 60s, plus admin-driven self-alignment.**
+  Two halves of one change, at the user's request.
+
+  **1. `CPROXY_JWT_LEEWAY_SECONDS: "60"`** in `deploy/compose.yml` (was the compiled default 300).
+  Measured skew between the droplet and the frontend at the time was ~2 seconds — both on NTP — so
+  60 keeps a 30× margin. The wide default existed only because nothing noticed or repaired drift.
+
+  **2. An admin token may now correct cproxy's clock.** A request carrying both a MAC-verified token
+  with `"adm": true` and an `X-Client-Time` header (the caller's UTC epoch) adopts the difference as
+  an in-process offset when it exceeds `CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS` (5), then
+  re-verifies the token once against the corrected clock. So the first admin call after a drift both
+  succeeds *and* unbreaks the gateway for every other caller. New: `src/clock_offset.hpp/.cpp`,
+  `CPROXY_JWT_CLOCK_SYNC` (default `true`), `..._THRESHOLD_SECONDS` (5), `..._MAX_SECONDS` (3600).
+  Frontend: `FishApiJwt.Build` gains an `adm` claim, set from `DbLayer.IsAdminUser` — the same
+  admin list the pages use.
+
+  Five things here are deliberate and easy to undo by accident:
+
+  - **It is an offset, not the system clock.** The container runs `cap_drop: ALL` so `clock_settime`
+    is unavailable; Docker shares the host kernel clock, so a successful call would move the whole
+    droplet's time (logs, TLS, cron); and systemd-timesyncd would revert it. The offset reaches only
+    credential validation, so log timestamps stay on real time and still correlate with journald.
+  - **`iat` is NOT the time reference, and this was the trap that shaped the design.** `FishApiJwt`
+    caches a minted token until UTC midnight and an admin downloads `jwt.txt` once a day, so `iat`
+    is routinely hours stale — aligning to it would drag cproxy *backwards*. Hence the separate
+    `X-Client-Time` header: the token authenticates the caller, the header supplies the reading.
+  - **The ceiling clamps the TOTAL offset, not the per-step delta**, so it cannot be walked past by
+    repeating a request. That is the security bound: a replayed admin token would need ~24h to make
+    its stale day-key current again, and anything under a day is already inside `DayKeyStore`'s
+    ±1-day window. `clock_offset_test` pins this, including under concurrency (the reason `adopt`
+    is a compare-exchange loop and not a `fetch_add`).
+  - **`JwtResult` now separates `signature_ok` / `time_rejected` from `ok`.** Without it the feature
+    could not fire when needed: skew larger than the leeway rejects the very tokens that could
+    report it. Consequently `iss`/`aud`/`sub` are now checked BEFORE the time claims, so a token for
+    another audience can never reach the alignment path however authentic its MAC. (This reorders
+    error precedence — a token that is both expired and wrong-issuer now reports the issuer.)
+  - **`adm` is read as a strict JSON boolean.** `"true"` the string and `1` the number both read as
+    *not* an admin. A golden cross-language fixture minted by the shipped `FishTracker.dll` pins
+    that .NET actually writes a real boolean — a serialisation change would otherwise silently
+    demote every admin and stop alignment working, with no other symptom.
+
+  Docs: `api-guide.html` (version banner, claim set, new "Clock skew" section),
+  `postman-collection.json` (collection-level pre-request script stamps `X-Client-Time` on every
+  request, so requests added later inherit it), `specification.md`, `README.md`, the `add-fish`
+  skill. Tests: 10/10, with `clock_offset_test` new and five end-to-end cases in `proxy_test`
+  (realignment, header absent, ceiling exceeded, kill-switch, junk header).
+
 - 2026-09-08: **0.10.0 — the gateway credential becomes a signed JWT; the day-key rides inside it.
   DEPLOYED** (digest `sha256:fed02125…517a`; `/health` → `0.10.0`; startup logs
   `"jwt":"on (X-Day-Guid still accepted, user claim ignored)"`, which is also the proof that

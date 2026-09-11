@@ -79,8 +79,11 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
 | `CPROXY_JWT_REQUIRED` | `false` | `true` ⇒ a valid token is the only accepted credential |
 | `CPROXY_JWT_REQUIRE_USER` | `false` | `true` ⇒ writes must carry a `user` claim; any claim present must match a live account |
 | `CPROXY_JWT_ISSUER` / `_AUDIENCE` / `_SUBJECT` | `envfish` / `fishfind.info` / `cproxy` | required claims; `NONE` skips one |
-| `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat` |
+| `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat`/`nbf` (**prod sets 60**) |
 | `CPROXY_JWT_USER_CACHE_SECONDS` | `60` | account-prime snapshot lifetime (also the revocation lag) |
+| `CPROXY_JWT_CLOCK_SYNC` | `true` | allow an `adm` token + `X-Client-Time` to correct the credential clock offset (never the system clock) |
+| `CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS` | `5` | smallest disagreement worth correcting |
+| `CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS` | `3600` | ceiling on the TOTAL offset — the security bound on the feature |
 | `CPROXY_CLOUDRANGE_DB` | (empty) | SQLite datacenter-IP range db; empty ⇒ feature off entirely |
 | `CPROXY_BLOCK_CLOUD_IPS` | `true` | kill-switch; `false` keeps data + refresh but refuses nothing |
 | `CPROXY_CLOUDRANGE_REFRESH_HOURS` | `336` | fortnightly provider-feed refresh |
@@ -192,6 +195,34 @@ frontend (`aspnet/Account/FishApiJwt.cs`):
 - **`CPROXY_JWT_REQUIRE_USER` demands a `user` claim on writes only.** A gated *read* may still be
   anonymous — `/news/featured` and `/news/more` are the public home page, and the gate there is
   against anonymous scraping, not anonymous reading. A claim that *is* present is checked either way.
+- **Clock skew is bounded by `CPROXY_JWT_LEEWAY_SECONDS` and self-repairing (0.11.0).** The leeway
+  applies to `exp`, `iat` and `nbf`; prod runs 60. It is the *binding* constraint on the two hosts
+  agreeing — the `server` day-key and the `user` claim's `day_year` each accept a
+  yesterday/today/tomorrow window, so the day rollover itself tolerates ±1 day.
+
+  A request carrying **both** a MAC-verified token with `"adm": true` **and** an `X-Client-Time`
+  header (the caller's UTC epoch) may correct cproxy's clock: past
+  `CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS` the offset is adopted and the token re-verified once.
+  Three things are load-bearing here:
+
+  - **It is an in-process offset (`ClockOffset`), never the system clock.** The container runs
+    `cap_drop: ALL` so it *cannot* `clock_settime`; Docker shares the host kernel clock so a
+    successful call would move the whole droplet; and systemd-timesyncd would undo it. The offset
+    reaches only credential validation — log timestamps stay on real time, so a line here still
+    lines up with journald during an incident.
+  - **`iat` cannot be the reference, and that is not an oversight.** `FishApiJwt` caches a minted
+    token until UTC midnight, so `iat` is routinely hours stale; aligning to it would drag cproxy
+    backwards by however long ago the admin downloaded `jwt.txt`. Hence the separate header.
+  - **The ceiling clamps the TOTAL offset, not the step**, so it cannot be walked past by repeating
+    a request. That bound is what makes a replayed admin token uninteresting: it would need ~24h to
+    make its stale day-key current again, and anything under a day is already inside the day-key
+    store's own window.
+
+  This is also why `JwtResult` separates `signature_ok` / `time_rejected` from `ok`: skew larger
+  than the leeway rejects the very tokens that could report it, so without reading claims off an
+  authentic-but-out-of-range token the correction could only run while the clocks were already
+  close enough not to need it. Identity claims (`iss`/`aud`/`sub`) are therefore checked *before*
+  the time claims — a token for another audience must never reach this path.
 - **Failure is the same opaque `500`** as a failed day-key. The reason goes to the log only.
 - **Rollout, three reversible switches:** `CPROXY_JWT_SECRET` empty ⇒ 0.9.x behaviour exactly →
   set the secret (both credentials accepted) → frontend `FishApi:JwtOnly=true` → gateway
