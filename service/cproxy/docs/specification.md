@@ -56,9 +56,11 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
   header is judged as carrying nothing. A wrong or missing token → `500` (deliberately not `401`, so it reads no
   differently from an ordinary server error). Two arms, either one gates: **every POST/PATCH**
   whatever the path, and **every method on a path in `CPROXY_DAYKEY_PATHS`** (default
-  `/news/default`, `/news/featured` and `/news/more` — this is how a *read* is put behind the
-  credential, added 0.7.0; the two extra entries came in 0.9.1 when docapi 1.8.1 split the home
-  page and left them as an unauthenticated bypass). Matching is on
+  `/news/default`, `/news/featured`, `/news/more` and `/news/photo` — this is how a *read* is put
+  behind the credential, added 0.7.0; the featured/more entries came in 0.9.1 when docapi 1.8.1 split
+  the home page and left them as an unauthenticated bypass, and `/news/photo` came in 0.14.0 with the
+  docapi 1.9.0 endpoint that serves those same lead photos by id — added in the same release rather
+  than after the fact). Matching is on
   the path tail, case-folded, trailing-slash-insensitive, and covers anything nested under a gated
   path; dot-dot is rejected before the gate so traversal cannot re-point a request past it. See
   `DayKeyStore` below.
@@ -74,7 +76,7 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
 | `CPROXY_API_KEY` | (empty) | require `X-API-Key` when set |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV method allow-list |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
-| `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more` | CSV of paths day-key gated on **every** method, GET included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more,/news/photo` | CSV of paths day-key gated on **every** method, GET included; `NONE` disables (an empty value reads as unset) |
 | `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ every gated request always `500` (startup ERROR), ungated reads unaffected. Removed in 0.13.0: `CPROXY_JWT_REQUIRED` (ignored with a WARN if set) |
 | `CPROXY_JWT_REQUIRE_USER` | `false` | `true` ⇒ writes must carry a `user` claim; any claim present must match a live account |
 | `CPROXY_JWT_ISSUER` / `_AUDIENCE` / `_SUBJECT` | `envfish` / `fishfind.info` / `cproxy` | required claims; `NONE` skips one |

@@ -9,6 +9,33 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-11: **0.14.0 — `/news/photo` joins the gated home-page paths.** docapi 1.9.0 adds
+  `GET /api/v1/news/photo/{id}`, which serves a lead article's photo as raw image bytes — the same
+  bytes `/news/featured` already embeds as base64, just addressable by id so the frontend can render
+  the home page without re-downloading a megabyte of photos it has already seen. Same content,
+  therefore the same gate.
+
+  - **`Config::daykey_paths` default gains `/news/photo`**, making it four entries:
+    `/news/default`, `/news/featured`, `/news/more`, `/news/photo`. The id is the path's last
+    segment, so the `contains(entry + "/")` arm of `daykey_gated_path` covers every
+    `/news/photo/<guid>` without a wildcard.
+  - **This is the third time the same shape of bypass could have opened**, and the first time it was
+    closed in the release that created it rather than days later: 0.7.0 gated `/news/default`; 0.9.1
+    had to add `/news/featured` and `/news/more` after docapi 1.8.1 split that endpoint and left the
+    expensive ~1.09 MB half readable with no credential. The comment above `daykey_paths` says to add
+    new home-page paths HERE in the same commit — this entry is that comment being followed.
+  - Tests: `config_test`'s `daykey_paths_gate_reads_by_default` pins four entries and gates
+    `/api/v1/news/photo/<guid>` at the real route prefix, case-folded, with and without a trailing
+    slash; near-misses (`/news/photograph`, `/oldnews/photo/x`) stay open; the empty-env case
+    (`CPROXY_DAYKEY_PATHS=""` reads as unset) pins four as well. All assertions pass.
+  - **Ships the unreleased 0.13.1 with it.** 0.13.1 (canonical base64url) never reached an image, so
+    `/health` goes straight from `0.13.0` to `0.14.0` and that build is the first carrying both
+    changes.
+  - Docs updated in the same change per the standing rule: `docs/api-guide.html` (gate callout, the
+    endpoint table, four new observed-behaviour rows), `docs/gen-postman.py` → regenerated
+    `docs/postman-collection.json` (51 requests: `GET /news/photo/{id}` under **News**, plus a
+    negative test asserting it is refused without a credential), and `docs/specification.md`.
+
 - 2026-09-11: **0.13.1 — base64url must be canonical.** Found live
   on prod: an HS512 token whose 86-char signature ended in `w` still verified with that character
   changed to `x`. 86 symbols carry 516 bits for a 64-byte MAC, so the last symbol holds only 2

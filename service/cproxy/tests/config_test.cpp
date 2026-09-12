@@ -201,10 +201,11 @@ void payload_limit_is_read_with_default() {
 // depend on remembering an env var at deploy time.
 void daykey_paths_gate_reads_by_default() {
     Config c = load_config(make_env({}));
-    CHECK(c.daykey_paths.size() == 3);
+    CHECK(c.daykey_paths.size() == 4);
     CHECK(c.daykey_paths[0] == "/news/default");
     CHECK(c.daykey_paths[1] == "/news/featured");
     CHECK(c.daykey_paths[2] == "/news/more");
+    CHECK(c.daykey_paths[3] == "/news/photo");
 
     // The gated read, at the real route prefix and bare.
     CHECK(c.daykey_required("GET", "/api/v1/news/default"));
@@ -227,6 +228,16 @@ void daykey_paths_gate_reads_by_default() {
     CHECK(c.daykey_required("GET", "/api/v1/news/more/"));
     CHECK(c.daykey_required("GET", "/api/v1/News/More"));
 
+    // docapi 1.9.0 added /news/photo/<id>: the SAME lead photos /news/featured embeds as base64,
+    // served by id as raw bytes. Leaving it open would be the bypass a third time, so it is gated
+    // with the rest of the home page. Note the credential is checked on the id-bearing form -- the
+    // bare /news/photo is a 404 upstream and is not what a scraper would call.
+    CHECK(c.daykey_required("GET", "/api/v1/news/photo/1B4E28BA-2FA1-11D2-883F-0016D3CCA427"));
+    CHECK(c.daykey_required("HEAD", "/api/v1/news/photo/1B4E28BA-2FA1-11D2-883F-0016D3CCA427"));
+    CHECK(c.daykey_required("GET", "/api/v1/News/Photo/1B4E28BA-2FA1-11D2-883F-0016D3CCA427"));
+    CHECK(c.daykey_required("GET", "/api/v1/news/photo"));
+    CHECK(c.daykey_required("GET", "/api/v1/news/photo/"));
+
     // Sibling news reads stay open — the gate is the home page, not the whole news surface.
     CHECK(!c.daykey_required("GET", "/api/v1/news/list"));
     CHECK(!c.daykey_required("GET", "/api/v1/news/search"));
@@ -234,6 +245,8 @@ void daykey_paths_gate_reads_by_default() {
     // A near-miss must not be swept in by the new entries either.
     CHECK(!c.daykey_required("GET", "/api/v1/news/moreish"));
     CHECK(!c.daykey_required("GET", "/api/v1/oldnews/more"));
+    CHECK(!c.daykey_required("GET", "/api/v1/news/photograph"));
+    CHECK(!c.daykey_required("GET", "/api/v1/oldnews/photo/x"));
     // The entry's leading '/' keeps the tail match on a segment boundary.
     CHECK(!c.daykey_required("GET", "/api/v1/oldnews/default"));
 
@@ -270,10 +283,11 @@ void daykey_paths_are_configurable_and_can_be_cleared() {
         return std::string(k) == "CPROXY_DAYKEY_PATHS" ? system_env("PATH_THAT_IS_NOT_SET_98765")
                                                        : std::nullopt;
     });
-    CHECK(empty.daykey_paths.size() == 3);
+    CHECK(empty.daykey_paths.size() == 4);
     CHECK(empty.daykey_required("GET", "/api/v1/news/default"));
     CHECK(empty.daykey_required("GET", "/api/v1/news/featured"));
     CHECK(empty.daykey_required("GET", "/api/v1/news/more"));
+    CHECK(empty.daykey_required("GET", "/api/v1/news/photo/x"));
 }
 
 void jwt_is_off_until_a_secret_is_configured() {
