@@ -29,7 +29,7 @@ namespace cproxy {
  * | CPROXY_LOG_DIR              | logs                          | rolling-log directory ("NONE" = stdout only) |
  * | CPROXY_LOG_MAX_HISTORY      | 7                             | days of rolled log files to keep          |
  * | CPROXY_DAYKEY_DB            | (empty)                       | path to the day-key SQLite db; every gated request 500s while empty |
- * | CPROXY_DAYKEY_PATHS         | /news/default,/news/featured,/news/more | CSV of paths gated on EVERY method, GET included ("NONE" disables) |
+ * | CPROXY_DAYKEY_PATHS         | /news/default,/news/featured,/news/more,/news/photo | CSV of paths gated on EVERY method, GET included ("NONE" disables) |
  * | CPROXY_JWT_SECRET           | (empty)                       | HS512 shared secret; empty = every gated request 500s (no other credential exists) |
  * | CPROXY_JWT_REQUIRE_USER     | false                         | true = writes must name an account, and any `user` claim must match the mirror |
  * | CPROXY_JWT_ISSUER           | envfish                       | required `iss` ("" = do not check)        |
@@ -176,13 +176,18 @@ struct Config {
     // being scraped anonymously; ops can widen the list via CPROXY_DAYKEY_PATHS, or turn the path
     // gate off with CPROXY_DAYKEY_PATHS=NONE (an empty value would read as "unset" — see load_config).
     //
-    // ALL THREE HOME-PAGE ENDPOINTS MUST BE LISTED TOGETHER. docapi 1.8.1 split /news/default into
+    // ALL THE HOME-PAGE ENDPOINTS MUST BE LISTED TOGETHER. docapi 1.8.1 split /news/default into
     // /news/featured (the 2 lead articles, ~1.09 MB) and /news/more (the sidebar, ~1.6 KB); the three
     // serve the SAME content, so gating only /news/default leaves the other two as an unauthenticated
     // bypass around the gate — /news/featured alone hands over the whole expensive half. That was live
     // between the docapi 1.8.1 deploy and this change. If a future release splits or renames these
     // endpoints again, add the new paths HERE in the same commit.
-    std::vector<std::string> daykey_paths = {"/news/default", "/news/featured", "/news/more"};
+    //
+    // /news/photo (docapi 1.9.0) is the fourth: the lead photos that /news/featured embeds as base64,
+    // served by id as raw bytes so the frontend needs no MySQL connection of its own. Same content,
+    // so leaving it open would be the same bypass one more time — the entry's trailing segment is the
+    // article id, which the contains() arm of daykey_gated_path covers.
+    std::vector<std::string> daykey_paths = {"/news/default", "/news/featured", "/news/more", "/news/photo"};
 
     /** Case-insensitive method allow-list check. Empty allow-list => everything permitted. */
     bool method_allowed(const std::string& method) const;
