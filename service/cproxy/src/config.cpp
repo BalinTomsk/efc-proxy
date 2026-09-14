@@ -94,6 +94,35 @@ std::string normalize_gate_path(std::string s) {
     return s;
 }
 
+/**
+ * Whether one path segment has the shape of a document id: a canonical 8-4-4-4-12 hex GUID, which
+ * is what docapi uses for every entity key it exposes by id.
+ *
+ * Deliberately STRICT. A false positive here gates something cheap — harmless but confusing; a
+ * false NEGATIVE leaves a megabyte-scale endpoint open, which is the bug this rule exists to close.
+ * Strictness is nonetheless the right trade because the thing being told apart is a guid from an
+ * English word (`list`, `search`, `default`, `featured`, `more`, `photo`, `export`, `import`), and no
+ * word is 36 characters of hex and dashes. The input is already lower-cased by normalize_gate_path,
+ * so only lower-case hex is accepted — do not "fix" that by adding A-F unless the normalizer changes.
+ *
+ * A bare 32-hex (unhyphenated) form is NOT accepted: docapi has never emitted or accepted one, and
+ * admitting it would widen the rule on speculation rather than on a route that exists.
+ */
+bool looks_like_document_id(const std::string& seg) {
+    static constexpr std::size_t kGuidLength = 36;
+    if (seg.size() != kGuidLength) return false;
+    for (std::size_t i = 0; i < kGuidLength; ++i) {
+        const char c = seg[i];
+        const bool dash_position = (i == 8 || i == 13 || i == 18 || i == 23);
+        if (dash_position) {
+            if (c != '-') return false;
+        } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 std::optional<std::string> system_env(const char* name) {
@@ -108,7 +137,9 @@ bool Config::method_allowed(const std::string& method) const {
 }
 
 bool Config::daykey_gated_path(const std::string& path) const {
-    if (daykey_paths.empty()) return false;
+    // The two lists are INDEPENDENT switches. This deliberately does not early-return on an empty
+    // daykey_paths: CPROXY_DAYKEY_PATHS=NONE must turn off the tail gate only, not silently take the
+    // document-id gate with it. Turning that one off is CPROXY_DAYKEY_ID_PATHS=NONE.
     const std::string norm = normalize_gate_path(path);
     for (const std::string& entry : daykey_paths) {
         // ends_with covers the endpoint itself at any route prefix ("/api/v1" + "/news/default");
@@ -116,6 +147,27 @@ bool Config::daykey_gated_path(const std::string& path) const {
         // does not match "/news/default". The contains() arm extends the gate to anything nested
         // under a gated path - a sub-resource of a protected resource is protected too.
         if (norm.ends_with(entry) || norm.contains(entry + "/")) return true;
+    }
+    return daykey_gated_id_path(path);
+}
+
+bool Config::daykey_gated_id_path(const std::string& path) const {
+    if (daykey_id_paths.empty()) return false;
+    const std::string norm = normalize_gate_path(path);
+
+    // Split the last segment off. normalize_gate_path has already stripped any trailing slash, so
+    // the last segment is never empty here.
+    const std::size_t slash = norm.rfind('/');
+    if (slash == std::string::npos || slash == 0) return false;
+    if (!looks_like_document_id(norm.substr(slash + 1))) return false;
+
+    // The parent must END WITH the entry, not merely contain it: that keeps the rule on a segment
+    // boundary and at the right depth, so "/news/<guid>" is gated while "/news/export/<guid>"
+    // (parent "/news/export") is not caught HERE — it is already gated as a literal daykey_paths
+    // entry, and matching it twice would only obscure which rule is doing the work.
+    const std::string parent = norm.substr(0, slash);
+    for (const std::string& entry : daykey_id_paths) {
+        if (parent.ends_with(entry)) return true;
     }
     return false;
 }
@@ -201,6 +253,20 @@ Config load_config(const EnvLookup& env) {
             while (std::getline(ps, ptok, ',')) {
                 auto p = normalize_gate_path(ptok);
                 if (!p.empty() && p != "/") cfg.daykey_paths.push_back(p);
+            }
+        }
+    }
+
+    // Same CSV-replaces / NONE-disables contract as CPROXY_DAYKEY_PATHS above, for the same
+    // reason (system_env reports an empty variable as unset).
+    if (auto id_paths = env("CPROXY_DAYKEY_ID_PATHS")) {
+        cfg.daykey_id_paths.clear();
+        if (to_upper(trim(*id_paths)) != "NONE") {
+            std::istringstream ips(*id_paths);
+            std::string itok;
+            while (std::getline(ips, itok, ',')) {
+                auto p = normalize_gate_path(itok);
+                if (!p.empty() && p != "/") cfg.daykey_id_paths.push_back(p);
             }
         }
     }

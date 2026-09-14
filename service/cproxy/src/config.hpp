@@ -187,7 +187,33 @@ struct Config {
     // served by id as raw bytes so the frontend needs no MySQL connection of its own. Same content,
     // so leaving it open would be the same bypass one more time — the entry's trailing segment is the
     // article id, which the contains() arm of daykey_gated_path covers.
-    std::vector<std::string> daykey_paths = {"/news/default", "/news/featured", "/news/more", "/news/photo"};
+    //
+    // /news/export is the fifth (0.15.0). It carries the FULL interchange document — every field
+    // plus all THREE paragraph photos as base64 — so it is the single largest response this gateway
+    // serves, larger than /news/featured. It is admin-only on the portal, but that gate lives in the
+    // portal, not here, so to this proxy it was an open megabyte-scale endpoint. The contains() arm
+    // covers the /news/export/<id> form.
+    std::vector<std::string> daykey_paths = {"/news/default", "/news/featured", "/news/more",
+                                             "/news/photo", "/news/export"};
+
+    // Parents whose DOCUMENT-BY-ID children are gated: a request for `<entry>/<id>` where `<id>` has
+    // the shape of a document id. Set via CPROXY_DAYKEY_ID_PATHS (CSV replaces, NONE disables), same
+    // conventions as CPROXY_DAYKEY_PATHS.
+    //
+    // WHY THIS EXISTS AS A SEPARATE MECHANISM. daykey_paths matches a literal path TAIL, so it can
+    // only gate a route whose last segment is fixed. `GET /news/{id}` has no fixed last segment —
+    // the id varies — and it is exactly the endpoint News.aspx now calls for every article view,
+    // returning the article WITH its lead photo as base64 (~500 KB). Listing "/news" in daykey_paths
+    // instead would work via the contains() arm but would also gate /news/list and /news/search,
+    // which are deliberately open: a page of JSON costs nothing to assemble and is not what a
+    // scraper is after. The distinction that matters is not the prefix, it is whether the request
+    // fetches ONE DOCUMENT BY ID. Hence a shape rule rather than another CSV entry.
+    //
+    // Only a real document id matches (see looks_like_document_id in config.cpp) — every literal
+    // sibling route under /news (list, search, default, featured, more, photo, export, import) is a
+    // word, never a guid, so none of them is caught by accident. A future templated route under a
+    // listed parent is gated automatically, which is the fail-secure direction.
+    std::vector<std::string> daykey_id_paths = {"/news"};
 
     /** Case-insensitive method allow-list check. Empty allow-list => everything permitted. */
     bool method_allowed(const std::string& method) const;
@@ -199,8 +225,24 @@ struct Config {
      */
     bool daykey_required(const std::string& method, const std::string& path) const;
 
-    /** True when `path` is at or under one of the daykey_paths entries. */
+    /**
+     * True when `path` is gated by either path rule: at or under a daykey_paths entry, or a
+     * document-by-id fetch under a daykey_id_paths entry.
+     *
+     * Both rules live behind this one predicate so that every call site gets both. proxy.cpp tests
+     * the decoded path AND the raw request target, and a rule reachable from only one of those is a
+     * rule with a bypass.
+     */
     bool daykey_gated_path(const std::string& path) const;
+
+    /**
+     * True when `path` fetches one document by id under a daykey_id_paths entry — i.e. its last
+     * segment looks like a document id and its parent ends with a listed entry.
+     *
+     * Separate and public so the shape rule is testable on its own; {@link daykey_gated_path} ORs it
+     * in. See daykey_id_paths for why a tail match cannot express this.
+     */
+    bool daykey_gated_id_path(const std::string& path) const;
 
     // Values typically supplied via an encrypted dotenv on the volume (EXTERNAL_ADMIN / EXTERNAL_FRONTEND);
     // decrypted at load time. Empty when not configured.

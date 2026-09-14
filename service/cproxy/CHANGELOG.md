@@ -9,6 +9,51 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-14: **0.15.0 — `GET /news/{id}` and `/news/export/{id}` join the gated surface.**
+  `News.aspx` moved onto this gateway for every piece of news it shows (docapi 1.10.0, same day),
+  which made `GET /news/{id}` a per-article-view call returning the article **with its lead photo as
+  base64, ~500 KB**. It was ungated. So was `/news/export/{id}`, which carries the full interchange
+  document — every field plus all *three* paragraph photos — making it the largest response this
+  gateway serves, larger than `/news/featured`. Both are now gated. This is the same bypass shape
+  that was missed after docapi 1.8.1 (`/news/featured` open for days) and caught in-release for
+  1.9.0 (`/news/photo`); here it is caught in the release that created the traffic.
+
+  - **`/news/export` is an ordinary `CPROXY_DAYKEY_PATHS` entry** — a literal tail, so the existing
+    mechanism covers it and the `contains()` arm reaches `/news/export/<id>`. The default list is now
+    five entries.
+  - **`GET /news/{id}` needed a new mechanism, and this is the point worth remembering.**
+    `CPROXY_DAYKEY_PATHS` matches a path **tail**, so it can only name a route whose last segment is
+    fixed; `/news/{id}`'s last segment is the id. Listing `/news` would have worked through the
+    `contains()` arm but would also have gated `/news/list` and `/news/search`, which are
+    deliberately open — a page of JSON is cheap to assemble and is not what a scraper is after. The
+    distinction that matters is not the prefix, it is whether the request **fetches one document by
+    id**. Hence `CPROXY_DAYKEY_ID_PATHS` (default `/news`): a request for `<entry>/<guid>` is gated.
+  - **Only a canonical 8-4-4-4-12 hex GUID matches** (`looks_like_document_id`). That is what tells
+    the templated route apart from its literal siblings — `list`, `search`, `default`, `featured`,
+    `more`, `photo`, `export`, `import` are English words, and no word is 36 characters of hex and
+    dashes. A templated route added under a listed parent in future is gated automatically, which is
+    the fail-secure direction. The unhyphenated 32-hex form is deliberately **not** accepted: docapi
+    has never emitted or accepted one, and admitting it would widen the rule on speculation.
+  - **The two lists are independent switches**, and getting this wrong was a real bug in the first
+    draft: an early `return false` on an empty `daykey_paths` meant `CPROXY_DAYKEY_PATHS=NONE` would
+    have silently unguarded `/news/{id}` as well. `the_two_path_gates_are_independent_switches` pins
+    each direction.
+  - **Tests: 10/10 ctest inside the Docker build stage.** `config_test` gains the five-entry default
+    pin, the `/news/export` cases, the id-gate cases (gated at any prefix, case-folded, with a
+    trailing slash; `daykey_gated_id_path` asserted directly), five near-miss id shapes that must
+    **not** gate, the parent-must-end-with-entry depth check, proof that `/news/list` and
+    `/news/search` stay open, and the two independence and configurability tests.
+  - **Docs + Postman together** (standing rule): `docs/api-guide.html` (gate callout rewritten, the
+    `/news/search` row's "four siblings" corrected, three new observed-behaviour rows),
+    `docs/gen-postman.py` → regenerated `docs/postman-collection.json` (**57 requests, was 54**: two
+    gate negatives plus an *ungated* `/news/list` positive that fails if the id gate is ever widened
+    too far — the positive lives in the News folder, not in the negatives folder whose contract is
+    "everything here is refused"), `README.md`, `CLAUDE.md`, `docs/specification.md`, `.env.example`.
+  - **NOT DEPLOYED.** Prod is still 0.14.0 (`sha256:8486afeb…268bebd`), so both endpoints remain
+    reachable without a credential until this ships. `deploy/compose.yml` still pins the 0.14.0
+    digest — update it as part of the deploy, and check for a stray `<placeholder>` first per
+    `docs/do-update.md`.
+
 - 2026-09-11: **0.14.0 — `/news/photo` joins the gated home-page paths.** docapi 1.9.0 adds
   `GET /api/v1/news/photo/{id}`, which serves a lead article's photo as raw image bytes — the same
   bytes `/news/featured` already embeds as base64, just addressable by id so the frontend can render

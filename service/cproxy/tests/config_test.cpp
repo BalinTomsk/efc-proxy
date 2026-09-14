@@ -201,11 +201,14 @@ void payload_limit_is_read_with_default() {
 // depend on remembering an env var at deploy time.
 void daykey_paths_gate_reads_by_default() {
     Config c = load_config(make_env({}));
-    CHECK(c.daykey_paths.size() == 4);
+    CHECK(c.daykey_paths.size() == 5);
     CHECK(c.daykey_paths[0] == "/news/default");
     CHECK(c.daykey_paths[1] == "/news/featured");
     CHECK(c.daykey_paths[2] == "/news/more");
     CHECK(c.daykey_paths[3] == "/news/photo");
+    CHECK(c.daykey_paths[4] == "/news/export");
+    CHECK(c.daykey_id_paths.size() == 1);
+    CHECK(c.daykey_id_paths[0] == "/news");
 
     // The gated read, at the real route prefix and bare.
     CHECK(c.daykey_required("GET", "/api/v1/news/default"));
@@ -238,7 +241,53 @@ void daykey_paths_gate_reads_by_default() {
     CHECK(c.daykey_required("GET", "/api/v1/news/photo"));
     CHECK(c.daykey_required("GET", "/api/v1/news/photo/"));
 
-    // Sibling news reads stay open — the gate is the home page, not the whole news surface.
+    // /news/export/<id> (0.15.0) carries the FULL interchange document -- every field plus all
+    // three paragraph photos as base64 -- so it is the largest response this gateway serves, bigger
+    // than /news/featured. It is admin-gated on the PORTAL, but that gate is not this proxy's, so
+    // to an anonymous caller here it was wide open.
+    CHECK(c.daykey_required("GET", "/api/v1/news/export/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(c.daykey_required("GET", "/api/v1/news/export"));
+    CHECK(c.daykey_required("GET", "/api/v1/News/Export/1B4E28BA-2FA1-11D2-883F-0016D3CCA427"));
+
+    // THE BYPASS A FOURTH TIME, and the one a tail match cannot express: GET /news/{id} is the
+    // article WITH its lead photo as base64 (~500 KB), and it is what News.aspx calls on every
+    // article view. Its last segment is the id, so there is no literal tail to list -- hence the
+    // document-id shape rule.
+    CHECK(c.daykey_required("GET", "/api/v1/news/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(c.daykey_required("HEAD", "/api/v1/news/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    // Casing and a trailing slash must not be a way around it, same as every other entry.
+    CHECK(c.daykey_required("GET", "/api/v1/News/1B4E28BA-2FA1-11D2-883F-0016D3CCA427"));
+    CHECK(c.daykey_required("GET", "/api/v1/news/1b4e28ba-2fa1-11d2-883f-0016d3cca427/"));
+    CHECK(c.daykey_required("GET", "/news/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    // The predicate is also correct on its own, not just through daykey_required.
+    CHECK(c.daykey_gated_id_path("/api/v1/news/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(!c.daykey_gated_id_path("/api/v1/news/list"));
+
+    // ONLY a real guid. Every literal sibling route under /news is a word, so none is swept in --
+    // this is what lets /news/list and /news/search stay open while /news/{id} is gated.
+    CHECK(!c.daykey_gated_id_path("/api/v1/news/import"));
+    CHECK(!c.daykey_gated_id_path("/api/v1/news/featured"));
+    for (const char* not_a_guid : {
+             "1b4e28ba-2fa1-11d2-883f-0016d3cca42",    // 35 chars
+             "1b4e28ba-2fa1-11d2-883f-0016d3cca4277",  // 37 chars
+             "1b4e28ba-2fa1-11d2-883f-0016d3cca42g",   // non-hex
+             "1b4e28ba2fa111d2883f0016d3cca427",       // unhyphenated 32-hex is NOT accepted
+             "1b4e28ba-2fa1-11d2-883f0-016d3cca427",   // dash in the wrong place
+         }) {
+        CHECK(!c.daykey_gated_id_path(std::string("/api/v1/news/") + not_a_guid));
+    }
+
+    // The parent must END WITH the entry, so the rule stays on a segment boundary and at the right
+    // depth. A guid one level deeper, or under a different parent, is not caught by THIS rule.
+    CHECK(!c.daykey_gated_id_path("/api/v1/oldnews/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(!c.daykey_gated_id_path("/api/v1/news/extra/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(!c.daykey_gated_id_path("/api/v1/fish/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    // ...and a guid under another entity stays open overall, since nothing else lists it.
+    CHECK(!c.daykey_required("GET", "/api/v1/fish/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(!c.daykey_required("GET", "/api/v1/waterbody/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+
+    // Sibling news reads stay open — the gate is the home page plus the by-id documents, not the
+    // whole news surface. A page of JSON costs nothing to assemble and is not what a scraper wants.
     CHECK(!c.daykey_required("GET", "/api/v1/news/list"));
     CHECK(!c.daykey_required("GET", "/api/v1/news/search"));
     CHECK(!c.daykey_required("GET", "/api/v1/fish"));
@@ -283,11 +332,61 @@ void daykey_paths_are_configurable_and_can_be_cleared() {
         return std::string(k) == "CPROXY_DAYKEY_PATHS" ? system_env("PATH_THAT_IS_NOT_SET_98765")
                                                        : std::nullopt;
     });
-    CHECK(empty.daykey_paths.size() == 4);
+    CHECK(empty.daykey_paths.size() == 5);
     CHECK(empty.daykey_required("GET", "/api/v1/news/default"));
     CHECK(empty.daykey_required("GET", "/api/v1/news/featured"));
     CHECK(empty.daykey_required("GET", "/api/v1/news/more"));
     CHECK(empty.daykey_required("GET", "/api/v1/news/photo/x"));
+    CHECK(empty.daykey_required("GET", "/api/v1/news/export/x"));
+}
+
+// The two path gates are INDEPENDENT switches. Turning one off must not take the other with it --
+// an early return on an empty daykey_paths did exactly that in the first draft of this change, which
+// would have made CPROXY_DAYKEY_PATHS=NONE silently unguard GET /news/{id} as well.
+void the_two_path_gates_are_independent_switches() {
+    const char* kGuid = "/api/v1/news/1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+
+    // Tail gate off, id gate still on.
+    Config no_tail = load_config(make_env({{"CPROXY_DAYKEY_PATHS", "NONE"}}));
+    CHECK(no_tail.daykey_paths.empty());
+    CHECK(no_tail.daykey_id_paths.size() == 1);
+    CHECK(!no_tail.daykey_required("GET", "/api/v1/news/featured"));
+    CHECK(no_tail.daykey_required("GET", kGuid));
+
+    // Id gate off, tail gate still on.
+    Config no_id = load_config(make_env({{"CPROXY_DAYKEY_ID_PATHS", "NONE"}}));
+    CHECK(no_id.daykey_id_paths.empty());
+    CHECK(no_id.daykey_paths.size() == 5);
+    CHECK(no_id.daykey_required("GET", "/api/v1/news/featured"));
+    CHECK(!no_id.daykey_required("GET", kGuid));
+
+    // Both off: only the write surface is left.
+    Config neither = load_config(make_env({{"CPROXY_DAYKEY_PATHS", "NONE"},
+                                           {"CPROXY_DAYKEY_ID_PATHS", "none"}}));
+    CHECK(!neither.daykey_required("GET", kGuid));
+    CHECK(!neither.daykey_required("GET", "/api/v1/news/featured"));
+    CHECK(neither.daykey_required("POST", kGuid));
+}
+
+// CPROXY_DAYKEY_ID_PATHS follows the same CSV-replaces contract as CPROXY_DAYKEY_PATHS, including
+// supplying a missing leading '/' and stripping a trailing one.
+void daykey_id_paths_are_configurable() {
+    Config c = load_config(make_env({{"CPROXY_DAYKEY_ID_PATHS", "/news, fish ,/waterbody/"}}));
+    CHECK(c.daykey_id_paths.size() == 3);
+    CHECK(c.daykey_id_paths[1] == "/fish");
+    CHECK(c.daykey_id_paths[2] == "/waterbody");
+    CHECK(c.daykey_required("GET", "/api/v1/fish/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(c.daykey_required("GET", "/api/v1/waterbody/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(!c.daykey_required("GET", "/api/v1/station/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
+    CHECK(!c.daykey_required("GET", "/api/v1/fish/search"));
+
+    // An unset variable must leave the default standing -- the empty-vs-unset trap again.
+    Config unset = load_config([](const char* k) -> std::optional<std::string> {
+        return std::string(k) == "CPROXY_DAYKEY_ID_PATHS" ? system_env("PATH_NOT_SET_98766")
+                                                          : std::nullopt;
+    });
+    CHECK(unset.daykey_id_paths.size() == 1);
+    CHECK(unset.daykey_id_paths[0] == "/news");
 }
 
 void jwt_is_off_until_a_secret_is_configured() {
@@ -430,6 +529,8 @@ int main() {
     payload_limit_is_read_with_default();
     daykey_paths_gate_reads_by_default();
     daykey_paths_are_configurable_and_can_be_cleared();
+    the_two_path_gates_are_independent_switches();
+    daykey_id_paths_are_configurable();
     jwt_is_off_until_a_secret_is_configured();
     jwt_settings_are_read_and_claim_checks_can_be_switched_off();
     a_jwt_switch_without_a_secret_is_a_startup_error();

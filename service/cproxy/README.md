@@ -58,7 +58,8 @@ probing is visible.
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
-| `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more,/news/photo` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_DAYKEY_PATHS` | `/news/default,/news/featured,/news/more,/news/photo,/news/export` | CSV of paths day-key gated on **every** method, `GET` included; `NONE` disables (an empty value reads as unset) |
+| `CPROXY_DAYKEY_ID_PATHS` | `/news` | CSV of parents whose **document-by-id** children are gated (`<entry>/<guid>`, so `GET /api/v1/news/{id}`); `NONE` disables. Independent of `CPROXY_DAYKEY_PATHS` — a tail match cannot express a route whose last segment varies |
 | `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ every gated request always `500` (the Bearer token is the only credential) |
 | `CPROXY_JWT_REQUIRE_USER` | `false` | `true` ⇒ writes must carry a `user` claim, and any claim present must match a live account |
 | `CPROXY_JWT_ISSUER` | `envfish` | required `iss`; `NONE` skips the check |
@@ -274,6 +275,11 @@ Two arms decide what is gated, and either one is enough:
   docapi write (`river/fish/{guid}`, `river/regulation/{guid}`,
   `region/regulation/{country}[/{state}]`, and anything added later) clears the same check with no
   configuration.
+- **Documents by id** — `CPROXY_DAYKEY_ID_PATHS`, default `/news`: a request for `<entry>/<guid>`
+  is gated, so `GET /api/v1/news/{id}` (the article plus its ~500 KB base64 lead photo) needs the
+  credential while `/news/list` and `/news/search` stay open. Only a canonical 8-4-4-4-12 hex GUID
+  counts, which is what tells the templated route apart from its literal siblings. Added in 0.15.0;
+  a separate switch from the one below, since a tail match cannot name a varying last segment.
 - **Named paths, by path** — `CPROXY_DAYKEY_PATHS`, default
   `/news/default,/news/featured,/news/more,/news/photo`. This is how a **read** is put behind the
   credential. **All four home-page endpoints are listed together on purpose:** docapi 1.8.1 split
