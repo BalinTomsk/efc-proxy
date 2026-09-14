@@ -56,6 +56,7 @@ fishfind.info ──HTTP──►  cproxy :8080  ──HTTP──►  docapi :80
   header is judged as carrying nothing. A wrong or missing token → `500` (deliberately not `401`, so it reads no
   differently from an ordinary server error). Two arms, either one gates: **every POST/PATCH**
   whatever the path, and **every method on a path in `CPROXY_DAYKEY_PATHS`** (default
+  whatever the path, and **every method on a path in ``CPROXY_DAYKEY_ID_PATHS` (default `/news`) gates a **document fetched by id** — `<entry>/<guid>`, i.e. `GET /api/v1/news/{id}`. A separate mechanism because `CPROXY_DAYKEY_PATHS` is a path *tail* match and that route's last segment varies; listing `/news` there would also gate `/news/list` and `/news/search`, which stay open on purpose. Only a canonical 8-4-4-4-12 hex GUID matches. The two lists are independent switches (`NONE` on one does not disable the other). Added 0.15.0.
   `/news/default`, `/news/featured`, `/news/more` and `/news/photo` — this is how a *read* is put
   behind the credential, added 0.7.0; the featured/more entries came in 0.9.1 when docapi 1.8.1 split
   the home page and left them as an unauthenticated bypass, and `/news/photo` came in 0.14.0 with the
