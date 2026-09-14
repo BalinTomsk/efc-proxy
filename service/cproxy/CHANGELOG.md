@@ -49,10 +49,32 @@ tracked. Newest entries first.
     gate negatives plus an *ungated* `/news/list` positive that fails if the id gate is ever widened
     too far — the positive lives in the News folder, not in the negatives folder whose contract is
     "everything here is refused"), `README.md`, `CLAUDE.md`, `docs/specification.md`, `.env.example`.
-  - **NOT DEPLOYED.** Prod is still 0.14.0 (`sha256:8486afeb…268bebd`), so both endpoints remain
-    reachable without a credential until this ships. `deploy/compose.yml` still pins the 0.14.0
-    digest — update it as part of the deploy, and check for a stray `<placeholder>` first per
-    `docs/do-update.md`.
+  - **DEPLOYED and verified live 2026-09-14**, digest
+    `sha256:dc7b9b460ecbdfdc46fa086ac633fc3efac27fc877d253104dbdb833aa229b68`, pinned in
+    `deploy/compose.yml`. `/health` → `0.15.0`, 0 restarts, startup clean (day-key store 3,652 days,
+    user-prime mirror 9 accounts / 6 admins, cloud-range store 3,758 merged ranges, RabbitMQ consumer
+    started, no ERROR/WARN).
+
+    Gate verified in **both** directions, which is the part that matters: with no credential
+    `/news/{id}` and `/news/export/{id}` are now **500** (bare and with a trailing slash), while
+    `/news/list` and `/news/search` are **still 200** — the id gate did not widen onto them. With a
+    valid Bearer token all five clear: `/news/{id}` 975,505 B, `/news/export/{id}`
+    **1,311,889 B** (which confirms it really was the largest unauthenticated surface here, bigger
+    than `/news/featured`'s 1,085,481 B), `/news/list`, `/news/search`, `/news/featured`. Existing
+    guards unchanged: traversal **400** both as `..` and `%2e%2e`, DELETE **405**, no-route **404**.
+
+    `https://fishfind.info/News.aspx` and `Default.aspx` both still render from the gateway
+    afterwards (55,251 B and 43,997 B, byte-identical to before the gate), so the frontend's token
+    path was not disturbed.
+
+    **Verification trap worth remembering:** `curl` collapses `..` client-side, so
+    `curl http://host/api/v1/news/../news/list` reports **200** and looks like the traversal guard
+    has regressed. It has not — the server never sees the dot-dot. Use `curl --path-as-is`.
+
+    The droplet's `/opt/cproxy/compose.yml` was byte-identical to git HEAD before the upload apart
+    from CRLF line endings (an `md5sum` comparison alone suggests drift that is not there — strip
+    `` before comparing). Previous file kept as `compose.yml.bak-0.14.0`; the dotenv was not
+    touched. GHCR logged out on the workstation and both droplets afterwards.
 
 - 2026-09-11: **0.14.0 — `/news/photo` joins the gated home-page paths.** docapi 1.9.0 adds
   `GET /api/v1/news/photo/{id}`, which serves a lead article's photo as raw image bytes — the same
