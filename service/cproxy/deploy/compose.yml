@@ -18,6 +18,12 @@ services:
       # A real process env var would win over the dotenv, which is why this must stay unset.
       CPROXY_ROUTE_PREFIX: /api/
       CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the Bearer JWT below, not open
+      # Raised from the compiled-in 1 MiB default (2026-09-15, at the user's request). AddNews.aspx's
+      # photo-upload PATCH sends a base64-encoded image (+~33% over the raw file) as the request body;
+      # a real phone photo up to ~5MB was hitting the old 1 MiB cap as a plain 413 before reaching
+      # docapi at all. 7340032 = 7 MiB, chosen to comfortably clear a 5MB raw photo's base64 size
+      # (~6.7MB) plus the small JSON wrapper (author/alt) around it.
+      CPROXY_MAX_PAYLOAD_BYTES: "7340032"
       CPROXY_DAYKEY_DB: /etc/cproxy/daykeys.sqlite        # per-day rotating key the JWT's `server` claim must match (see DayKeyStore)
       CPROXY_DOTENV_PATH: /etc/cproxy/.env
       FF_MASTER_KEY_FILE: /etc/cproxy/master.key
