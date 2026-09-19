@@ -9,6 +9,41 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-19: **0.17.1 — a guest's `/news/list` is capped by cproxy itself. DEPLOYED WITH docapi 1.18.1.**
+  0.17.0 stamped the role and left the cap to docapi; the requirement is that cproxy does it. Anyone without a valid `user` claim
+  is a guest, and for them cproxy now forwards `/news/list` with `offset=0&limit=100`.
+
+  No valid `user` claim (no token, a bad one, or
+  a product no live account holds) ⇒ cproxy rewrites the forwarded request: every `limit`/`offset` the caller
+  sent is dropped — percent-encoded spellings included, since docapi decodes them — and `offset=0&limit=100`
+  is appended, other parameters untouched. A user or admin passes through as sent; `/news/search`, `/lake`,
+  `/fish` are not rewritten. docapi's own cap stays as a second layer. Four more `proxy_test` cases; they
+  failed against the tree without the rewrite and pass with it.
+
+  **Deployed order (2026-09-19):** the SQL script was applied first, then cproxy 0.17.0, then docapi 1.18.1 (1.16.0 was failing on
+  any list page it had not cached the moment the procedure changed), then this.
+
+- 2026-09-18: **0.17.0 — every forwarded request carries `X-Fish-Role`. DEPLOYED 2026-09-19** (then superseded by 0.17.1 the same day, which adds the guest cap; digest `729f3d8d…cf3d` is the safe rollback target).
+  docapi 1.18.1 orders `/news/list` by role (admin: last edited first; registered user: article date first;
+  guest: article date first, first 100 rows only) and needs to be told who is asking. cproxy already
+  verifies the credential and holds the account mirror, so it now says so: `X-Fish-Role: guest|user|admin`,
+  set on every request. The role comes from a **verified** token and the mirror — never from a claim in the
+  token (there is still no admin claim) and never from anything the caller sends: an inbound `X-Fish-Role`
+  is dropped like `X-Forwarded-*`. It fails closed to `guest` (no secret, no mirror, unknown account).
+
+  **The open surface stays open.** `/news/list` is not gated and still is not: a token is verified when one
+  is presented, and a missing or bad one is simply a guest. On the gated surface the role is the result of
+  the check that already ran. **One behaviour change to know about:** the account mirror is now opened
+  whenever a JWT secret is set, not only for `CPROXY_JWT_REQUIRE_USER` / `CPROXY_JWT_CLOCK_SYNC`.
+
+  **Deploy order matters** — see `docapi/docs/do-update.md`: SQL script, then docapi 1.18.1, then this. Until
+  this is live docapi sees no header and treats every caller as a guest: safe (capped), not correct.
+  **Tests:** five new cases in `proxy_test` (role from a verified token + mirror; a token that does not
+  verify is a guest and is still served; a caller-supplied header is never forwarded and only one copy
+  arrives; the gated surface stamps the same role; no secret / no mirror ⇒ guest). Verified by building in
+  Docker (`ctest` 10/10) and, test-first, by the original `proxy.cpp` failing the new tests at the first role
+  check. `deploy/compose.yml` still pins 0.15.0 by digest — the digest changes when the image is pushed.
+
 - 2026-09-14: **0.15.0 — `GET /news/{id}` and `/news/export/{id}` join the gated surface.**
   `News.aspx` moved onto this gateway for every piece of news it shows (docapi 1.10.0, same day),
   which made `GET /news/{id}` a per-article-view call returning the article **with its lead photo as

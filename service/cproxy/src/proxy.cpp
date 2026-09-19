@@ -111,11 +111,12 @@ struct ProxyState {
                     ex.what()));
             }
         }
-        // Two consumers: the `user` claim check (CPROXY_JWT_REQUIRE_USER) and, since 0.12.0, the
-        // admin lookup that gates clock alignment (CPROXY_JWT_CLOCK_SYNC). Either one needs the store;
-        // with neither, it is never built and the mirror is never opened.
-        const bool store_needed =
-            cfg.jwt_enabled() && (cfg.jwt_require_user || cfg.jwt_clock_sync);
+        // Three consumers: the `user` claim check (CPROXY_JWT_REQUIRE_USER), since 0.12.0 the admin
+        // lookup that gates clock alignment (CPROXY_JWT_CLOCK_SYNC), and since 0.17.0 the role stamped
+        // on every request as X-Fish-Role. The third applies to every request that carries a token,
+        // gated or not, so the store is needed whenever a token can be verified at all; with no JWT
+        // secret nothing is ever verified, no role is ever anything but guest, and it is never built.
+        const bool store_needed = cfg.jwt_enabled();
         if (store_needed && !cfg.account_mirror_db_path.empty()) {
             user_prime_store.emplace(cfg.account_mirror_db_path, cfg.jwt_user_cache_seconds);
             // Force the first snapshot here so a mirror that is missing, empty, or still dormant is
@@ -167,14 +168,16 @@ bool iequals(const std::string& a, const std::string& b) {
  * Content-Type are also excluded because the httplib client/response sets them itself.
  * X-Forwarded-* and X-Request-Id are excluded because this proxy IS the edge and sets its own
  * authoritative values — and httplib's set_header APPENDS to the multimap, so a copied inbound
- * (possibly spoofed) value would otherwise ride along next to ours.
+ * (possibly spoofed) value would otherwise ride along next to ours. X-Fish-Role is the same case with
+ * higher stakes: docapi trusts it outright, so a caller-supplied copy would be a self-service admin.
  */
 bool is_unforwardable(const std::string& key) {
     static const char* const drop[] = {
         "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
         "te", "trailer", "transfer-encoding", "upgrade", "host",
         "content-length", "content-type",
-        "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-request-id"};
+        "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-request-id",
+        "x-fish-role"};
     for (const char* d : drop) {
         if (iequals(key, d)) return true;
     }
@@ -223,6 +226,73 @@ std::string forward_target(const httplib::Request& req) {
     return target;
 }
 
+/**
+ * How many rows of `GET /news/list` a caller without a valid `user` claim (a guest) can ever be given.
+ * cproxy enforces this itself, by rewriting the request it forwards, so a guest's traffic is bounded
+ * before docapi is even asked -- docapi (1.18.1) applies the same cap as a second layer.
+ */
+constexpr int kGuestNewsListRows = 100;
+
+/** Percent-decodes a query KEY the way an upstream servlet container would, for comparison only. */
+std::string decode_query_key(const std::string& key) {
+    std::string out;
+    out.reserve(key.size());
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        if (key[i] == '%' && i + 2 < key.size() && std::isxdigit(static_cast<unsigned char>(key[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(key[i + 2]))) {
+            out.push_back(static_cast<char>(std::stoi(key.substr(i + 1, 2), nullptr, 16)));
+            i += 2;
+        } else if (key[i] == '+') {
+            out.push_back(' ');
+        } else {
+            out.push_back(key[i]);
+        }
+    }
+    return out;
+}
+
+/** True for the news-list path at any route prefix, case- and trailing-slash-insensitive. */
+bool is_news_list_path(const std::string& path) {
+    std::string p;
+    p.reserve(path.size());
+    for (unsigned char c : path) p.push_back(static_cast<char>(std::tolower(c)));
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    const std::string tail = "/news/list";
+    return p.size() >= tail.size() && p.compare(p.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+/**
+ * A guest's `/news/list` request, rewritten so it can only ask for the first kGuestNewsListRows rows:
+ * every caller-supplied `limit` and `offset` is removed -- however the key is spelled, since the
+ * upstream percent-decodes it and `%6cimit=200` would otherwise sit beside ours -- and
+ * `offset=0&limit=100` is appended. Every other parameter (`country`, ...) is forwarded as sent.
+ * The window is exactly one page: a guest sees the first 100 rows of their country's list and no
+ * more, whatever they ask for.
+ */
+std::string cap_guest_news_list(const std::string& target) {
+    const auto q = target.find('?');
+    const std::string path = target.substr(0, q);
+    std::string kept;
+    if (q != std::string::npos) {
+        const std::string query = target.substr(q + 1);
+        std::size_t pos = 0;
+        while (pos <= query.size()) {
+            std::size_t amp = query.find('&', pos);
+            if (amp == std::string::npos) amp = query.size();
+            const std::string pair = query.substr(pos, amp - pos);
+            pos = amp + 1;
+            if (pair.empty()) continue;
+            const std::string key = decode_query_key(pair.substr(0, pair.find('=')));
+            if (key == "limit" || key == "offset") continue;
+            if (!kept.empty()) kept += '&';
+            kept += pair;
+        }
+    }
+    if (!kept.empty()) kept += '&';
+    kept += "offset=0&limit=" + std::to_string(kGuestNewsListRows);
+    return path + "?" + kept;
+}
+
 void write_error(httplib::Response& res, int status, const std::string& code,
                  const std::string& message) {
     res.status = status;
@@ -260,11 +330,32 @@ bool is_retryable_method(const std::string& method) {
     return method == "GET" || method == "HEAD" || method == "OPTIONS";
 }
 
-/** Outcome of the gated-surface credential check: `ok`, plus a short reason for the LOG only. */
+/**
+ * Outcome of the credential check: `ok`, plus a short reason for the LOG only, plus the `role` a
+ * successful check establishes ("guest", "user" or "admin" — see role_for_claims). `role` is only
+ * meaningful when `ok`; a failed check leaves it "guest".
+ */
 struct CredentialCheck {
     bool ok = false;
     std::string reason;
+    std::string role = "guest";
 };
+
+/**
+ * The role docapi is told about the caller, from the claims of a token that has ALREADY verified.
+ * "guest" unless the `user` product belongs to a live account in THIS service's mirror; "admin" when
+ * that account is a superAdmin (`access == 255`), else "user". Both come from the mirror, never from
+ * the token: the token proves who signed it, not what its holder may do (see JwtClaims — there is
+ * deliberately no admin claim). No mirror, an empty one, or an unknown product all read as "guest":
+ * fail-closed, because docapi uses the role to LIMIT what a caller sees.
+ */
+std::string role_for_claims(ProxyState& state, const JwtClaims& claims,
+                            std::chrono::system_clock::time_point now) {
+    if (claims.user.empty() || !state.user_prime_store.has_value()) return "guest";
+    if (state.user_prime_store->is_admin(claims.user, now)) return "admin";
+    if (state.user_prime_store->is_valid(claims.user, now)) return "user";
+    return "guest";
+}
 
 /**
  * The caller's own clock, from `X-Client-Time` (epoch seconds). False when the header is absent,
@@ -404,7 +495,7 @@ CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
             return {false, "jwt user claim does not match a live account"};
         }
     }
-    return {true, {}};
+    return {true, {}, role_for_claims(state, verified.claims, now)};
 }
 
 /** Forwards one request to the docapi upstream and copies the response back. */
@@ -477,6 +568,13 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // (/news/default first): expensive to assemble, and nothing about GET makes free scraping of it
     // acceptable. Both the decoded path and the raw target are tested, and either one matching
     // gates the request — the union is the fail-secure direction.
+    //
+    // The caller's ROLE (X-Fish-Role, set below) comes out of the same check. On the gated surface it
+    // is the check that already ran. On an ungated path — /news/list is deliberately one, and stays
+    // open — a token is verified when one is presented, and its absence or failure is not an error:
+    // it just means "guest". So the open surface stays open, and docapi can still tell a registered
+    // user or an admin from an anonymous caller without ever being asked to believe the caller.
+    std::string role = "guest";
     if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const CredentialCheck credential =
             check_gate_credential(cfg, state, req, state.clock.now());
@@ -486,6 +584,18 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
                         req.remote_addr, rid);
             return;
         }
+        role = credential.role;
+    } else if (!req.get_header_value("Authorization").empty()) {
+        const CredentialCheck credential =
+            check_gate_credential(cfg, state, req, state.clock.now());
+        if (credential.ok) role = credential.role;
+    }
+
+    // A guest -- no token, a token that does not verify, or one whose `user` product is not a live
+    // account -- gets the first kGuestNewsListRows rows of the news list and nothing else. Enforced
+    // here, on the request docapi is sent, rather than left to the caller to ask for politely.
+    if (role == "guest" && is_news_list_path(target_path)) {
+        target = cap_guest_news_list(target);
     }
 
     // Fail fast while the breaker is open: an outage would otherwise make every request pay the
@@ -520,6 +630,9 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     out.set_header("X-Forwarded-Host", req.get_header_value("Host"));
     out.set_header("X-Forwarded-Proto", "http");
     out.set_header("X-Request-Id", rid);
+    // The verified role. The inbound X-Fish-Role, if any, was dropped by is_unforwardable, so this is
+    // the only one docapi ever sees.
+    out.set_header("X-Fish-Role", role.c_str());
 
     httplib::Client& cli = pooled_client(cfg);
     auto started = std::chrono::steady_clock::now();
