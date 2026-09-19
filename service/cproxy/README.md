@@ -333,6 +333,18 @@ loaded` reports a non-zero account count before turning it on. Gated **reads** s
 either way: `/news/featured` and `/news/more` are the public home page, and the gate there is against
 scraping, not reading.
 
+### Caller role — `X-Fish-Role` (0.17.0)
+
+Every forwarded request carries `X-Fish-Role: guest | user | admin`, which docapi uses to order
+`/news/list` (admin: last edited first; registered user: article date first; guest: article date first,
+first 100 rows only). It is derived from a **verified** token and cproxy's account mirror — `admin` is a
+superAdmin (`access == 255`), `user` any other live account, `guest` everything else, including no token, a
+bad token, no JWT secret and no mirror (fail-closed). Any `X-Fish-Role` a caller sends is dropped. It never
+blocks a request: `/news/list` stays open, and a token that does not verify is just a guest. **A guest's
+`/news/list` is forwarded as `offset=0&limit=100`** (any `limit`/`offset` they sent is dropped), so a guest can
+only ever be given the first 100 rows; a user or admin is forwarded untouched. The account
+mirror is opened whenever a JWT secret is configured.
+
 ## Tests
 
 `ctest` runs nine suites: `config_test` (config parsing — defaults, overrides, method allow-list,

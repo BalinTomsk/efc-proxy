@@ -46,6 +46,10 @@ void install_fake_upstream(httplib::Server& s) {
     s.Get(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("X-Got-XFF", req.get_header_value("X-Forwarded-For"));
         res.set_header("X-Got-Reqid", req.get_header_value("X-Request-Id"));
+        // What docapi would see as the caller's role, and HOW MANY copies of the header arrived: a
+        // caller-supplied one must never ride along beside cproxy's own.
+        res.set_header("X-Got-Role", req.get_header_value("X-Fish-Role"));
+        res.set_header("X-Got-Role-Count", std::to_string(req.get_header_value_count("X-Fish-Role")));
         res.set_content("upstream:" + req.target, "text/plain");
     });
 }
@@ -399,10 +403,11 @@ void gated_read_path_requires_a_bearer_token() {
     auto dodge = cli.Get("/api/v1/news/default/../default");
     CHECK(dodge && dodge->status == 400);
 
-    // Sibling news reads are untouched — no credential, still served.
+    // Sibling news reads stay open — no credential, still served. An anonymous caller is a guest, so
+    // the list is forwarded capped to the first 100 rows (see the guest-cap tests below).
     auto list = cli.Get("/api/v1/news/list?country=CA");
     CHECK(list && list->status == 200);
-    CHECK(list->body == "upstream:/api/v1/news/list?country=CA");
+    CHECK(list->body == "upstream:/api/v1/news/list?country=CA&offset=0&limit=100");
     auto fish = cli.Get("/api/v1/fish?water=fresh");
     CHECK(fish && fish->status == 200);
 
@@ -978,6 +983,228 @@ void upstream_connection_is_reused_across_requests() {
     CHECK(peers.size() == 1);  // pre-0.5.0 this was 5 - a fresh connection per request
 }
 
+// ---- X-Fish-Role (0.17.0) --------------------------------------------------------------------------
+//
+// docapi orders /news/list by role (admin: last edited, others: article date) and caps a guest at the
+// first 100 rows, and it can only do that if it knows who is asking. cproxy is the one that verified
+// the credential, so it says so, in a header docapi trusts outright. These pin the two halves of that
+// trust: the role is derived from a VERIFIED token and the accounts mirror, and nothing the caller
+// sends can stand in for it.
+
+/** The role the upstream saw for GET /news/list with these headers (which is UNGATED: it never 500s). */
+std::string role_seen_on_the_open_list(httplib::Client& cli, const httplib::Headers& headers,
+                                       std::string* count = nullptr) {
+    auto r = cli.Get("/api/v1/news/list?country=CA", headers);
+    CHECK(r && r->status == 200);
+    if (count != nullptr) *count = r->get_header_value("X-Got-Role-Count");
+    return r->get_header_value("X-Got-Role");
+}
+
+void the_role_is_stamped_from_a_verified_token_and_the_mirror() {
+    ClockSyncFixture fx("proxy_test_role", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+    std::string count;
+
+    // No credential at all: the open surface stays open, and the caller is a guest.
+    CHECK(role_seen_on_the_open_list(cli, {}, &count) == "guest");
+    CHECK(count == "1");  // always stamped, so docapi never has to guess at an absent header
+
+    // A verified token with no `user` claim is an anonymous visitor's token.
+    CHECK(role_seen_on_the_open_list(cli, {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}}) ==
+          "guest");
+    // ...an ordinary account,
+    CHECK(role_seen_on_the_open_list(
+              cli, {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))}}) == "user");
+    // ...and a superAdmin. The privilege is the MIRROR's, not the token's.
+    CHECK(role_seen_on_the_open_list(
+              cli, {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))}}) == "admin");
+}
+
+void a_token_that_does_not_verify_is_a_guest_and_is_still_served() {
+    ClockSyncFixture fx("proxy_test_role_bad", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    // Signed with the wrong secret: an admin's product, but not a token cproxy can believe.
+    CHECK(role_seen_on_the_open_list(
+              cli, {{"Authorization",
+                     bearer(mint_token("TEST-DAY-KEY", kAdminProduct, "not-the-signing-secret"))}}) ==
+          "guest");
+    // A good signature over a day-key that is not today's: the leaked-secret case the day-key
+    // rotation exists to deny.
+    CHECK(role_seen_on_the_open_list(
+              cli, {{"Authorization", bearer(mint_token("NOT-TODAYS-KEY", kAdminProduct))}}) == "guest");
+    // A well-formed product no live account holds.
+    CHECK(role_seen_on_the_open_list(
+              cli, {{"Authorization", bearer(mint_token("TEST-DAY-KEY", "999999999999"))}}) == "guest");
+    // Not a bearer credential, and not even a token.
+    CHECK(role_seen_on_the_open_list(cli, {{"Authorization", "Basic " + mint_token("TEST-DAY-KEY")}}) ==
+          "guest");
+    CHECK(role_seen_on_the_open_list(cli, {{"Authorization", "Bearer junk"}}) == "guest");
+}
+
+void a_caller_supplied_role_header_is_never_forwarded() {
+    ClockSyncFixture fx("proxy_test_role_spoof", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+    std::string count;
+
+    // The whole point: an anonymous caller claiming to be an admin is a guest, and there is exactly
+    // ONE X-Fish-Role upstream (cproxy's), not two.
+    CHECK(role_seen_on_the_open_list(cli, {{"X-Fish-Role", "admin"}}, &count) == "guest");
+    CHECK(count == "1");
+    CHECK(role_seen_on_the_open_list(cli, {{"x-fish-role", "ADMIN"}}, &count) == "guest");
+    CHECK(count == "1");
+
+    // And a real user cannot promote themselves by adding it.
+    CHECK(role_seen_on_the_open_list(
+              cli,
+              {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))},
+               {"X-Fish-Role", "admin"}},
+              &count) == "user");
+    CHECK(count == "1");
+}
+
+void the_gated_surface_stamps_the_same_role() {
+    ClockSyncFixture fx("proxy_test_role_gated", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    // /news/default is gated, so this is the role taken from the credential check that let it in.
+    auto admin = cli.Get("/api/v1/news/default",
+                         {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))},
+                          {"X-Fish-Role", "guest"}});
+    CHECK(admin && admin->status == 200);
+    CHECK(admin->get_header_value("X-Got-Role") == "admin");
+    CHECK(admin->get_header_value("X-Got-Role-Count") == "1");
+
+    auto anon = cli.Get("/api/v1/news/default", {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}});
+    CHECK(anon && anon->status == 200);
+    CHECK(anon->get_header_value("X-Got-Role") == "guest");
+}
+
+void without_a_secret_or_a_mirror_everyone_is_a_guest() {
+    // No JWT secret: nothing is ever verified, so a token proves nothing.
+    {
+        TestServer up;
+        install_fake_upstream(up.server);
+        up.start();
+        Config cfg;
+        cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+        TestServer proxy;
+        install_routes(proxy.server, cfg);
+        proxy.start();
+        httplib::Client cli("127.0.0.1", proxy.port);
+        CHECK(role_seen_on_the_open_list(
+                  cli, {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))}}) ==
+              "guest");
+    }
+    // A secret and a day-key store but NO account mirror: the token verifies, yet there is no way to
+    // say who it belongs to, so it cannot be more than a guest. Fail-closed, since docapi uses the
+    // role to limit what is shown.
+    {
+        TestServer up;
+        install_fake_upstream(up.server);
+        up.start();
+        const std::string db = "proxy_test_role_nomirror.sqlite";
+        write_uniform_day_key_db(db, "TEST-DAY-KEY");
+        Config cfg;
+        cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+        cfg.daykey_db_path = db;
+        cfg.jwt_secret = kTestJwtSecret;
+        TestServer proxy;
+        install_routes(proxy.server, cfg);
+        proxy.start();
+        httplib::Client cli("127.0.0.1", proxy.port);
+        CHECK(role_seen_on_the_open_list(
+                  cli, {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))}}) ==
+              "guest");
+        std::remove(db.c_str());
+    }
+}
+
+// ---- the guest cap on /news/list (0.17.0) -----------------------------------------------------------
+//
+// A caller without a valid `user` claim is a guest, and cproxy itself makes sure a guest can only ever
+// be given the first 100 rows: it rewrites the request it forwards. The fake upstream echoes the raw
+// target, so these read exactly what docapi would have been asked for.
+
+/** The target the upstream received for `target`, sent with `headers`. */
+std::string forwarded_target(httplib::Client& cli, const std::string& target,
+                             const httplib::Headers& headers = {}) {
+    auto r = cli.Get(target, headers);
+    CHECK(r && r->status == 200);
+    const std::string body = r->body;
+    CHECK(body.rfind("upstream:", 0) == 0);
+    return body.substr(std::string("upstream:").size());
+}
+
+void a_guest_can_only_ask_for_the_first_hundred_rows() {
+    ClockSyncFixture fx("proxy_test_guestcap", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    // No credential at all: whatever was asked for, docapi is asked for offset 0, limit 100.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?country=CA&limit=200&offset=50") ==
+          "/api/v1/news/list?country=CA&offset=0&limit=100");
+    // No query string at all.
+    CHECK(forwarded_target(cli, "/api/v1/news/list") == "/api/v1/news/list?offset=0&limit=100");
+    // A smaller limit is raised to 100 too: the guest window is one whole page.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=5") == "/api/v1/news/list?offset=0&limit=100");
+    // Repeated and mixed-case-path spellings cannot smuggle a second value past it.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=5&limit=200&offset=1&offset=900") ==
+          "/api/v1/news/list?offset=0&limit=100");
+    CHECK(forwarded_target(cli, "/api/v1/News/List/?limit=200") == "/api/v1/News/List/?offset=0&limit=100");
+    // A percent-encoded key is decoded by the upstream, so it must be caught here as well.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?%6cimit=200&%6Fffset=500&country=US") ==
+          "/api/v1/news/list?country=US&offset=0&limit=100");
+    // Only limit and offset are touched; every other parameter is forwarded exactly as sent.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?country=CA&x=1&y=%20z") ==
+          "/api/v1/news/list?country=CA&x=1&y=%20z&offset=0&limit=100");
+}
+
+void a_bad_or_anonymous_token_is_capped_like_no_token() {
+    ClockSyncFixture fx("proxy_test_guestcap_bad", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+    const std::string capped = "/api/v1/news/list?offset=0&limit=100";
+
+    // A verified token with no `user` claim (an anonymous visitor's token).
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=200",
+                           {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}}) == capped);
+    // A `user` product no live account holds.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=200",
+                           {{"Authorization", bearer(mint_token("TEST-DAY-KEY", "999999999999"))}}) == capped);
+    // Signed with the wrong secret, and a day-key that is not today's.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=200",
+                           {{"Authorization",
+                             bearer(mint_token("TEST-DAY-KEY", kAdminProduct, "not-the-signing-secret"))}}) ==
+          capped);
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=200",
+                           {{"Authorization", bearer(mint_token("NOT-TODAYS-KEY", kAdminProduct))}}) == capped);
+    // Junk, and a spoofed role header on top of nothing.
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=200", {{"Authorization", "Bearer junk"}}) == capped);
+    CHECK(forwarded_target(cli, "/api/v1/news/list?limit=200", {{"X-Fish-Role", "admin"}}) == capped);
+}
+
+void a_registered_user_and_an_admin_are_not_capped() {
+    ClockSyncFixture fx("proxy_test_guestcap_user", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+    const std::string asked = "/api/v1/news/list?country=CA&offset=150&limit=50";
+
+    CHECK(forwarded_target(cli, asked,
+                           {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))}}) == asked);
+    CHECK(forwarded_target(cli, asked,
+                           {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))}}) == asked);
+}
+
+void only_the_news_list_is_rewritten() {
+    ClockSyncFixture fx("proxy_test_guestcap_scope", false);
+    httplib::Client cli("127.0.0.1", fx.proxy.port);
+
+    for (const std::string t : {"/api/v1/news/search?q=walleye&limit=200&offset=300",
+                                "/api/v1/fish/search?q=trout&limit=200",
+                                "/api/v1/news/lake/00000000-0000-0000-0000-000000000000?limit=50",
+                                "/api/v1/news/listing?limit=200"}) {
+        CHECK(forwarded_target(cli, t) == t);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1006,6 +1233,15 @@ int main() {
     ready_reports_upstream_state_and_breaker_fails_fast();
     metrics_expose_counters();
     upstream_connection_is_reused_across_requests();
+    the_role_is_stamped_from_a_verified_token_and_the_mirror();
+    a_token_that_does_not_verify_is_a_guest_and_is_still_served();
+    a_caller_supplied_role_header_is_never_forwarded();
+    the_gated_surface_stamps_the_same_role();
+    without_a_secret_or_a_mirror_everyone_is_a_guest();
+    a_guest_can_only_ask_for_the_first_hundred_rows();
+    a_bad_or_anonymous_token_is_capped_like_no_token();
+    a_registered_user_and_an_admin_are_not_capped();
+    only_the_news_list_is_rewritten();
     std::cout << "proxy_test: all assertions passed\n";
     return 0;
 }
