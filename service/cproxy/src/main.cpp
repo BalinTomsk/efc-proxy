@@ -95,11 +95,14 @@ int main() {
     cproxy::log_raw(std::format(
         "{{\"service\":\"cproxy\",\"version\":\"{}\",\"msg\":\"starting\","
         "\"listen\":\"{}:{}\",\"route_prefix\":\"{}\",\"docapi_upstream\":\"{}\","
+        "\"waterapi\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
         "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\","
         "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
+        cfg.waterapi_enabled() ? std::format("{} -> {}", cfg.waterapi_prefix, cfg.waterapi_upstream)
+                               : std::string("off"),
         cfg.auth_required() ? "true" : "false",
         cfg.allowed_methods.empty() ? "ALL" : "restricted",
         cfg.log_dir.empty() ? "(stdout only)" : cfg.log_dir,
@@ -129,6 +132,14 @@ int main() {
         cproxy::log_raw(
             "{\"service\":\"cproxy\",\"level\":\"ERROR\",\"msg\":\"CPROXY_JWT_SECRET is unset: "
             "every gated request (POST, PATCH, CPROXY_DAYKEY_PATHS) will answer 500\"}");
+    }
+    // Same fail-closed outcome for a secret with no audience: the audience has no compiled default, so
+    // a dotenv without CPROXY_JWT_AUDIENCE refuses every token.
+    if (cfg.jwt_enabled() && !cfg.jwt_audience_configured) {
+        cproxy::log_raw(
+            "{\"service\":\"cproxy\",\"level\":\"ERROR\",\"msg\":\"CPROXY_JWT_AUDIENCE is unset: "
+            "every token is refused, so every gated request (POST, PATCH, CPROXY_DAYKEY_PATHS) will "
+            "answer 500 (set it, or NONE to skip the claim)\"}");
     }
     // The switch that used to decide whether the bare X-Day-Guid header was still honoured is gone.
     // Say so if a leftover compose file still sets it, so nobody mistakes "false" for a rollback.

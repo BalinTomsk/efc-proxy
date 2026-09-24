@@ -6,9 +6,9 @@
 namespace cproxy {
 
 /**
- * The claim set the frontend mints for a gated call, matching `fishfind-frontend/doc/envfish-jwt.html`:
+ * The claim set the frontend mints for a gated call, matching the frontend's `doc/envfish-jwt.html`:
  *
- *   { "iss":"envfish", "iat":…, "exp":<end of the current UTC day>, "aud":"fishfind.info",
+ *   { "iss":"envfish", "iat":…, "exp":<end of the current UTC day>, "aud":"<portal hostname>",
  *     "sub":"cproxy", "server":"<dbo.day_keys.guid for today>",
  *     "user":"<Users.prime * Users_Prime.prime for today>" }
  *

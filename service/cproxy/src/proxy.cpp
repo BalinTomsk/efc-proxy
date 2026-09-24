@@ -15,6 +15,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <unordered_map>
 
 #include "breaker.hpp"
 #include "clock_offset.hpp"
@@ -69,6 +70,9 @@ struct Metrics {
  */
 struct ProxyState {
     CircuitBreaker breaker;
+    // The waterapi route's own breaker (0.18.0). Separate on purpose: waterapi is on another droplet,
+    // and one shared breaker would let a waterapi outage fail-fast every docapi request too.
+    CircuitBreaker water_breaker;
     Metrics metrics;
     // Loaded best-effort: a missing/malformed day-key database must not take down the ungated GET
     // surface, so a load failure here just leaves this empty — every gated request then fails closed
@@ -92,7 +96,8 @@ struct ProxyState {
     ClockOffset clock;
 
     explicit ProxyState(const Config& cfg, CloudRangeStore* shared_ranges)
-        : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
+        : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
+          water_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
         if (shared_ranges != nullptr) cloud_ranges = shared_ranges;
         if (!cfg.daykey_db_path.empty()) {
             try {
@@ -301,20 +306,27 @@ void write_error(httplib::Response& res, int status, const std::string& code,
 }
 
 /**
- * The upstream client for THIS worker thread, kept alive between requests.
+ * The client for `origin` on THIS worker thread, kept alive between requests.
  *
  * A fresh Client per request meant a TCP connect + teardown on every call. httplib's Client keeps
  * the socket open and checks it is still alive before reuse, so the steady state is one connection
- * per worker thread. It is thread_local rather than shared because a single Client serializes
- * concurrent requests on its own mutex, which would defeat the point.
+ * per worker thread per upstream. It is thread_local rather than shared because a single Client
+ * serializes concurrent requests on its own mutex, which would defeat the point. Keyed by origin
+ * since 0.18.0, when waterapi became a second upstream.
  */
-httplib::Client& pooled_client(const Config& cfg) {
-    thread_local std::string bound_upstream;
-    thread_local std::unique_ptr<httplib::Client> client;
-    if (!client || bound_upstream != cfg.docapi_upstream) {
-        client = std::make_unique<httplib::Client>(cfg.docapi_upstream);
+httplib::Client& pooled_client(const Config& cfg, const std::string& origin) {
+    thread_local std::unordered_map<std::string, std::unique_ptr<httplib::Client>> clients;
+    std::unique_ptr<httplib::Client>& client = clients[origin];
+    if (!client) {
+        client = std::make_unique<httplib::Client>(origin);
         client->set_keep_alive(true);
-        bound_upstream = cfg.docapi_upstream;
+        // Pass the upstream's body through byte for byte. This build has no zlib/brotli, and with
+        // decompression on, httplib REFUSES a gzip/br body (it fails the read, which surfaced as a
+        // 502) instead of forwarding it. A proxy should not decode anyway: the caller asked for the
+        // encoding via its own Accept-Encoding, which is forwarded, and the Content-Encoding header is
+        // copied back with the untouched bytes. waterapi compresses whenever asked; docapi does not,
+        // so this was latent until 0.18.0.
+        client->set_decompress(false);
     }
     // Re-applied per request so a config change is picked up without rebuilding the connection.
     client->set_connection_timeout(0, cfg.connect_timeout_ms * 1000);
@@ -454,6 +466,8 @@ CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
                                       const httplib::Request& req,
                                       std::chrono::system_clock::time_point now) {
     if (!cfg.jwt_enabled()) return {false, "jwt not configured (CPROXY_JWT_SECRET unset)"};
+    // Fail closed rather than skip the claim: an audience nobody configured is not "any audience".
+    if (!cfg.jwt_audience_configured) return {false, "jwt audience not configured (CPROXY_JWT_AUDIENCE unset)"};
 
     const std::string token = bearer_token(req.get_header_value("Authorization"));
     if (token.empty()) return {false, "no bearer token presented"};
@@ -498,7 +512,27 @@ CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
     return {true, {}, role_for_claims(state, verified.claims, now)};
 }
 
-/** Forwards one request to the docapi upstream and copies the response back. */
+/** Where one request goes: the upstream's name (for messages), its origin, and its breaker. */
+struct Upstream {
+    const char* name;
+    const std::string& origin;
+    CircuitBreaker& breaker;
+};
+
+/**
+ * docapi, or waterapi for a path under CPROXY_WATERAPI_PREFIX. Chosen from the DECODED path (the
+ * form both upstreams route on), after the dot-dot rejection, so a request cannot be re-pointed at
+ * the other upstream once chosen.
+ */
+Upstream select_upstream(const Config& cfg, ProxyState& state, const httplib::Request& req) {
+    if (cfg.routes_to_waterapi(req.path)) return {"waterapi", cfg.waterapi_upstream, state.water_breaker};
+    return {"docapi", cfg.docapi_upstream, state.breaker};
+}
+
+/**
+ * Forwards one request to its upstream (docapi, or waterapi for the water prefix) and copies the
+ * response back. Every guard below applies to both upstreams identically.
+ */
 void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Request& req,
                      httplib::Response& res) {
     const std::string rid = request_id(req);
@@ -598,9 +632,11 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         target = cap_guest_news_list(target);
     }
 
+    const Upstream upstream = select_upstream(cfg, state, req);
+
     // Fail fast while the breaker is open: an outage would otherwise make every request pay the
     // full connect timeout and hold a worker thread for it.
-    if (!state.breaker.allow(std::chrono::steady_clock::now())) {
+    if (!upstream.breaker.allow(std::chrono::steady_clock::now())) {
         state.metrics.observe_short_circuit();
         write_error(res, 502, "upstream_unavailable",
                     "Upstream is unavailable (circuit breaker open)");
@@ -634,13 +670,25 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // the only one docapi ever sees.
     out.set_header("X-Fish-Role", role.c_str());
 
-    httplib::Client& cli = pooled_client(cfg);
+    // A 304 has no body (RFC 9110 §15.4.5), but the pinned httplib (v0.15.3) only knows that about
+    // 204: for a 304 sent without Content-Length -- which is how Kestrel sends one -- it reads
+    // "until close" and sits out the whole read timeout (10 s) before answering. waterapi's ETag
+    // revalidation hit exactly that. So stop at the headers of a 304: the handler keeps them and
+    // cancels the body read, and the cancelled exchange is then treated as the complete response it is.
+    std::optional<httplib::Response> not_modified;
+    out.response_handler = [&not_modified](const httplib::Response& head) {
+        if (head.status != 304) return true;
+        not_modified = head;
+        return false;
+    };
+
+    httplib::Client& cli = pooled_client(cfg, upstream.origin);
     auto started = std::chrono::steady_clock::now();
     auto result = cli.send(out);
     // A pooled connection the upstream closed while idle fails on first use through no fault of
     // this request; one retry (idempotent methods only) turns that into a normal response instead
     // of a spurious 502. httplib drops the dead socket on failure, so the retry reconnects.
-    if (!result && cfg.upstream_retry > 0 && is_retryable_method(req.method)) {
+    if (!result && !not_modified && cfg.upstream_retry > 0 && is_retryable_method(req.method)) {
         state.metrics.observe_retry();
         result = cli.send(out);
     }
@@ -648,10 +696,13 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
                     std::chrono::steady_clock::now() - started)
                     .count();
 
-    if (!result) {
-        state.breaker.on_failure(std::chrono::steady_clock::now());
+    // The upstream's answer: the full response, or the headers of a 304 whose (empty) body read was
+    // cancelled on purpose above. Neither means a transport failure.
+    const httplib::Response* answer = result ? &*result : (not_modified ? &*not_modified : nullptr);
+    if (answer == nullptr) {
+        upstream.breaker.on_failure(std::chrono::steady_clock::now());
         state.metrics.observe_failure();
-        write_error(res, 502, "bad_gateway", "Upstream docapi is unreachable");
+        write_error(res, 502, "bad_gateway", std::format("Upstream {} is unreachable", upstream.name));
         log_request(std::format("{} {} -> 502 (upstream error {}, {}ms)", req.method, req.path,
                                 httplib::to_string(result.error()), took),
                     req.remote_addr, rid);
@@ -659,17 +710,17 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     }
     // Reachable upstream: an HTTP error status is the upstream's answer, not a transport failure,
     // so it closes the breaker like any other response.
-    state.breaker.on_success();
+    upstream.breaker.on_success();
     state.metrics.observe_exchange(took);
 
-    res.status = result->status;
-    std::string content_type = result->get_header_value("Content-Type");
+    res.status = answer->status;
+    std::string content_type = answer->get_header_value("Content-Type");
     if (content_type.empty()) content_type = "application/octet-stream";
-    for (const auto& [k, v] : result->headers) {
+    for (const auto& [k, v] : answer->headers) {
         if (!is_unforwardable(k)) res.set_header(k.c_str(), v.c_str());
     }
-    res.set_content(result->body, content_type.c_str());
-    log_request(std::format("{} {} -> {} ({}ms)", req.method, req.path, result->status, took),
+    res.set_content(answer->body, content_type.c_str());
+    log_request(std::format("{} {} -> {} ({}ms)", req.method, req.path, answer->status, took),
                 req.remote_addr, rid);
 }
 
@@ -686,7 +737,7 @@ std::string regex_escape(const std::string& s) {
 }
 
 /** Prometheus text exposition of the current counters. */
-std::string render_metrics(const ProxyState& state) {
+std::string render_metrics(const ProxyState& state, bool waterapi_enabled) {
     std::string out;
     {
         std::lock_guard<std::mutex> lock(state.metrics.mu);
@@ -713,6 +764,12 @@ std::string render_metrics(const ProxyState& state) {
     out += "# TYPE cproxy_breaker_state gauge\n";
     out += std::format("cproxy_breaker_state {}\n",
                        static_cast<int>(state.breaker.state(std::chrono::steady_clock::now())));
+    if (waterapi_enabled) {
+        out += "# HELP cproxy_waterapi_breaker_state waterapi circuit breaker: 0 closed, 1 open, 2 half-open.\n";
+        out += "# TYPE cproxy_waterapi_breaker_state gauge\n";
+        out += std::format("cproxy_waterapi_breaker_state {}\n",
+                           static_cast<int>(state.water_breaker.state(std::chrono::steady_clock::now())));
+    }
     return out;
 }
 
@@ -737,18 +794,25 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
 
     // Readiness: can this proxy currently serve useful traffic? Reports the breaker's view of the
     // upstream (503 while open) rather than probing on demand, which would hammer a sick upstream.
-    server.Get("/health/ready", [state](const httplib::Request&, httplib::Response& res) {
-        const auto s = state->breaker.state(std::chrono::steady_clock::now());
+    // Readiness follows docapi ONLY: it carries almost all traffic, and a waterapi outage must not
+    // make an orchestrator pull the whole edge. The waterapi breaker is reported alongside.
+    server.Get("/health/ready", [state, &cfg](const httplib::Request&, httplib::Response& res) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto s = state->breaker.state(now);
         const bool ready = s != CircuitBreaker::State::Open;
         res.status = ready ? 200 : 503;
+        const std::string water =
+            cfg.waterapi_enabled()
+                ? std::format(",\"waterapi\":\"{}\"", to_string(state->water_breaker.state(now)))
+                : std::string{};
         res.set_content(
-            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"}}",
-                        ready ? "UP" : "DOWN", to_string(s)),
+            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"{}}}",
+                        ready ? "UP" : "DOWN", to_string(s), water),
             "application/json");
     });
 
-    server.Get("/metrics", [state](const httplib::Request&, httplib::Response& res) {
-        res.set_content(render_metrics(*state), "text/plain; version=0.0.4");
+    server.Get("/metrics", [state, &cfg](const httplib::Request&, httplib::Response& res) {
+        res.set_content(render_metrics(*state, cfg.waterapi_enabled()), "text/plain; version=0.0.4");
     });
 
     // Real per-method routes, NOT a pre_routing_handler: httplib runs pre-routing BEFORE reading

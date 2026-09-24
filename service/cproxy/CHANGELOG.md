@@ -9,6 +9,69 @@ tracked. Newest entries first.
 > The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-24: **0.19.0 — no portal name in the public source; three settings now come only from the
+  private dotenv. NOT DEPLOYED.** The portal's name has been removed from source, comments, tests and
+  every tracked doc (hostnames are written `<portal>`). Three values used to be compiled defaults, and
+  one was also set in the public `deploy/compose.yml`; none has a default now:
+  - **`CPROXY_JWT_AUDIENCE`** (the portal hostname). Unset is **not** "skip the check": with a secret set,
+    every token is refused (the gated surface fails closed) and startup logs an ERROR. `NONE` is still the
+    explicit way to skip the claim. New `Config::jwt_audience_configured`.
+  - **`CPROXY_RABBITMQ_USERNAME`** and **`CPROXY_RABBITMQ_QUEUE`**. Unset with events enabled disables only
+    the account mirror, as the existing `rabbitmq_config_problems` path already did; the proxy keeps
+    serving. With `CPROXY_JWT_REQUIRE_USER=true`, though, an empty mirror refuses every write.
+  - **Account event types** are matched on the part after the producer's namespace (`<ns>.account.user` →
+    `account.user`, and the same for `api_key`, `user_sync`, `user_prime_sync`). Nothing to configure;
+    the events only arrive from our own authenticated queue.
+
+  **Deploy prerequisite:** append `CPROXY_JWT_AUDIENCE`, `CPROXY_RABBITMQ_USERNAME` and
+  `CPROXY_RABBITMQ_QUEUE`, with the values prod uses today, to the volume dotenv **before** this image or
+  this `compose.yml` goes up. Without them every gated request answers 500. Tests: `config_test`
+  (audience set only via the environment, empty stays unconfigured, missing broker names reported) and a
+  new `proxy_test` case `no_audience_shuts_the_gated_surface`. The golden frontend-minted tokens now
+  verify with the audience comparison off; their signed `aud` is not spelled out here. 10/10 pass.
+
+- 2026-09-23: **0.18.0 — second upstream: waterapi. DEPLOYED 2026-09-24**, digest `0d7653901db2…4c72`
+  (rollback: 0.17.1 `2ebfa416bd14…b94b`; the droplet keeps `compose.yml.bak-0.17.1` and `.env.bak-prewater`).
+  Rolled out in two steps: first the image with the route off, verified docapi unaffected. Then
+  `CPROXY_WATERAPI_UPSTREAM` was appended to the volume dotenv and the container recreated. Verified at
+  the edge: US map 200 (987 KB; 281 KB brotli), ETag 304 in 34 ms, sid 200, MX 400, readiness
+  `"waterapi":"closed"`, docapi routes unchanged. The private link is VPC peering `<vpc-cidr>` ↔
+  `<second-droplet>`'s VPC, with routes installed by DigitalOcean's `vpc-peering.service`. waterapi itself
+  needed a 0.1.1 fix: it selected its public endpoints by Host header, which 404'd every gateway request.
+  Requests under `CPROXY_WATERAPI_PREFIX` (default `/api/v1/water/`) now go to `CPROXY_WATERAPI_UPSTREAM`,
+  the new C# station-map API (`efcs-backend/service/waterapi`) on `<second-droplet>`, instead of docapi.
+  The frontend map gets one gateway and one credential for both backends. waterapi gets its own path
+  namespace because docapi already owns `/api/v1/station/{id}`. Unset upstream (the default) means no
+  water route, so behaviour is unchanged until the dotenv carries the address.
+
+  - **Same guards, own breaker.** Water requests pass every check docapi traffic does, in the same order:
+    datacenter block, method allow-list, API key, dot-dot rejection, credential gate, and `X-Fish-Role`
+    stamping with the inbound copy dropped. The upstream is chosen from the decoded path after the dot-dot
+    check. The route has a **separate circuit breaker**, so a waterapi outage can never fail-fast docapi
+    requests. `/health/ready` still follows docapi only and reports `"waterapi":"<state>"` beside it;
+    `/metrics` adds `cproxy_waterapi_breaker_state`.
+  - **Fixed: compressed upstream bodies were refused (latent since 0.1.0).** httplib, built without
+    zlib/brotli, rejects a `Content-Encoding: gzip`/`br` body rather than forwarding it, and the proxy
+    answered 502. docapi never compresses, so this never showed; waterapi compresses whenever asked. The
+    pooled client now runs with `set_decompress(false)`: bytes and `Content-Encoding` pass through
+    untouched, and the caller's own `Accept-Encoding` is what was forwarded. The US map is 987 KB plain and
+    281 KB brotli.
+  - **Fixed: a `304 Not Modified` took the full read timeout.** The pinned httplib (v0.15.3) skips the body
+    only for 204. A 304 without `Content-Length`, which is how Kestrel sends one, was read "until close",
+    so an ETag revalidation cost 10 s instead of 2 ms. A `response_handler` now stops at the headers of any
+    304, and that answer counts as a success.
+  - The pooled client is keyed per upstream. The startup line gains `"waterapi":"<prefix> -> <origin>"` or
+    `"off"`. `validate_config` rejects a schemeless upstream, and any prefix that is not strictly inside
+    `CPROXY_ROUTE_PREFIX`.
+  - Tests: `config_test` +4, `proxy_test` +6 (routing, no-upstream fallback, breaker isolation,
+    compressed pass-through, guards on the water route, prompt 304). The compression and 304 tests were
+    each run against the tree without their fix and failed: a 502, and a 3 s stall. Then 10/10 passed.
+    An end-to-end run of both real images in the Rancher VM (cproxy → waterapi → production view,
+    read-only) returned 200 plain and brotli, 304 in 2 ms, 400 envelope, sid lookup, and readiness showing
+    both breakers.
+  - **Transport to `<second-droplet>` is still to be settled.** It is not in cproxy's VPC, so there is
+    no private route today. See `docs/do-update.md`.
+
 - 2026-09-19: **0.17.1 — a guest's `/news/list` is capped by cproxy itself. DEPLOYED WITH docapi 1.18.1.**
   0.17.0 stamped the role and left the cap to docapi; the requirement is that cproxy does it. Anyone without a valid `user` claim
   is a guest, and for them cproxy now forwards `/news/list` with `offset=0&limit=100`.
@@ -98,7 +161,7 @@ tracked. Newest entries first.
     than `/news/featured`'s 1,085,481 B), `/news/list`, `/news/search`, `/news/featured`. Existing
     guards unchanged: traversal **400** both as `..` and `%2e%2e`, DELETE **405**, no-route **404**.
 
-    `https://fishfind.info/News.aspx` and `Default.aspx` both still render from the gateway
+    `https://<portal>/News.aspx` and `Default.aspx` both still render from the gateway
     afterwards (55,251 B and 43,997 B, byte-identical to before the gate), so the frontend's token
     path was not disturbed.
 
@@ -108,7 +171,8 @@ tracked. Newest entries first.
 
     The droplet's `/opt/cproxy/compose.yml` was byte-identical to git HEAD before the upload apart
     from CRLF line endings (an `md5sum` comparison alone suggests drift that is not there — strip
-    `` before comparing). Previous file kept as `compose.yml.bak-0.14.0`; the dotenv was not
+    `
+` before comparing). Previous file kept as `compose.yml.bak-0.14.0`; the dotenv was not
     touched. GHCR logged out on the workstation and both droplets afterwards.
 
 - 2026-09-11: **0.14.0 — `/news/photo` joins the gated home-page paths.** docapi 1.9.0 adds
@@ -292,10 +356,10 @@ tracked. Newest entries first.
   `CPROXY_JWT_REQUIRE_USER` are both still OFF** — see the rollout note below; the migration is at
   step 2 of 4. The header `X-Day-Guid: <guid>` is replaced by
   `Authorization: Bearer <HS512 JWT>`, minted by the frontend (`aspnet/Account/FishApiJwt.cs`) with
-  the claim set in `fishfind-frontend/doc/envfish-jwt.html`:
+  the claim set in the frontend's `doc/envfish-jwt.html`:
 
   ```
-  { "iss":"envfish", "iat":…, "exp":<end of the current UTC day>, "aud":"fishfind.info",
+  { "iss":"envfish", "iat":…, "exp":<end of the current UTC day>, "aud":"<portal>",
     "sub":"cproxy", "server":"<dbo.day_keys.guid for today>",
     "user":"<Users.prime * Users_Prime.prime for today>" }
   ```
@@ -899,14 +963,14 @@ tracked. Newest entries first.
   rule). Tracked now: `deploy/cproxy-firewall.sh`, `deploy/cproxy-firewall.service`,
   `deploy/cproxy-firewall.allow.example` (placeholders), `deploy/compose.yml` (private VPC addresses
   only). Droplet updated to the parameterized script + real allow file (admin `<admin-ip>`,
-  fishfind `<frontend-ip>` + egress `<frontend-egress-ip>`), reapplied, unit restart clean, `/health` 200
+  the portal `<frontend-ip>` + egress `<frontend-egress-ip>`), reapplied, unit restart clean, `/health` 200
   from admin IP. **The droplet's `/usr/local/sbin/cproxy-firewall.sh` and `/opt/cproxy/compose.yml`
   must stay in sync with `deploy/`** — edit in git, then scp + rerun.
 - 2026-08-04: **Phase 1 hardening DEPLOYED — public access closed to two allowed sources.** (1)
   **IP allowlist** on the droplet: `/usr/local/sbin/cproxy-firewall.sh` populates the `DOCKER-USER`
   iptables chain (the chain Docker-published ports actually honor — ufw/INPUT is bypassed by Docker
   NAT): on `eth0` only `<admin-ip>` (EXTERNAL_ADMIN) and `<frontend-ip>` (EXTERNAL_FRONTEND =
-  fishfind.info's WinHost server, resolved 2026-08-04) may reach published containers; everyone else
+  the portal's WinHost server, resolved 2026-08-04) may reach published containers; everyone else
   DROPs; established/related returns for container-initiated outbound (GHCR pulls) stay open; `eth1`
   (VPC) and SSH (host INPUT) untouched, so no lock-out risk. ip6tables mirrored (drop-all — no global
   IPv6 on eth0 but Docker publishes `[::]:80`). Persisted via systemd oneshot
@@ -918,7 +982,7 @@ tracked. Newest entries first.
   secrets still decrypt (`external_admin:set`). **Verified:** admin IP → `/health` 200 +
   `/api/v1/fish/search` 200 + POST 405; check-host.net nodes (DE/IR/RU) → connection timeout; DROP
   counter accruing; volume logs still written. **Egress verified (2026-08-04):** a temporary
-  server-side test page on fishfind.info proved WinHost's *outbound* egress IP is **<frontend-egress-ip>**
+  server-side test page on the portal proved WinHost's *outbound* egress IP is **<frontend-egress-ip>**
   — NOT the A record `.29` — so `cproxy-firewall.sh` allows **both** `.28` (egress, the one that
   matters for calling cproxy) and `.29` (the site's inbound IP); with only `.29` the site's call
   timed out, with `.28` added it gets `/health` 200. Test page deleted after use. If a future
@@ -957,7 +1021,7 @@ tracked. Newest entries first.
   `http://127.0.0.1:8080` self-loops if hit under `/api/` (proxy forwards to its own port) — harmless
   in prod (upstream is docapi) but don't run the default against `/api/` locally.
 - 2026-08-04: **Initial service — built and DEPLOYED.** C++23 reverse proxy fronting docapi for
-  `fishfind.info`. cpp-httplib server+client; env-driven config; `/health` + `/api/`-forward + 404;
+  `<portal>`. cpp-httplib server+client; env-driven config; `/health` + `/api/`-forward + 404;
   hop-by-hop stripping; `X-Forwarded-*`; optional API-key + method allow-list; 502 on upstream failure.
   Multi-stage Debian 13 Docker image (non-root, ctest-in-build). **Deployed to `<cproxy-droplet>`** as
   `ghcr.io/balintomsk/cproxy:0.1.0`, public on port 80, GET-only, upstream docapi over the DO VPC

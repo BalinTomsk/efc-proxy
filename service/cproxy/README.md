@@ -21,13 +21,15 @@ frontend.service ──HTTP──►  cproxy (10.12.22.225)  ──HTTP──►
 | `GET /health` | local liveness JSON `{ status, service, version }` — never forwarded, never upstream-dependent |
 | `GET /health/ready` | readiness — `503` while the upstream circuit breaker is open |
 | `GET /metrics` | Prometheus text counters (requests by status, upstream latency, failures, breaker state) |
+| `<CPROXY_WATERAPI_PREFIX>…` (default `/api/v1/water/`) | reverse-proxied to the waterapi upstream (station map) when `CPROXY_WATERAPI_UPSTREAM` is set — same guards, its own circuit breaker (0.18.0) |
 | `<CPROXY_ROUTE_PREFIX>…` (default `/api/`) | reverse-proxied to the docapi upstream |
 | anything else | `404` |
 
 Forwarding preserves the method, the **raw** request target (exact bytes — no decode/re-encode round
 trip), headers (minus hop-by-hop and inbound `X-Forwarded-*`/`X-Request-Id`, which the proxy sets
 itself), and body; adds `X-Forwarded-For` / `-Host` / `-Proto`; and maps an unreachable or slow
-upstream to a clean `502`. Two optional edge guards: an **API key** (`X-API-Key`, compared in
+upstream to a clean `502`. Response bodies are relayed as-is — a gzip/brotli body and its
+`Content-Encoding` pass straight through, and a `304 Not Modified` is relayed at its headers. Two optional edge guards: an **API key** (`X-API-Key`, compared in
 constant time) and a **method allow-list** (e.g. GET-only).
 
 Reliability: upstream connections are **pooled per worker thread** with keep-alive (rather than a
@@ -55,6 +57,8 @@ probing is visible.
 | `CPROXY_LISTEN_PORT` | `8080` | bind port |
 | `CPROXY_DOCAPI_UPSTREAM` | `http://11.13.196.12:8080` | docapi origin (`scheme://host:port`) |
 | `CPROXY_ROUTE_PREFIX` | `/api/` | path prefix forwarded to docapi |
+| `CPROXY_WATERAPI_UPSTREAM` | (empty = no water route) | waterapi origin (`scheme://host:port`) |
+| `CPROXY_WATERAPI_PREFIX` | `/api/v1/water/` | sub-path of the route prefix sent to waterapi instead of docapi |
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
@@ -63,7 +67,7 @@ probing is visible.
 | `CPROXY_JWT_SECRET` | (empty) | HS512 shared secret; empty ⇒ every gated request always `500` (the Bearer token is the only credential) |
 | `CPROXY_JWT_REQUIRE_USER` | `false` | `true` ⇒ writes must carry a `user` claim, and any claim present must match a live account |
 | `CPROXY_JWT_ISSUER` | `envfish` | required `iss`; `NONE` skips the check |
-| `CPROXY_JWT_AUDIENCE` | `fishfind.info` | required `aud`; `NONE` skips the check |
+| `CPROXY_JWT_AUDIENCE` | (none — required) | required `aud`, the portal's hostname; unset ⇒ every token is refused; `NONE` skips the check |
 | `CPROXY_JWT_SUBJECT` | `cproxy` | required `sub`; `NONE` skips the check |
 | `CPROXY_JWT_LEEWAY_SECONDS` | `300` | clock-skew allowance on `exp`/`iat`/`nbf` (**prod sets 60**) |
 | `CPROXY_JWT_USER_CACHE_SECONDS` | `60` | how long the account-prime snapshot is reused (also the revocation lag) |
@@ -78,9 +82,9 @@ probing is visible.
 | `CPROXY_CLOUDRANGE_EXEMPT_IPS` | (empty) | never blocked (admin + frontend are exempt automatically) |
 | `CPROXY_RABBITMQ_EVENTS_ENABLED` | `false` | consume frontend account/API-key events from RabbitMQ into local SQLite |
 | `CPROXY_RABBITMQ_MANAGEMENT_URL` | (empty) | RabbitMQ HTTPS management API used for queue polling; required (`scheme://host[:port]`) when events are enabled — no default, set via the encrypted dotenv like `CPROXY_RABBITMQ_PASSWORD` |
-| `CPROXY_RABBITMQ_USERNAME` | `fishfind` | RabbitMQ user for account-event consumption |
+| `CPROXY_RABBITMQ_USERNAME` | (none) | RabbitMQ user for account-event consumption; unset ⇒ mirror disabled |
 | `CPROXY_RABBITMQ_PASSWORD` | (empty) | RabbitMQ password; required when events are enabled; keep in encrypted dotenv |
-| `CPROXY_RABBITMQ_QUEUE` | `fishfind.account.events` | durable queue carrying account and API-key events |
+| `CPROXY_RABBITMQ_QUEUE` | (none) | durable queue carrying account and API-key events; unset ⇒ mirror disabled |
 | `CPROXY_ACCOUNT_MIRROR_DB` | `/var/lib/cproxy/auth.sqlite` | local SQLite mirror for `Users`, `user_api_key`, and raw account events |
 | `CPROXY_RABBITMQ_POLL_MS` | `1000` | delay between empty/failed RabbitMQ polls |
 | `CPROXY_RABBITMQ_BATCH_SIZE` | `25` | max messages consumed per RabbitMQ poll |
@@ -136,7 +140,7 @@ if every feed fails the database is not touched at all.
 ## RabbitMQ account-event mirror
 
 When `CPROXY_RABBITMQ_EVENTS_ENABLED=true`, cproxy polls RabbitMQ's HTTPS management API at
-`CPROXY_RABBITMQ_MANAGEMENT_URL`, consumes the durable queue `fishfind.account.events`, and writes
+`CPROXY_RABBITMQ_MANAGEMENT_URL`, consumes the durable queue named by `CPROXY_RABBITMQ_QUEUE`, and writes
 an idempotent local SQLite mirror to `CPROXY_ACCOUNT_MIRROR_DB`. The mirror has four tables:
 `account_events` for raw event audit, `users` for the registration/OAuth profile snapshot,
 `users_sync` for the full `dbo.Users` row mirror (see below), and `user_api_key` for API-key
@@ -147,12 +151,13 @@ repo is public. In production put `CPROXY_RABBITMQ_MANAGEMENT_URL=<url>` and
 `CPROXY_RABBITMQ_PASSWORD=<password>` in the encrypted dotenv mounted at `/etc/cproxy/.env`; do not
 put either in tracked `deploy/compose.yml`.
 
-Frontend publishers emit these event types:
+Frontend publishers emit these event types. Each is `<namespace>.<kind>`; cproxy matches the
+`<kind>` part, so the namespace (the producer's name) is not configured here:
 
-- `fishfind.account.user` with actions `registered`, `oauth_registered`, and `oauth_login`.
-- `fishfind.account.api_key` with actions `issued`, `disabled`, `enabled`, and `deleted`.
-- `fishfind.account.user_sync` with actions `created` and `updated`, emitted by
-  `fishfind-frontend/aspnet/tools/Run-UsersSyncDispatch.ps1` (a scheduled-task dispatcher, not app
+- `<ns>.account.user` with actions `registered`, `oauth_registered`, and `oauth_login`.
+- `<ns>.account.api_key` with actions `issued`, `disabled`, `enabled`, and `deleted`.
+- `<ns>.account.user_sync` with actions `created` and `updated`, emitted by the frontend's
+  `aspnet/tools/Run-UsersSyncDispatch.ps1` (a scheduled-task dispatcher, not app
   code) draining `dbo.UsersSyncOutbox`. `dbo.TR_Users_SyncOutbox` (envfish-db) appends to that outbox
   on **every** write to `dbo.Users`, including a manual admin `UPDATE` to `access`/`suspended`/
   `deleted` run directly against the table — there is no app code path for those today, so this is
@@ -303,7 +308,7 @@ The day-key travels **inside a signed token**, never on its own in a header. Cal
 `Authorization: Bearer <HS512 JWT>`:
 
 ```json
-{ "iss": "envfish", "iat": 1788880000, "exp": 1788911999, "aud": "fishfind.info",
+{ "iss": "envfish", "iat": 1788880000, "exp": 1788911999, "aud": "<portal hostname>",
   "sub": "cproxy", "server": "<today's day-key GUID>", "user": "<Users.prime * Users_Prime.prime>" }
 ```
 
@@ -354,6 +359,5 @@ and the fail-loud-on-a-bad-database cases), `cloud_range_store_test`, `account_m
 `jwt_verifier_test` (forged signature, tampered payload, `alg:none`, an HS256 downgrade, expiry and
 leeway, claim mismatches, malformed input), and `user_prime_store_test` (the prime product, a product
 past 2^63, revoked/expired accounts, the day window, and a missing mirror failing closed). Proxy
-behaviour is also verified by running the container against a reachable echo upstream (see
-`docs/specification.md`).
+behaviour is also verified by running the container against a reachable echo upstream.
 

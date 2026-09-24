@@ -18,6 +18,8 @@ namespace cproxy {
  * | CPROXY_LISTEN_PORT          | 8080                          | bind port                                 |
  * | CPROXY_DOCAPI_UPSTREAM      | http://127.0.0.1:8080         | docapi origin (scheme://host:port)        |
  * | CPROXY_ROUTE_PREFIX         | /api/                         | path prefix forwarded to docapi           |
+ * | CPROXY_WATERAPI_UPSTREAM    | (empty = no waterapi route)   | waterapi origin (scheme://host:port)      |
+ * | CPROXY_WATERAPI_PREFIX      | /api/v1/water/                | sub-prefix of the route prefix sent to waterapi |
  * | CPROXY_API_KEY              | (empty)                       | if set, require header X-API-Key to match |
  * | CPROXY_ALLOWED_METHODS      | (empty = all)                 | CSV allow-list, e.g. "GET,HEAD"           |
  * | CPROXY_CONNECT_TIMEOUT_MS   | 3000                          | upstream connect timeout                  |
@@ -33,7 +35,7 @@ namespace cproxy {
  * | CPROXY_JWT_SECRET           | (empty)                       | HS512 shared secret; empty = every gated request 500s (no other credential exists) |
  * | CPROXY_JWT_REQUIRE_USER     | false                         | true = writes must name an account, and any `user` claim must match the mirror |
  * | CPROXY_JWT_ISSUER           | envfish                       | required `iss` ("" = do not check)        |
- * | CPROXY_JWT_AUDIENCE         | fishfind.info                 | required `aud` ("" = do not check)        |
+ * | CPROXY_JWT_AUDIENCE         | (none; must be set)           | required `aud`; unset = every token refused, NONE = do not check |
  * | CPROXY_JWT_SUBJECT          | cproxy                        | required `sub` ("" = do not check)        |
  * | CPROXY_JWT_LEEWAY_SECONDS   | 300                           | clock-skew allowance on exp/iat           |
  * | CPROXY_JWT_USER_CACHE_SECONDS | 60                          | how long the account-prime snapshot is reused |
@@ -50,6 +52,31 @@ struct Config {
     // docapi address is deployment config, not a source-code constant).
     std::string docapi_upstream = "http://127.0.0.1:8080";
     std::string route_prefix = "/api/";
+
+    // --- Second upstream: waterapi (0.18.0) ------------------------------------------------------
+    // Requests under waterapi_prefix go to waterapi (efcs-backend/service/waterapi, the station-map
+    // API) instead of docapi. Everything else about them is identical: the same guards in the same
+    // order, the same credential gate, the same X-Fish-Role. Only the destination and the circuit
+    // breaker differ; a separate breaker is the point, since waterapi lives on another droplet and
+    // its outage must never make cproxy fail-fast docapi traffic.
+    //
+    // Empty (the default) means no waterapi route: the prefix is just part of /api/ and reaches
+    // docapi, which 404s it. Same neutral-default reasoning as docapi_upstream: the real address is
+    // deployment config.
+    //
+    // The prefix is its own namespace (/api/v1/water/...) rather than a list of borrowed docapi
+    // paths, because docapi already owns /api/v1/station/{id}. It must sit strictly inside
+    // route_prefix (validate_config), otherwise the forwarding routes never see it. It is stored
+    // lower-cased with a trailing '/', and matched case-insensitively (waterapi routes the same way).
+    std::string waterapi_upstream;
+    std::string waterapi_prefix = "/api/v1/water/";
+
+    /** True when CPROXY_WATERAPI_UPSTREAM is set, i.e. the waterapi route exists. */
+    bool waterapi_enabled() const { return !waterapi_upstream.empty(); }
+
+    /** True when `path` (the decoded request path) is served by waterapi rather than docapi. */
+    bool routes_to_waterapi(const std::string& path) const;
+
     std::string api_key;                    // empty => no auth required
     std::set<std::string> allowed_methods;  // empty => all methods allowed (stored upper-case)
     int connect_timeout_ms = 3000;
@@ -92,10 +119,15 @@ struct Config {
     // on only once the mirror is known to be current (the startup log reports how many accounts it
     // loaded).
     bool jwt_require_user = false;
-    // Claims the token must carry, "" meaning "do not check". Defaults match the platform's minter
-    // (fishfind-frontend/doc/envfish-jwt.html).
+    // Claims the token must carry, "" meaning "do not check". Issuer and subject default to what the
+    // frontend's minter emits (see its doc/envfish-jwt.html).
     std::string jwt_issuer = "envfish";
-    std::string jwt_audience = "fishfind.info";
+    // The audience has NO compiled default: it is the portal's own hostname, which this public
+    // repository does not carry. It comes from the private dotenv (CPROXY_JWT_AUDIENCE). Unset is
+    // not "skip the check": jwt_audience_configured stays false and every token is refused (the gated
+    // surface fails closed, like a missing secret). "NONE" is the explicit way to skip it.
+    std::string jwt_audience;
+    bool jwt_audience_configured = false;
     std::string jwt_subject = "cproxy";
     // Clock-skew allowance on exp/iat, seconds. The token lives one day; a few minutes of slack
     // between two independently-clocked hosts costs nothing.
@@ -153,16 +185,18 @@ struct Config {
     std::vector<std::string> cloudrange_exempt_ips;
 
     // RabbitMQ account-event consumer. When enabled, cproxy polls the RabbitMQ management HTTPS API
-    // for account/user and API-key events emitted by fishfind-frontend, then mirrors them into a
+    // for account/user and API-key events emitted by the web frontend, then mirrors them into a
     // local SQLite database for fast local auth/cache use.
     bool rabbitmq_events_enabled = false;
     // No real infrastructure address baked in as a default (same reason docapi_upstream stays a
     // neutral placeholder): production always sets CPROXY_RABBITMQ_MANAGEMENT_URL explicitly, and
     // validate_config() fails startup on an empty/schemeless value when events are enabled.
     std::string rabbitmq_management_url;
-    std::string rabbitmq_username = "fishfind";
+    // Broker account and queue names have no compiled default (they are deployment names, not code).
+    // Unset with events enabled disables only the mirror -- see rabbitmq_config_problems.
+    std::string rabbitmq_username;
     std::string rabbitmq_password;
-    std::string rabbitmq_queue = "fishfind.account.events";
+    std::string rabbitmq_queue;
     std::string account_mirror_db_path = "/var/lib/cproxy/auth.sqlite";
     int rabbitmq_poll_ms = 1000;
     int rabbitmq_batch_size = 25;

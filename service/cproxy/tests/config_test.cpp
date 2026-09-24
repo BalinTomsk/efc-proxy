@@ -38,8 +38,9 @@ void defaults_apply_when_env_is_empty() {
     CHECK(!c.rabbitmq_events_enabled);
     // No real infrastructure address in tests — same reason as docapi_upstream above.
     CHECK(c.rabbitmq_management_url.empty());
-    CHECK(c.rabbitmq_username == "fishfind");
-    CHECK(c.rabbitmq_queue == "fishfind.account.events");
+    // Broker account/queue are deployment names with no compiled default (see Config).
+    CHECK(c.rabbitmq_username.empty());
+    CHECK(c.rabbitmq_queue.empty());
     CHECK(c.account_mirror_db_path == "/var/lib/cproxy/auth.sqlite");
 }
 
@@ -149,11 +150,21 @@ void rabbitmq_misconfig_degrades_the_mirror_not_the_proxy() {
     // as the password.
     Config ok = load_config(make_env({{"CPROXY_RABBITMQ_EVENTS_ENABLED", "true"},
                                       {"CPROXY_RABBITMQ_MANAGEMENT_URL", "https://rabbitmq.example.invalid:15671"},
-                                      {"CPROXY_RABBITMQ_PASSWORD", "secret"}}));
+                                      {"CPROXY_RABBITMQ_PASSWORD", "secret"},
+                                      {"CPROXY_RABBITMQ_USERNAME", "mirror"},
+                                      {"CPROXY_RABBITMQ_QUEUE", "acme.account.events"}}));
     CHECK(ok.rabbitmq_events_enabled);
     CHECK(ok.rabbitmq_password == "secret");
     CHECK(validate_config(ok).empty());
     CHECK(rabbitmq_config_problems(ok).empty());
+
+    // User and queue have no compiled default: leaving them out disables the mirror (reported), never
+    // the proxy.
+    Config no_names = load_config(make_env({{"CPROXY_RABBITMQ_EVENTS_ENABLED", "true"},
+                                            {"CPROXY_RABBITMQ_MANAGEMENT_URL", "https://rabbitmq.example.invalid:15671"},
+                                            {"CPROXY_RABBITMQ_PASSWORD", "secret"}}));
+    CHECK(validate_config(no_names).empty());
+    CHECK(rabbitmq_config_problems(no_names).size() == 2);  // user and queue
 
     // Enabled with no URL and no password: startup must survive, and the problems must be reported
     // through the separate channel so main() can log them and switch the consumer off.
@@ -393,10 +404,11 @@ void jwt_is_off_until_a_secret_is_configured() {
     Config c = load_config(make_env({}));
     CHECK(!c.jwt_enabled());
     CHECK(!c.jwt_require_user);
-    // Defaults match what the frontend mints (doc/envfish-jwt.html); a mismatch here rejects every
-    // real token, so pin them.
+    // Issuer/subject defaults match what the frontend mints (doc/envfish-jwt.html); a mismatch here
+    // rejects every real token, so pin them. The audience has no default and is not configured.
     CHECK(c.jwt_issuer == "envfish");
-    CHECK(c.jwt_audience == "fishfind.info");
+    CHECK(c.jwt_audience.empty());
+    CHECK(!c.jwt_audience_configured);
     CHECK(c.jwt_subject == "cproxy");
     CHECK(c.jwt_leeway_seconds == 300);
     CHECK(c.jwt_user_cache_seconds == 60);
@@ -417,8 +429,22 @@ void jwt_settings_are_read_and_claim_checks_can_be_switched_off() {
     CHECK(c.jwt_user_cache_seconds == 5);
     CHECK(c.jwt_issuer == "elsewhere");
     CHECK(c.jwt_audience.empty());  // "NONE" = do not check this claim
+    CHECK(c.jwt_audience_configured);  // ...which is a configured choice, unlike leaving it unset
     CHECK(c.jwt_subject.empty());   // and it survives the casing an operator actually types
     CHECK(validate_config(c).empty());
+}
+
+void the_jwt_audience_is_configured_only_by_the_environment() {
+    Config set = load_config(make_env({{"CPROXY_JWT_AUDIENCE", " portal.example "}}));
+    CHECK(set.jwt_audience_configured);
+    CHECK(set.jwt_audience == "portal.example");
+    // Through the REAL environment too: an empty variable reads as unset, so it must stay
+    // unconfigured (every token refused) rather than turn into "do not check".
+    put_real_env("CPROXY_JWT_AUDIENCE", "");
+    CHECK(!load_config(system_env).jwt_audience_configured);
+    put_real_env("CPROXY_JWT_AUDIENCE", "portal.example");
+    CHECK(load_config(system_env).jwt_audience == "portal.example");
+    put_real_env("CPROXY_JWT_AUDIENCE", nullptr);
 }
 
 void a_jwt_switch_without_a_secret_is_a_startup_error() {
@@ -515,9 +541,61 @@ void a_zero_ceiling_is_legal_and_pins_the_host_clock() {
     CHECK(validate_config(cfg).empty());
 }
 
+
+void waterapi_route_is_off_until_an_upstream_is_set() {
+    Config c = load_config(make_env({}));
+    CHECK(!c.waterapi_enabled());
+    CHECK(c.waterapi_prefix == "/api/v1/water/");
+    CHECK(!c.routes_to_waterapi("/api/v1/water/station/map"));
+    CHECK(validate_config(c).empty());
+}
+
+void waterapi_settings_are_read_normalized_and_matched() {
+    Config c = load_config(make_env({{"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"},
+                                     {"CPROXY_WATERAPI_PREFIX", " /API/v1/Water "}}));
+    CHECK(c.waterapi_enabled());
+    CHECK(c.waterapi_upstream == "http://127.0.0.1:8090");
+    CHECK(c.waterapi_prefix == "/api/v1/water/");
+    CHECK(validate_config(c).empty());
+    CHECK(c.routes_to_waterapi("/api/v1/water/station/map"));
+    CHECK(c.routes_to_waterapi("/API/V1/WATER/station/1"));
+    CHECK(c.routes_to_waterapi("/api/v1/water"));
+    CHECK(!c.routes_to_waterapi("/api/v1/waterbody/1"));
+    CHECK(!c.routes_to_waterapi("/api/v1/station/1"));
+}
+
+void waterapi_settings_work_through_the_real_environment() {
+    put_real_env("CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090");
+    CHECK(load_config(system_env).waterapi_enabled());
+    // Empty reads as unset, which here means "no waterapi route" — the safe direction.
+    put_real_env("CPROXY_WATERAPI_UPSTREAM", "");
+    CHECK(!load_config(system_env).waterapi_enabled());
+    put_real_env("CPROXY_WATERAPI_UPSTREAM", nullptr);
+}
+
+void a_bad_waterapi_config_is_a_startup_error() {
+    auto problems = [](std::map<std::string, std::string> env) {
+        return validate_config(load_config(make_env(std::move(env))));
+    };
+    CHECK(!problems({{"CPROXY_WATERAPI_UPSTREAM", "127.0.0.1:8090"}}).empty());  // no scheme
+    // Outside the route prefix: the forwarding routes would never see it.
+    CHECK(!problems({{"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"},
+                     {"CPROXY_WATERAPI_PREFIX", "/water/"}}).empty());
+    // Equal to the route prefix: it would swallow all of docapi.
+    CHECK(!problems({{"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"},
+                     {"CPROXY_WATERAPI_PREFIX", "/api/"}}).empty());
+    // A prefix with no upstream is inert, not an error.
+    CHECK(problems({{"CPROXY_WATERAPI_PREFIX", "/water/"}}).empty());
+}
+
 }  // namespace
 
 int main() {
+    the_jwt_audience_is_configured_only_by_the_environment();
+    waterapi_route_is_off_until_an_upstream_is_set();
+    waterapi_settings_are_read_normalized_and_matched();
+    waterapi_settings_work_through_the_real_environment();
+    a_bad_waterapi_config_is_a_startup_error();
     defaults_apply_when_env_is_empty();
     overrides_are_read_and_methods_restricted();
     malformed_int_falls_back_and_all_keyword_means_unrestricted();
