@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:0d7653901db260f65794687fb2b6b743ba18be274babdee1d5f0d878025a4c72  # 0.18.0 pinned by digest (rollback: 0.17.1 = sha256:2ebfa416bd1428439fa56d17bd11910fd2e86f4d8c2536cae432194631b7a94b)
+    image: ghcr.io/balintomsk/cproxy@sha256:23865588159338029c55a5d22676390896b848f5232987e0ec26fe275836e7ab  # 0.19.0 pinned by digest (rollback: 0.18.0 = sha256:0d7653901db260f65794687fb2b6b743ba18be274babdee1d5f0d878025a4c72)
     container_name: cproxy
     restart: unless-stopped
     ports:

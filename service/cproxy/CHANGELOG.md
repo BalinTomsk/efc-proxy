@@ -10,7 +10,11 @@ tracked. Newest entries first.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
 - 2026-09-24: **0.19.0 — no portal name in the public source; three settings now come only from the
-  private dotenv. NOT DEPLOYED.** The portal's name has been removed from source, comments, tests and
+  private dotenv. DEPLOYED 2026-09-24**, digest `238655881593…e7ab`, with rollback to 0.18.0 `0d7653901db2…4c72`.
+  Startup was clean: no ERROR or WARN, the account mirror loaded 15 accounts, and the RabbitMQ consumer
+  started on the queue named in the dotenv. The portal's own gated `/news/featured` and `/news/more`
+  calls answered 200 with zero audience refusals. Ungated reads, the water route and both breakers
+  were checked too. The portal's name has been removed from source, comments, tests and
   every tracked doc (hostnames are written `<portal>`). Three values used to be compiled defaults, and
   one was also set in the public `deploy/compose.yml`; none has a default now:
   - **`CPROXY_JWT_AUDIENCE`** (the portal hostname). Unset is **not** "skip the check": with a secret set,
