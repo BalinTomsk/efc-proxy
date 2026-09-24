@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:dc7b9b460ecbdfdc46fa086ac633fc3efac27fc877d253104dbdb833aa229b68  # 0.15.0 pinned by digest
+    image: ghcr.io/balintomsk/cproxy@sha256:0d7653901db260f65794687fb2b6b743ba18be274babdee1d5f0d878025a4c72  # 0.18.0 pinned by digest (rollback: 0.17.1 = sha256:2ebfa416bd1428439fa56d17bd11910fd2e86f4d8c2536cae432194631b7a94b)
     container_name: cproxy
     restart: unless-stopped
     ports:
@@ -17,6 +17,10 @@ services:
       # the volume, /mnt/volume_cnode/cproxy/.env, alongside EXTERNAL_ADMIN / EXTERNAL_FRONTEND.
       # A real process env var would win over the dotenv, which is why this must stay unset.
       CPROXY_ROUTE_PREFIX: /api/
+      # CPROXY_WATERAPI_UPSTREAM (0.18.0) is deliberately NOT set here either, for the same reason as
+      # CPROXY_DOCAPI_UPSTREAM: it is a real address and this file deploys verbatim from a public repo.
+      # It comes from /mnt/volume_cnode/cproxy/.env; while absent there is no water route at all and
+      # /api/v1/water/* reaches docapi (a 404). CPROXY_WATERAPI_PREFIX keeps its default, /api/v1/water/.
       CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the Bearer JWT below, not open
       # Raised from the compiled-in 1 MiB default (2026-09-15, at the user's request). AddNews.aspx's
       # photo-upload PATCH sends a base64-encoded image (+~33% over the raw file) as the request body;
@@ -41,9 +45,10 @@ services:
       # <placeholder> would not be documentation, it would be an outage the moment the RabbitMQ
       # consumer tried to resolve it. The real value (like CPROXY_RABBITMQ_PASSWORD) comes from
       # /mnt/volume_cnode/cproxy/.env.
-      CPROXY_RABBITMQ_USERNAME: fishfind
-      # CPROXY_RABBITMQ_PASSWORD is secret and must come from /mnt/volume_cnode/cproxy/.env.
-      CPROXY_RABBITMQ_QUEUE: fishfind.account.events
+      # CPROXY_RABBITMQ_USERNAME and CPROXY_RABBITMQ_QUEUE have no compiled default and are not set
+      # here either (they are deployment names, and this repo is public): they come from
+      # /mnt/volume_cnode/cproxy/.env, like CPROXY_RABBITMQ_PASSWORD. Missing there = the account
+      # mirror is disabled (startup ERROR), which with CPROXY_JWT_REQUIRE_USER refuses every write.
       CPROXY_ACCOUNT_MIRROR_DB: /var/lib/cproxy/auth.sqlite
       # Gateway JWT (0.10.0). CPROXY_JWT_SECRET is secret and comes from the volume's .env, same as
       # the two above -- it must equal FishApi:JwtKey in the frontend's secrets.config byte for byte.
@@ -99,9 +104,10 @@ services:
       CPROXY_JWT_CLOCK_SYNC: "true"
       CPROXY_JWT_CLOCK_SYNC_THRESHOLD_SECONDS: "5"
       CPROXY_JWT_CLOCK_SYNC_MAX_SECONDS: "3600"
-      #   issuer/audience/subject       -- envfish / fishfind.info / cproxy, which is what the
-      #                                    frontend mints; writing them here would just be a second
-      #                                    place to keep in sync.
+      #   issuer/subject                -- envfish / cproxy, which is what the frontend mints;
+      #                                    writing them here would just be a second place to keep in
+      #                                    sync. CPROXY_JWT_AUDIENCE has NO default and must be in
+      #                                    /mnt/volume_cnode/cproxy/.env (unset = every token refused).
       # CPROXY_CLOUDRANGE_REFRESH_ON_START is intentionally NOT set. It was on for the first deploy
       # only, to populate the database immediately instead of waiting out the 336h timer. The
       # database lives on the volume and survives redeploys, so leaving it on would just re-pull

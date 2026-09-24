@@ -172,6 +172,14 @@ bool Config::daykey_gated_id_path(const std::string& path) const {
     return false;
 }
 
+bool Config::routes_to_waterapi(const std::string& path) const {
+    if (!waterapi_enabled()) return false;
+    // "/api/v1/water" (no trailing slash) belongs to the prefix too, so compare against path + "/".
+    // waterapi_prefix is already lower-case with a trailing '/', see load_config.
+    const std::string p = to_lower(path) + "/";
+    return p.starts_with(waterapi_prefix);
+}
+
 bool Config::cloudrange_exempt(const std::string& ip) const {
     if (ip.empty()) return false;
     // The frontend host and the admin address are exempt unconditionally. Both are ordinary
@@ -197,6 +205,15 @@ Config load_config(const EnvLookup& env) {
     cfg.listen_port = get_int(env, "CPROXY_LISTEN_PORT", cfg.listen_port);
     cfg.docapi_upstream = get_str(env, "CPROXY_DOCAPI_UPSTREAM", cfg.docapi_upstream);
     cfg.route_prefix = get_str(env, "CPROXY_ROUTE_PREFIX", cfg.route_prefix);
+    cfg.waterapi_upstream = get_str(env, "CPROXY_WATERAPI_UPSTREAM", cfg.waterapi_upstream);
+    {
+        // Canonical form: lower-case, leading and trailing '/'. validate_config checks it is inside
+        // the route prefix.
+        std::string prefix = to_lower(get_str(env, "CPROXY_WATERAPI_PREFIX", cfg.waterapi_prefix));
+        if (prefix.empty() || prefix.front() != '/') prefix.insert(prefix.begin(), '/');
+        if (prefix.back() != '/') prefix.push_back('/');
+        cfg.waterapi_prefix = prefix;
+    }
     cfg.api_key = get_str(env, "CPROXY_API_KEY", cfg.api_key);
     cfg.connect_timeout_ms = get_int(env, "CPROXY_CONNECT_TIMEOUT_MS", cfg.connect_timeout_ms);
     cfg.read_timeout_ms = get_int(env, "CPROXY_READ_TIMEOUT_MS", cfg.read_timeout_ms);
@@ -227,7 +244,13 @@ Config load_config(const EnvLookup& env) {
     // reports an empty variable as unset, so CPROXY_JWT_ISSUER= would silently leave the default
     // "envfish" requirement standing — the opposite of what an operator typing it means.
     cfg.jwt_issuer = none_to_empty(get_str(env, "CPROXY_JWT_ISSUER", cfg.jwt_issuer));
-    cfg.jwt_audience = none_to_empty(get_str(env, "CPROXY_JWT_AUDIENCE", cfg.jwt_audience));
+    // No default audience (see Config::jwt_audience): only a value in the environment configures it,
+    // and "NONE" configures it as "do not check".
+    {
+        const std::string audience = get_str(env, "CPROXY_JWT_AUDIENCE", "");
+        cfg.jwt_audience_configured = !audience.empty();
+        cfg.jwt_audience = none_to_empty(audience);
+    }
     cfg.jwt_subject = none_to_empty(get_str(env, "CPROXY_JWT_SUBJECT", cfg.jwt_subject));
 
     // "NONE" turns file logging off (console only); anything else is the rolling-log directory.
@@ -363,6 +386,17 @@ std::vector<std::string> validate_config(const Config& cfg) {
         errors.push_back("CPROXY_ROUTE_PREFIX must start with '/'");
     if (cfg.docapi_upstream.rfind("http://", 0) != 0 && cfg.docapi_upstream.rfind("https://", 0) != 0)
         errors.push_back("CPROXY_DOCAPI_UPSTREAM must be scheme://host[:port] with http or https");
+    if (cfg.waterapi_enabled()) {
+        if (cfg.waterapi_upstream.rfind("http://", 0) != 0 &&
+            cfg.waterapi_upstream.rfind("https://", 0) != 0)
+            errors.push_back("CPROXY_WATERAPI_UPSTREAM must be scheme://host[:port] with http or https");
+        // Strictly INSIDE the route prefix: outside it the forwarding routes never see the request,
+        // and equal to it the water route would swallow all of docapi.
+        const std::string route = to_lower(cfg.route_prefix);
+        if (!cfg.waterapi_prefix.starts_with(route) || cfg.waterapi_prefix.size() <= route.size())
+            errors.push_back("CPROXY_WATERAPI_PREFIX must be a sub-path of CPROXY_ROUTE_PREFIX, e.g. "
+                             "/api/v1/water/");
+    }
     if (cfg.jwt_leeway_seconds < 0)
         errors.push_back("CPROXY_JWT_LEEWAY_SECONDS must be >= 0");
     if (cfg.jwt_user_cache_seconds <= 0)

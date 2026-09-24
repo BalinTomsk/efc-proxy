@@ -23,6 +23,16 @@ std::string str_or_empty(const nlohmann::json& obj, const char* key) {
     return obj[key].dump();
 }
 
+/**
+ * An event type without its producer namespace: "<ns>.account.user" -> "account.user". A type with
+ * no namespace, or an empty one, yields "" and so matches nothing.
+ */
+std::string event_kind(const std::string& type) {
+    const std::size_t dot = type.find('.');
+    if (dot == std::string::npos || dot == 0) return {};
+    return type.substr(dot + 1);
+}
+
 int bool_or_zero(const nlohmann::json& obj, const char* key) {
     if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) return 0;
     if (obj[key].is_boolean()) return obj[key].get<bool>() ? 1 : 0;
@@ -170,7 +180,7 @@ std::int64_t int64_or_zero(const nlohmann::json& obj, const char* key) {
 }
 
 // Full dbo.Users row mirror (id, UsersId, userName, email, lastVisit, access, suspended, authType,
-// deleted, deletedUtc, prime, prime_expired) fed by the fishfind-frontend outbox dispatcher
+// deleted, deletedUtc, prime, prime_expired) fed by the web frontend's outbox dispatcher
 // (Run-UsersSyncDispatch.ps1), which snapshots EVERY write to dbo.Users -- including a manual admin
 // UPDATE to access/suspended/deleted, not just app code paths. Distinct from `users` above, which only
 // ever carries the narrower registration/OAuth profile fields.
@@ -446,14 +456,17 @@ bool AccountMirrorStore::apply_event(const nlohmann::json& event) {
         return false;
     }
 
-    const std::string type = str_or_empty(event, "eventType");
-    if (type == "fishfind.account.user") {
+    // Matched on the part after the producer's namespace ("<ns>.account.user" -> "account.user"): the
+    // namespace is the portal's name, which this public repository does not carry, and the events only
+    // arrive from our own authenticated queue, so the namespace adds nothing to trust.
+    const std::string type = event_kind(str_or_empty(event, "eventType"));
+    if (type == "account.user") {
         upsert_user(handle.db, event.contains("user") ? event["user"] : nlohmann::json::object(), event);
-    } else if (type == "fishfind.account.api_key") {
+    } else if (type == "account.api_key") {
         upsert_api_key(handle.db, event.contains("apiKey") ? event["apiKey"] : nlohmann::json::object(), event);
-    } else if (type == "fishfind.account.user_sync") {
+    } else if (type == "account.user_sync") {
         upsert_user_sync(handle.db, event.contains("user") ? event["user"] : nlohmann::json::object(), event);
-    } else if (type == "fishfind.account.user_prime_sync") {
+    } else if (type == "account.user_prime_sync") {
         apply_user_prime_sync(handle.db,
                               event.contains("userPrime") ? event["userPrime"] : nlohmann::json::object(), event);
     }

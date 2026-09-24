@@ -74,7 +74,7 @@ std::string mint(const std::string& header_json, const std::string& payload_json
 std::string platform_payload(long long exp, const std::string& server = "20C23A17-DEAD-BEEF",
                              const std::string& user = "2392473924723984",
                              const std::string& iss = "envfish",
-                             const std::string& aud = "fishfind.info",
+                             const std::string& aud = "example.test",
                              const std::string& sub = "cproxy") {
     return "{\"iss\":\"" + iss + "\",\"iat\":1788880000,\"exp\":" + std::to_string(exp) +
            ",\"aud\":\"" + aud + "\",\"sub\":\"" + sub + "\",\"server\":\"" + server +
@@ -87,8 +87,21 @@ JwtVerifyOptions default_options() {
     JwtVerifyOptions opts;
     opts.secret = kSecret;
     opts.issuer = "envfish";
-    opts.audience = "fishfind.info";
+    opts.audience = "example.test";
     opts.subject = "cproxy";
+    return opts;
+}
+
+/**
+ * Options for the GOLDEN fixtures below: tokens minted by the real frontend carry the portal's own
+ * hostname as `aud`, which this public repository does not spell out, so these cases skip only the
+ * audience comparison ("" = do not check). Everything they exist to pin -- base64url, UTF-8 claim
+ * bytes, the HMAC, the claim shapes -- is still verified; the audience rule itself is covered by the
+ * minted cases above and below.
+ */
+JwtVerifyOptions golden_options() {
+    JwtVerifyOptions opts = default_options();
+    opts.audience.clear();
     return opts;
 }
 
@@ -125,7 +138,7 @@ void a_token_minted_by_the_real_frontend_verifies() {
         "c2VyIjoiMTA0NzI5MzE0MTg3In0."
         "rtjblzKLQvQrm0cG0F6MtuDtetE3TEdooQuJIy2zb2U-EB6vFi-3VTPvRRPyjRaQnFTJMJxUf51Klh5RW_Z6CA";
 
-    const JwtResult result = verify_hs512(minted_by_dotnet, default_options(), at_epoch(1788900000));
+    const JwtResult result = verify_hs512(minted_by_dotnet, golden_options(), at_epoch(1788900000));
     CHECK(result.ok);
     CHECK(result.claims.server == "20C23A17-841D-44E7-AD0F-B26FA6E8968E");
     CHECK(result.claims.user == "104729314187");  // 1000003 * 104729, as BigInteger produced it
@@ -133,7 +146,7 @@ void a_token_minted_by_the_real_frontend_verifies() {
 
     // The frontend encodes canonically (Convert.ToBase64String zero-fills the unused bits), so the
     // spelling above is the only one of its 16 that may verify — see the respelling case below.
-    CHECK(!verify_hs512(respell_last_symbol(minted_by_dotnet, 1), default_options(),
+    CHECK(!verify_hs512(respell_last_symbol(minted_by_dotnet, 1), golden_options(),
                         at_epoch(1788900000))
                .ok);
 }
@@ -190,7 +203,7 @@ void a_token_without_exp_is_rejected() {
     // No exp means a leaked token is valid forever, which is exactly what the day-key rotation
     // exists to prevent — so an unbounded token is refused rather than treated as long-lived.
     const std::string payload =
-        "{\"iss\":\"envfish\",\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"X\"}";
+        "{\"iss\":\"envfish\",\"aud\":\"example.test\",\"sub\":\"cproxy\",\"server\":\"X\"}";
     CHECK(!verify_hs512(mint(kHs512Header, payload), default_options(), at_epoch(1788890000)).ok);
 }
 
@@ -204,7 +217,7 @@ void issuer_audience_and_subject_are_all_enforced() {
                default_options(), now)
                .ok);
     CHECK(!verify_hs512(mint(kHs512Header, platform_payload(1788900000, "X", "1", "envfish",
-                                                           "fishfind.info", "docapi")),
+                                                           "example.test", "docapi")),
                         default_options(), now)
                .ok);
 }
@@ -219,7 +232,7 @@ void an_unchecked_claim_accepts_anything() {
 
 void an_array_audience_matches_when_it_contains_the_expected_value() {
     const std::string payload =
-        "{\"iss\":\"envfish\",\"exp\":1788900000,\"aud\":[\"other\",\"fishfind.info\"],"
+        "{\"iss\":\"envfish\",\"exp\":1788900000,\"aud\":[\"other\",\"example.test\"],"
         "\"sub\":\"cproxy\",\"server\":\"X\",\"user\":\"7\"}";
     CHECK(verify_hs512(mint(kHs512Header, payload), default_options(), at_epoch(1788890000)).ok);
 }
@@ -228,7 +241,7 @@ void a_numeric_user_claim_is_read_without_losing_digits() {
     // The frontend sends `user` as a string precisely because the product overflows a double, but a
     // hand-built token may use a number; reading it must not go through a float.
     const std::string payload =
-        "{\"iss\":\"envfish\",\"exp\":1788900000,\"aud\":\"fishfind.info\",\"sub\":\"cproxy\","
+        "{\"iss\":\"envfish\",\"exp\":1788900000,\"aud\":\"example.test\",\"sub\":\"cproxy\","
         "\"server\":\"X\",\"user\":9007199254740993}";
     const JwtResult result =
         verify_hs512(mint(kHs512Header, payload), default_options(), at_epoch(1788890000));
@@ -329,7 +342,7 @@ void a_token_carrying_any_adm_claim_still_verifies_and_the_claim_is_ignored() {
     for (const char* adm : adm_variants) {
         const std::string payload =
             "{\"iss\":\"envfish\",\"iat\":1788880000,\"exp\":1788900000,"
-            "\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"20C23A17-DEAD-BEEF\""
+            "\"aud\":\"example.test\",\"sub\":\"cproxy\",\"server\":\"20C23A17-DEAD-BEEF\""
             + std::string(adm) + "}";
         const JwtResult result = verify_hs512(mint(kHs512Header, payload), default_options(),
                                               at_epoch(1788890000));
@@ -344,7 +357,7 @@ void an_expired_token_still_reports_its_claims_so_the_skew_can_be_measured() {
     // the clocks were already close enough not to need it.
     const std::string token = mint(kHs512Header,
                                    "{\"iss\":\"envfish\",\"iat\":1788880000,\"exp\":1788900000,"
-                                   "\"aud\":\"fishfind.info\",\"sub\":\"cproxy\","
+                                   "\"aud\":\"example.test\",\"sub\":\"cproxy\","
                                    "\"server\":\"20C23A17-DEAD-BEEF\",\"adm\":true}");
     JwtVerifyOptions opts = default_options();
     opts.leeway_seconds = 60;
@@ -364,7 +377,7 @@ void a_forged_token_reports_neither_signature_ok_nor_time_rejected() {
     const std::string token =
         mint(kHs512Header,
              "{\"iss\":\"envfish\",\"iat\":1788880000,\"exp\":1788900000,"
-             "\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"X\",\"adm\":true}",
+             "\"aud\":\"example.test\",\"sub\":\"cproxy\",\"server\":\"X\",\"adm\":true}",
              "the-wrong-secret-entirely-but-still-long-enough-to-hmac-with");
     const JwtResult result = verify_hs512(token, default_options(), at_epoch(1788890000));
 
@@ -391,7 +404,7 @@ void a_token_missing_exp_is_authentic_but_never_a_time_rejection() {
     // Authentic yet malformed. It says nothing trustworthy about what time it is, so it must not
     // arm the correction path either.
     const std::string token =
-        mint(kHs512Header, "{\"iss\":\"envfish\",\"aud\":\"fishfind.info\","
+        mint(kHs512Header, "{\"iss\":\"envfish\",\"aud\":\"example.test\","
                            "\"sub\":\"cproxy\",\"server\":\"S\",\"adm\":true}");
     const JwtResult result = verify_hs512(token, default_options(), at_epoch(1788890000));
 
@@ -424,8 +437,8 @@ void a_token_from_the_0_11_frontend_with_adm_still_verifies() {
         "Mzk4NCJ9."
         "jsSHuFQrbGvSod5Yl2ZQSfd_G4T2KMgp94NPbMzu-ed51UaD24VFTbrqVdBr0kNg3Fb-oIpnhtNYBH4zWi_LnA";
 
-    const JwtResult admin = verify_hs512(admin_minted_by_dotnet, default_options(), at_epoch(1789020000));
-    const JwtResult plain = verify_hs512(plain_minted_by_dotnet, default_options(), at_epoch(1789020000));
+    const JwtResult admin = verify_hs512(admin_minted_by_dotnet, golden_options(), at_epoch(1789020000));
+    const JwtResult plain = verify_hs512(plain_minted_by_dotnet, golden_options(), at_epoch(1789020000));
     CHECK(admin.ok);
     CHECK(plain.ok);
     CHECK(admin.claims.user == plain.claims.user);

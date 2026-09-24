@@ -4,6 +4,6 @@
 build
 out
 cmake-build-*
-docs
+docs/*
 .env
 *.md

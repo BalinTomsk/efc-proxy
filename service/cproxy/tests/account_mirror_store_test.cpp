@@ -30,7 +30,7 @@ void applies_user_and_api_key_events_idempotently() {
 
     nlohmann::json user = {
         {"eventId", "evt-user-1"},
-        {"eventType", "fishfind.account.user"},
+        {"eventType", "acme.account.user"},
         {"action", "registered"},
         {"aggregateId", "user-1"},
         {"occurredUtc", "2026-09-03T18:00:00Z"},
@@ -43,7 +43,7 @@ void applies_user_and_api_key_events_idempotently() {
 
     nlohmann::json key = {
         {"eventId", "evt-key-1"},
-        {"eventType", "fishfind.account.api_key"},
+        {"eventType", "acme.account.api_key"},
         {"action", "issued"},
         {"aggregateId", "key-1"},
         {"occurredUtc", "2026-09-03T18:01:00Z"},
@@ -63,7 +63,7 @@ void applies_user_and_api_key_events_idempotently() {
     std::remove(db_path.c_str());
 }
 
-// dbo.Users full-row mirror fed by the fishfind-frontend RabbitMQ users-sync dispatcher
+// dbo.Users full-row mirror fed by the web frontend's RabbitMQ users-sync dispatcher
 // (Run-UsersSyncDispatch.ps1 -> dbo.UsersSyncOutbox -> dbo.TR_Users_SyncOutbox). Covers: the
 // 'created' snapshot lands with every field, a later 'updated' event for the same user (e.g. an
 // admin suspending the account directly in SQL) upserts in place rather than duplicating the row,
@@ -76,13 +76,13 @@ void applies_user_sync_events_idempotently_and_upserts_on_update() {
     store.ensure_schema();
 
     nlohmann::json created = {
-        {"schema", "fishfind.account-event.v1"},
+        {"schema", "acme.account-event.v1"},
         {"eventId", "usersync-1"},
-        {"eventType", "fishfind.account.user_sync"},
+        {"eventType", "acme.account.user_sync"},
         {"action", "created"},
         {"aggregateId", "user-sync-1"},
         {"occurredUtc", "2026-09-03T18:00:00Z"},
-        {"source", "fishfind-frontend"},
+        {"source", "frontend"},
         {"user", {{"id", "user-sync-1"}, {"usersId", 3201}, {"userName", "Ada"},
                   {"email", "ada.sync@example.test"}, {"lastVisit", "2026-09-03T17:00:00Z"},
                   {"access", 0}, {"suspended", false}, {"authType", "Local"},
@@ -97,13 +97,13 @@ void applies_user_sync_events_idempotently_and_upserts_on_update() {
     // A manual admin UPDATE dbo.Users SET suspended = 1 (no app code path for this today) produces
     // a distinct outbox row / eventId with action 'updated' -- must upsert onto the SAME row.
     nlohmann::json updated = {
-        {"schema", "fishfind.account-event.v1"},
+        {"schema", "acme.account-event.v1"},
         {"eventId", "usersync-2"},
-        {"eventType", "fishfind.account.user_sync"},
+        {"eventType", "acme.account.user_sync"},
         {"action", "updated"},
         {"aggregateId", "user-sync-1"},
         {"occurredUtc", "2026-09-03T18:05:00Z"},
-        {"source", "fishfind-frontend"},
+        {"source", "frontend"},
         {"user", {{"id", "user-sync-1"}, {"usersId", 3201}, {"userName", "Ada"},
                   {"email", "ada.sync@example.test"}, {"lastVisit", "2026-09-03T17:00:00Z"},
                   {"access", 0}, {"suspended", true}, {"authType", "Local"},
@@ -152,13 +152,13 @@ void preserves_prime_beyond_32_bits() {
     const std::int64_t big_prime = 4294967311LL;  // the first prime above 2^32
 
     nlohmann::json created = {
-        {"schema", "fishfind.account-event.v1"},
+        {"schema", "acme.account-event.v1"},
         {"eventId", "usersync-bigprime-1"},
-        {"eventType", "fishfind.account.user_sync"},
+        {"eventType", "acme.account.user_sync"},
         {"action", "updated"},
         {"aggregateId", "user-bigprime-1"},
         {"occurredUtc", "2026-09-03T18:00:00Z"},
-        {"source", "fishfind-frontend"},
+        {"source", "frontend"},
         {"user", {{"id", "user-bigprime-1"}, {"usersId", 42}, {"userName", "Sophie"},
                   {"email", "sophie@example.test"}, {"lastVisit", "2026-09-03T17:00:00Z"},
                   {"access", 0}, {"suspended", false}, {"authType", "Local"},
@@ -221,13 +221,13 @@ void migrates_prime_columns_onto_an_existing_mirror() {
     store.ensure_schema();  // idempotent: a second run must not fail on "duplicate column name"
 
     nlohmann::json event = {
-        {"schema", "fishfind.account-event.v1"},
+        {"schema", "acme.account-event.v1"},
         {"eventId", "usersync-migrate-1"},
-        {"eventType", "fishfind.account.user_sync"},
+        {"eventType", "acme.account.user_sync"},
         {"action", "updated"},
         {"aggregateId", "legacy-user-1"},
         {"occurredUtc", "2026-09-05T12:00:00Z"},
-        {"source", "fishfind-frontend"},
+        {"source", "frontend"},
         {"user", {{"id", "legacy-user-1"}, {"usersId", 7}, {"userName", "Legacy"},
                   {"email", "legacy@example.test"}, {"lastVisit", "2026-09-05T11:00:00Z"},
                   {"access", 0}, {"suspended", false}, {"authType", "Local"},
@@ -261,13 +261,13 @@ void stores_missing_prime_expired_as_null() {
     store.ensure_schema();
 
     nlohmann::json event = {
-        {"schema", "fishfind.account-event.v1"},
+        {"schema", "acme.account-event.v1"},
         {"eventId", "usersync-nullprime-1"},
-        {"eventType", "fishfind.account.user_sync"},
+        {"eventType", "acme.account.user_sync"},
         {"action", "created"},
         {"aggregateId", "user-nullprime-1"},
         {"occurredUtc", "2026-09-05T12:00:00Z"},
-        {"source", "fishfind-frontend"},
+        {"source", "frontend"},
         {"user", {{"id", "user-nullprime-1"}, {"usersId", 9}, {"userName", "Old"},
                   {"email", "old@example.test"}, {"lastVisit", "2026-09-05T11:00:00Z"},
                   {"access", 0}, {"suspended", false}, {"authType", "Local"},
@@ -305,13 +305,13 @@ void preserves_users_id_beyond_32_bits() {
     const std::int64_t big_users_id = 4294967424LL;  // 2^32 + 128: the next id after a 2^32 seed
 
     nlohmann::json created = {
-        {"schema", "fishfind.account-event.v1"},
+        {"schema", "acme.account-event.v1"},
         {"eventId", "usersync-bigid-1"},
-        {"eventType", "fishfind.account.user_sync"},
+        {"eventType", "acme.account.user_sync"},
         {"action", "created"},
         {"aggregateId", "user-bigid-1"},
         {"occurredUtc", "2026-09-03T18:00:00Z"},
-        {"source", "fishfind-frontend"},
+        {"source", "frontend"},
         {"user", {{"id", "user-bigid-1"}, {"usersId", big_users_id}, {"userName", "Grace"},
                   {"email", "grace@example.test"}, {"lastVisit", "2026-09-03T17:00:00Z"},
                   {"access", 0}, {"suspended", false}, {"authType", "Local"},
@@ -359,13 +359,13 @@ void applies_user_prime_sync_creating_all_day_rows() {
     }
 
     nlohmann::json created = {
-        {"schema", "fishfind.account-event.v1"},
+        {"schema", "acme.account-event.v1"},
         {"eventId", "userprimesync-1"},
-        {"eventType", "fishfind.account.user_prime_sync"},
+        {"eventType", "acme.account.user_prime_sync"},
         {"action", "created"},
         {"aggregateId", "user-prime-1"},
         {"occurredUtc", "2026-09-08T18:00:00Z"},
-        {"source", "fishfind-frontend"},
+        {"source", "frontend"},
         {"userPrime", {{"userId", "user-prime-1"}, {"dayCount", 365}, {"days", days}}}
     };
     CHECK(store.apply_event(created));
@@ -409,7 +409,7 @@ void removes_user_prime_rows_on_delete_event() {
     }
     nlohmann::json created = {
         {"eventId", "userprimesync-del-1"},
-        {"eventType", "fishfind.account.user_prime_sync"},
+        {"eventType", "acme.account.user_prime_sync"},
         {"action", "created"},
         {"aggregateId", "user-prime-del"},
         {"occurredUtc", "2026-09-08T18:00:00Z"},
@@ -422,7 +422,7 @@ void removes_user_prime_rows_on_delete_event() {
     released.push_back({{"day", 3}, {"prime", 9030000003LL}});
     nlohmann::json deleted = {
         {"eventId", "userprimesync-del-2"},
-        {"eventType", "fishfind.account.user_prime_sync"},
+        {"eventType", "acme.account.user_prime_sync"},
         {"action", "deleted"},
         {"aggregateId", "user-prime-del"},
         {"occurredUtc", "2026-09-08T18:05:00Z"},

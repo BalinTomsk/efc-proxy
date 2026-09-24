@@ -9,6 +9,11 @@
 #include <string>
 #include <thread>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <httplib.h>
 #include <openssl/hmac.h>
 #include <sqlite3.h>
@@ -339,7 +344,7 @@ std::string mint_token(const std::string& day_guid, const std::string& user = ""
 
     std::string payload = "{\"iss\":\"envfish\",\"iat\":" + std::to_string(iat) +
                           ",\"exp\":" + std::to_string(exp) +
-                          ",\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"" + day_guid +
+                          ",\"aud\":\"example.test\",\"sub\":\"cproxy\",\"server\":\"" + day_guid +
                           "\"";
     if (!user.empty()) payload += ",\"user\":\"" + user + "\"";
     payload += "}";
@@ -372,6 +377,8 @@ void gated_read_path_requires_a_bearer_token() {
     cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
     cfg.daykey_db_path = db;
     cfg.jwt_secret = kTestJwtSecret;
+    cfg.jwt_audience = "example.test";
+    cfg.jwt_audience_configured = true;
     TestServer proxy;
     install_routes(proxy.server, cfg);
     proxy.start();
@@ -473,7 +480,7 @@ std::string mint_skewed_token(const std::string& day_guid, long long host_behind
 
     std::string payload = "{\"iss\":\"envfish\",\"iat\":" + std::to_string(iat) +
                           ",\"exp\":" + std::to_string(exp) +
-                          ",\"aud\":\"fishfind.info\",\"sub\":\"cproxy\",\"server\":\"" + day_guid +
+                          ",\"aud\":\"example.test\",\"sub\":\"cproxy\",\"server\":\"" + day_guid +
                           "\"";
     if (!user.empty()) payload += ",\"user\":\"" + user + "\"";
     if (adm_claim) payload += ",\"adm\":true";
@@ -523,6 +530,8 @@ struct ClockSyncFixture {
         cfg.daykey_db_path = db;
         cfg.account_mirror_db_path = mirror;
         cfg.jwt_secret = kTestJwtSecret;
+        cfg.jwt_audience = "example.test";
+        cfg.jwt_audience_configured = true;
         cfg.jwt_leeway_seconds = 60;
         cfg.jwt_clock_sync = sync_enabled;
         cfg.jwt_clock_sync_threshold_seconds = 5;
@@ -666,6 +675,8 @@ void the_day_key_header_is_never_a_credential() {
     cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
     cfg.daykey_db_path = db;
     cfg.jwt_secret = kTestJwtSecret;
+    cfg.jwt_audience = "example.test";
+    cfg.jwt_audience_configured = true;
     TestServer proxy;
     install_routes(proxy.server, cfg);
     proxy.start();
@@ -742,6 +753,34 @@ void no_secret_shuts_the_gated_surface() {
               ->status == 500);
     CHECK(cli.Get("/api/v1/news/default")->status == 500);
     // Ungated reads are unaffected.
+    auto list = cli.Get("/api/v1/news/list?country=CA");
+    CHECK(list && list->status == 200);
+
+    std::remove(db.c_str());
+}
+
+// The audience has no compiled default (0.19.0). A secret with no configured audience must refuse every
+// token -- fail closed -- and never quietly skip the claim; ungated reads keep serving.
+void no_audience_shuts_the_gated_surface() {
+    TestServer up;
+    install_fake_upstream(up.server);
+    up.start();
+
+    const std::string db = "proxy_test_noaud_day_keys.sqlite";
+    write_uniform_day_key_db(db, "TEST-DAY-KEY");
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    cfg.daykey_db_path = db;
+    cfg.jwt_secret = kTestJwtSecret;  // audience deliberately left unconfigured
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto gated = cli.Get("/api/v1/news/default", {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}});
+    CHECK(gated && gated->status == 500);
+    CHECK(gated->body.find("upstream:") == std::string::npos);  // refused by the gateway, never forwarded
     auto list = cli.Get("/api/v1/news/list?country=CA");
     CHECK(list && list->status == 200);
 
@@ -1109,6 +1148,8 @@ void without_a_secret_or_a_mirror_everyone_is_a_guest() {
         cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
         cfg.daykey_db_path = db;
         cfg.jwt_secret = kTestJwtSecret;
+        cfg.jwt_audience = "example.test";
+        cfg.jwt_audience_configured = true;
         TestServer proxy;
         install_routes(proxy.server, cfg);
         proxy.start();
@@ -1205,6 +1246,258 @@ void only_the_news_list_is_rewritten() {
     }
 }
 
+
+// ---- Second upstream: waterapi (0.18.0) ------------------------------------------------------------
+//
+// Paths under CPROXY_WATERAPI_PREFIX go to waterapi instead of docapi, through every guard docapi
+// traffic goes through, with a circuit breaker of their own.
+
+/** A fake upstream that answers every GET with "<tag>:<target>", and the role it was told. */
+void install_tagged_upstream(httplib::Server& s, const std::string& tag) {
+    s.Get(R"(/.*)", [tag](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("X-Got-Role", req.get_header_value("X-Fish-Role"));
+        res.set_header("X-Got-Role-Count", std::to_string(req.get_header_value_count("X-Fish-Role")));
+        res.set_content(tag + ":" + req.target, "text/plain");
+    });
+}
+
+void the_water_prefix_goes_to_waterapi_and_everything_else_to_docapi() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+    TestServer water;
+    install_tagged_upstream(water.server, "waterapi");
+    water.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.waterapi_upstream = "http://127.0.0.1:" + std::to_string(water.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto w = cli.Get("/api/v1/water/station/map?country=US&state=MN");
+    CHECK(w && w->status == 200);
+    CHECK(w->body == "waterapi:/api/v1/water/station/map?country=US&state=MN");
+
+    // docapi keeps its own /station — the reason waterapi has a namespace of its own.
+    auto d = cli.Get("/api/v1/station/1");
+    CHECK(d && d->status == 200);
+    CHECK(d->body == "docapi:/api/v1/station/1");
+
+    // Case-insensitive, like waterapi's own routing; the bare prefix belongs to waterapi too.
+    auto upper = cli.Get("/api/v1/WATER/station/map?country=CA");
+    CHECK(upper && upper->body.starts_with("waterapi:"));
+    auto bare = cli.Get("/api/v1/water");
+    CHECK(bare && bare->body.starts_with("waterapi:"));
+
+    // A look-alike segment is not the prefix.
+    auto near = cli.Get("/api/v1/waterbody/abc");
+    CHECK(near && near->body.starts_with("docapi:"));
+
+    // Readiness and metrics report the second breaker.
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->status == 200);
+    CHECK(ready->body.find("\"waterapi\":\"closed\"") != std::string::npos);
+    auto m = cli.Get("/metrics");
+    CHECK(m && m->body.find("cproxy_waterapi_breaker_state 0") != std::string::npos);
+}
+
+void without_a_waterapi_upstream_the_prefix_is_just_docapi() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto r = cli.Get("/api/v1/water/station/map?country=US");
+    CHECK(r && r->body.starts_with("docapi:"));
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->body.find("waterapi") == std::string::npos);
+}
+
+void a_waterapi_outage_never_trips_the_docapi_breaker() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.waterapi_upstream = "http://127.0.0.1:1";  // nothing listens there
+    cfg.connect_timeout_ms = 300;
+    cfg.breaker_threshold = 2;
+    cfg.breaker_cooldown_ms = 60000;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_read_timeout(5, 0);
+    for (int i = 0; i < 2; ++i) {
+        auto r = cli.Get("/api/v1/water/station/map?country=US");
+        CHECK(r && r->status == 502);
+        CHECK(r->body.find("Upstream waterapi is unreachable") != std::string::npos);
+    }
+    // waterapi's breaker is now open: it fails fast...
+    auto fast = cli.Get("/api/v1/water/station/map?country=US");
+    CHECK(fast && fast->status == 502);
+    CHECK(fast->body.find("upstream_unavailable") != std::string::npos);
+
+    // ...while docapi is served as normal and the edge stays ready.
+    auto d = cli.Get("/api/v1/fish/search?q=trout");
+    CHECK(d && d->status == 200);
+    CHECK(d->body.starts_with("docapi:"));
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->status == 200);
+    CHECK(ready->body.find("\"upstream\":\"closed\"") != std::string::npos);
+    CHECK(ready->body.find("\"waterapi\":\"open\"") != std::string::npos);
+}
+
+void a_compressed_upstream_body_passes_through_untouched() {
+    // Bytes that are NOT valid gzip on purpose: the proxy must not look inside. Before 0.18.0 the
+    // pooled client tried to decompress (and, built without zlib, refused) — a 502.
+    static const char raw[] = "\x1f\x8b\x08\x00opaque-compressed-bytes\x00\xff";
+    const std::string opaque(raw, sizeof(raw) - 1);
+    TestServer up;
+    up.server.Get(R"(/.*)", [&opaque](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Content-Encoding", "gzip");
+        res.set_header("Vary", "Accept-Encoding");
+        res.set_header("X-Got-Accept-Encoding", req.get_header_value("Accept-Encoding"));
+        res.set_content(opaque, "application/json");
+    });
+    up.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:1";
+    cfg.waterapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_decompress(false);  // this test client has no zlib either; read the raw bytes
+    auto r = cli.Get("/api/v1/water/station/map?country=US", {{"Accept-Encoding", "gzip, br"}});
+    CHECK(r && r->status == 200);
+    CHECK(r->get_header_value("Content-Encoding") == "gzip");
+    CHECK(r->get_header_value("Content-Type") == "application/json");
+    CHECK(r->get_header_value("X-Got-Accept-Encoding") == "gzip, br");  // the caller's own ask
+    CHECK(r->body == opaque);
+}
+
+void the_water_route_goes_through_every_guard() {
+    TestServer water;
+    install_tagged_upstream(water.server, "waterapi");
+    water.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:1";
+    cfg.waterapi_upstream = "http://127.0.0.1:" + std::to_string(water.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    // Traversal is refused before an upstream is chosen, in either direction.
+    auto out = cli.Get("/api/v1/water/../news/default");
+    CHECK(out && out->status == 400);
+    auto in = cli.Get("/api/v1/news/../water/station/map");
+    CHECK(in && in->status == 400);
+
+    // A write is gated exactly like docapi's (no secret configured here, so it can never pass).
+    auto post = cli.Post("/api/v1/water/station/map", "{}", "application/json");
+    CHECK(post && post->status == 500);
+    CHECK(post->body.find("upstream") == std::string::npos);
+
+    // The caller's own X-Fish-Role never rides along; waterapi sees cproxy's, once.
+    auto r = cli.Get("/api/v1/water/station/map?country=US", {{"X-Fish-Role", "admin"}});
+    CHECK(r && r->status == 200);
+    CHECK(r->get_header_value("X-Got-Role") == "guest");
+    CHECK(r->get_header_value("X-Got-Role-Count") == "1");
+}
+
+
+/**
+ * A 304 Not Modified with no Content-Length on a kept-alive connection -- the way Kestrel (waterapi)
+ * answers an If-None-Match that matches. Raw socket rather than an httplib::Server, so the response
+ * is byte-for-byte that shape and nothing adds a Content-Length the real upstream never sends. The
+ * connection is held open for `hold_ms` afterwards, as a keep-alive server would.
+ */
+struct Raw304Upstream {
+    int listen_fd = -1;
+    int port = 0;
+    std::thread th;
+
+    explicit Raw304Upstream(int hold_ms) {
+        listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(listen_fd >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        CHECK(::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        CHECK(::listen(listen_fd, 4) == 0);
+        socklen_t len = sizeof(addr);
+        CHECK(::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        port = ntohs(addr.sin_port);
+        th = std::thread([this, hold_ms] {
+            const int fd = ::accept(listen_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            std::string request;
+            char buf[1024];
+            while (request.find("\r\n\r\n") == std::string::npos) {
+                const auto n = ::recv(fd, buf, sizeof(buf), 0);
+                if (n <= 0) break;
+                request.append(buf, static_cast<std::size_t>(n));
+            }
+            const std::string reply =
+                "HTTP/1.1 304 Not Modified\r\nETag: \"CA-ALL-1-2\"\r\n"
+                "Cache-Control: public, max-age=300\r\n\r\n";
+            ::send(fd, reply.data(), reply.size(), 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+            ::close(fd);
+        });
+    }
+    ~Raw304Upstream() {
+        if (th.joinable()) th.join();
+        ::close(listen_fd);
+    }
+};
+
+void a_not_modified_answer_is_relayed_at_once() {
+    Raw304Upstream up(3000);
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:1";
+    cfg.waterapi_upstream = "http://127.0.0.1:" + std::to_string(up.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_read_timeout(15, 0);
+    const auto started = std::chrono::steady_clock::now();
+    auto r = cli.Get("/api/v1/water/station/map?country=CA", {{"If-None-Match", "\"CA-ALL-1-2\""}});
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - started)
+                          .count();
+    CHECK(r && r->status == 304);
+    CHECK(r->get_header_value("ETag") == "\"CA-ALL-1-2\"");
+    CHECK(r->body.empty());
+    // Before the fix this waited for the upstream to close the connection (3 s here; the full
+    // 10 s read timeout against a real keep-alive server).
+    CHECK(took < 1500);
+
+    // A 304 is an answer, not a failure: the breaker stays closed.
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->body.find("\"waterapi\":\"closed\"") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -1226,6 +1519,7 @@ int main() {
     gated_read_path_requires_a_bearer_token();
     the_day_key_header_is_never_a_credential();
     no_secret_shuts_the_gated_surface();
+    no_audience_shuts_the_gated_surface();
     gated_read_path_can_be_disabled();
     datacenter_ip_is_refused_with_500();
     datacenter_block_has_escape_hatches();
@@ -1242,6 +1536,12 @@ int main() {
     a_bad_or_anonymous_token_is_capped_like_no_token();
     a_registered_user_and_an_admin_are_not_capped();
     only_the_news_list_is_rewritten();
+    the_water_prefix_goes_to_waterapi_and_everything_else_to_docapi();
+    without_a_waterapi_upstream_the_prefix_is_just_docapi();
+    a_waterapi_outage_never_trips_the_docapi_breaker();
+    a_compressed_upstream_body_passes_through_untouched();
+    the_water_route_goes_through_every_guard();
+    a_not_modified_answer_is_relayed_at_once();
     std::cout << "proxy_test: all assertions passed\n";
     return 0;
 }
