@@ -302,6 +302,11 @@ void daykey_paths_gate_reads_by_default() {
     CHECK(!c.daykey_required("GET", "/api/v1/news/list"));
     CHECK(!c.daykey_required("GET", "/api/v1/news/search"));
     CHECK(!c.daykey_required("GET", "/api/v1/fish"));
+    // River reads stay open too, including the docapi 1.19.0 search (every criterion rides in the
+    // query string, so a guid= value there is never mistaken for a by-id document path).
+    CHECK(!c.daykey_required("GET", "/api/v1/river/search"));
+    CHECK(!c.daykey_required("GET", "/api/v1/river/unfished"));
+    CHECK(!c.daykey_required("GET", "/api/v1/river/description/1b4e28ba-2fa1-11d2-883f-0016d3cca427"));
     // A near-miss must not be swept in by the new entries either.
     CHECK(!c.daykey_required("GET", "/api/v1/news/moreish"));
     CHECK(!c.daykey_required("GET", "/api/v1/oldnews/more"));
