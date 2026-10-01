@@ -44,8 +44,17 @@ namespace cproxy {
  * `shared_ranges`, when non-null, is used INSTEAD of a privately-loaded range set, so the refresh
  * thread's atomic swap is seen by live traffic without a restart. It must outlive `server`. Tests
  * pass nullptr and get a private store loaded from the config path.
+ *
+ * The MCP path (`cfg.mcp_path`, 0.20.0) is the one exception to the day-key gate: it takes a
+ * long-lived per-client key from `cfg.mcp_keys_db_path` instead (see McpKeyStore), a refused key is a
+ * 401 with `WWW-Authenticate`, each key is rate-limited (429 + `Retry-After`), and the key is not
+ * forwarded upstream. It is served on the plain listener only when `cfg.mcp_allow_plain` is set.
+ *
+ * `tls_server`, when non-null (and the MCP path is configured), gets ONLY `GET /health` and the MCP
+ * path, sharing this call's state. The caller constructs it (an httplib::SSLServer in production).
  */
 void install_routes(httplib::Server& server, const Config& cfg,
-                    CloudRangeStore* shared_ranges = nullptr);
+                    CloudRangeStore* shared_ranges = nullptr,
+                    httplib::Server* tls_server = nullptr);
 
 }  // namespace cproxy

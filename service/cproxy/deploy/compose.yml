@@ -3,11 +3,12 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:23865588159338029c55a5d22676390896b848f5232987e0ec26fe275836e7ab  # 0.19.0 pinned by digest (rollback: 0.18.0 = sha256:0d7653901db260f65794687fb2b6b743ba18be274babdee1d5f0d878025a4c72)
+    image: ghcr.io/balintomsk/cproxy@sha256:231416de7ef00a1f2e337f79bb52d50783ef0434f2ebe7ebe606261d594ae480  # 0.20.0 pinned by digest (rollback: 0.19.0 = sha256:23865588159338029c55a5d22676390896b848f5232987e0ec26fe275836e7ab)
     container_name: cproxy
     restart: unless-stopped
     ports:
       - "80:8080"                                        # public edge; inbound restricted by cproxy-firewall.service (DOCKER-USER allowlist)
+      - "443:8443"                                       # MCP over HTTPS (0.20.0): /health + CPROXY_MCP_PATH only; opened to everyone by PUBLIC_TCP_PORTS in cproxy-firewall.service
     environment:
       # CPROXY_DOCAPI_UPSTREAM is deliberately NOT set here. This repo is public, so the docapi VPC
       # address cannot live in a tracked file — and this file is deployed VERBATIM to
@@ -22,6 +23,22 @@ services:
       # It comes from /mnt/volume_cnode/cproxy/.env; while absent there is no water route at all and
       # /api/v1/water/* reaches docapi (a 404). CPROXY_WATERAPI_PREFIX keeps its default, /api/v1/water/.
       CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the Bearer JWT below, not open
+      # MCP (0.20.0). docapi 1.20.0's read-only MCP server, for Claude Code / Claude Desktop. This ONE
+      # path is exempt from the day-key JWT (an MCP client cannot renew a token that dies at UTC
+      # midnight) and takes a long-lived per-client key instead, checked against SHA-256 hashes in
+      # CPROXY_MCP_KEYS_DB. Keys are made and revoked with deploy/mcp-keys.py; a replaced file is picked
+      # up within 60 s, no restart. Each key is rate-limited (60/min, burst 20 by default).
+      # It is served ONLY on the TLS listener below; the plain port answers it 404 (the key must not
+      # cross the internet in clear text). Rollback without a redeploy: delete these lines, compose up.
+      CPROXY_MCP_PATH: /api/v1/mcp
+      CPROXY_MCP_KEYS_DB: /etc/cproxy/mcpkeys/mcpkeys.sqlite
+      # TLS is terminated IN cproxy, not by a proxy in front -- anything in front would replace the
+      # real peer address that the datacenter block and every log line depend on. The certificate is
+      # read at startup, so a renewal needs `docker restart cproxy` (the certbot deploy hook does it;
+      # see docs/do-update.md). A missing or unreadable certificate disables only this listener.
+      CPROXY_TLS_PORT: "8443"
+      CPROXY_TLS_CERT: /etc/cproxy/tls/fullchain.pem
+      CPROXY_TLS_KEY: /etc/cproxy/tls/privkey.pem
       # Raised from the compiled-in 1 MiB default (2026-09-15, at the user's request). AddNews.aspx's
       # photo-upload PATCH sends a base64-encoded image (+~33% over the raw file) as the request body;
       # a real phone photo up to ~5MB was hitting the old 1 MiB cap as a plain 413 before reaching
@@ -121,8 +138,12 @@ services:
       - /mnt/volume_cnode/cproxy/daykeys/daykeys.sqlite:/etc/cproxy/daykeys.sqlite:ro  # own folder, same volume as logs
       - /mnt/volume_cnode/cproxy/logs:/var/log/cproxy    # rolling logs persist on volume-cnode
       - /mnt/volume_cnode/cproxy/cloudranges:/var/lib/cproxy  # rw: the refresher rewrites range + account mirror dbs here
+      # A DIRECTORY mount on purpose: a single-file bind pins the original inode, so an uploaded
+      # replacement (a new or revoked key) would never be seen inside the container.
+      - /mnt/volume_cnode/cproxy/mcpkeys:/etc/cproxy/mcpkeys:ro
+      - /mnt/volume_cnode/cproxy/tls:/etc/cproxy/tls:ro     # fullchain.pem + privkey.pem, uid 10001, 0400
     read_only: true                                      # binary writes only to the two rw bind mounts
-    cap_drop: [ALL]                                      # binds unprivileged 8080 in-container; needs no capabilities
+    cap_drop: [ALL]                                      # binds unprivileged 8080/8443 in-container; needs no capabilities
     security_opt:
       - no-new-privileges:true
 

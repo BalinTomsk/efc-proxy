@@ -9,6 +9,61 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-09-30: **0.20.0 — the MCP path: its own key, its own rate limit, served over HTTPS. DEPLOYED 2026-10-01
+  — but INACTIVE until a certificate and keys exist.** Digest `231416de…e480`, rollback 0.19.0 `238655881593…e7ab`.
+  The droplet's `compose.yml` matched git before it was replaced (backup `compose.yml.bak-0.19.0`); `mcpkeys/`
+  and `tls/` were created empty on the volume. Startup: version 0.20.0, `jwt` on, waterapi route on,
+  `mcp` `/api/v1/mcp (tls only, 60/min burst 20)`, `tls` off, and exactly the two expected ERRORs (no
+  certificate, no key database). Sweep on the droplet: health/ready 200; fish search, news list, river
+  search, water map 200; gated `/news/featured` and a PATCH without a token 500; MCP on the plain port 404;
+  `/api/v1/mcp/tools` 500 (the day-key gate); DELETE 405; traversal 400; no route 404; nothing on 443. The
+  portal's own token-gated `GET /news/{id}` answered 200 through the new image; restarts 0 a minute apart.
+  The full Postman run was not possible (no current `jwt.txt`). **The firewall's 443 rule was deliberately
+  NOT installed yet**: nothing listens there until the certificate exists.
+  docapi 1.20.0 adds a read-only Model Context Protocol server at `POST /api/v1/mcp` for Claude Code /
+  Claude Desktop. Through 0.19.0 it was unreachable from any MCP client: every POST needs the day-key
+  JWT, which expires at UTC midnight and is minted for a portal session, and an MCP client is configured
+  once with a static header. So this ONE path (`CPROXY_MCP_PATH`, matched exactly, case-folded, after the
+  traversal guard) is exempt from the day-key gate and takes its own credential instead:
+  - **Per-client keys** (`McpKeyStore`): `Authorization: Bearer <key>` checked against SHA-256 hashes
+    in a SQLite file (`CPROXY_MCP_KEYS_DB`, schema `mcp_keys(key_id, token_sha256, label, created_utc,
+    expires_utc, disabled)`), made and revoked with `deploy/mcp-keys.py` (stdlib Python; prints a token
+    once). Unlike the day-key store it is RELOADED: the file's mtime is checked every
+    `CPROXY_MCP_KEYS_RELOAD_SECONDS` (60), so revoking needs no restart; a broken replacement keeps the
+    last good set and logs ERROR. Mount the DIRECTORY, not the file (a file bind pins the old inode).
+  - **A refused key is `401` + `WWW-Authenticate: Bearer realm="fishfind-mcp"`**, not the opaque `500`:
+    an MCP client acts on a 401, and a 256-bit random key leaves a prober nothing to learn.
+  - **Per-key token bucket** (`RateLimiter`): `CPROXY_MCP_RATE_PER_MINUTE` 60, `CPROXY_MCP_BURST` 20;
+    over it `429` + `Retry-After`. A model in a loop must not be able to trip docapi's shared SQL breaker.
+  - **Body cap** `CPROXY_MCP_MAX_PAYLOAD_BYTES` 64 KiB (`413`). **The key is not forwarded** to docapi;
+    `X-Fish-Role` is always `guest`. The success log line carries `mcp=<key_id>`.
+  - **TLS listener** (`CPROXY_TLS_PORT`/`_CERT`/`_KEY`): an `httplib::SSLServer` in this process serving
+    ONLY `/health` and the MCP path, sharing the plain listener's state (breakers, counters, keys, rate
+    budgets). Terminated here rather than by a proxy in front, which would replace `req.remote_addr`
+    and so break the datacenter block and every log line. A certificate that fails to load disables only
+    this listener (ERROR); a renewal needs a restart. `X-Forwarded-Proto: https` on that listener.
+  - **TLS only by default**: the plain listener answers the MCP path `404` unless `CPROXY_MCP_ALLOW_PLAIN`
+    is true, so a long-lived key never crosses the internet in clear text.
+  - `/metrics` adds `cproxy_mcp_requests_total{outcome="accepted|unauthorized|rate_limited"}`.
+  - `deploy/`: `compose.yml` publishes `443:8443`, sets the MCP/TLS variables and mounts `mcpkeys/` and
+    `tls/`; `cproxy-firewall.sh` opens `PUBLIC_TCP_PORTS` to every address (matched with
+    `--ctorigdstport`, because DOCKER-USER sees the post-DNAT container port), and the unit sets
+    `PUBLIC_TCP_PORTS=443`. Port 80 stays on the allow file.
+  - **Tests:** 11 suites green in the Docker build stage. New `mcp_key_store_test` (hashing, disabled /
+    expired / inclusive-expiry keys, malformed files, live reload and revocation, keep-last-good, the
+    reload interval, the token bucket); `config_test` +4 (defaults, exact normalized matching, the real
+    environment, startup errors); `proxy_test` +6 (own key instead of the day-key, key not forwarded,
+    exemption is the exact path only, TLS-only default, no key store = 401, rate limit + metrics, body
+    cap, and a real TLS round trip on a generated self-signed certificate: only `/health` and the MCP
+    path answer, `X-Forwarded-Proto: https`). **End to end** in the Rancher VM with the docapi 1.20.0 image
+    on a private network: initialize / tools/list / tools/call over HTTPS, notification 202, no or wrong
+    key 401 with `WWW-Authenticate`, GET 405 from docapi, other paths 404 on TLS, MCP 404 on the plain
+    port, other POSTs still 500 at the day-key gate, 429 past the burst, and a key revoked with
+    `mcp-keys.py disable` refused within the reload interval with no restart.
+  - **Before deploying** (docs/do-update.md → "0.20.0"): a hostname and a DNS-01 certificate (HTTP-01
+    cannot reach the allowlisted port 80), the key file, the firewall unit. Rollback: drop the
+    `CPROXY_MCP_*`/`CPROXY_TLS_*` lines and `compose up -d`, or the 0.19.0 digest.
+
 - 2026-09-24: **0.19.0 — no portal name in the public source; three settings now come only from the
   private dotenv. DEPLOYED 2026-09-24**, digest `238655881593…e7ab`, with rollback to 0.18.0 `0d7653901db2…4c72`.
   Startup was clean: no ERROR or WARN, the account mirror loaded 15 accounts, and the RabbitMQ consumer

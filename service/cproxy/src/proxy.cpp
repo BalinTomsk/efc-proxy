@@ -23,6 +23,8 @@
 #include "day_key_store.hpp"
 #include "jwt_verifier.hpp"
 #include "log.hpp"
+#include "mcp_key_store.hpp"
+#include "rate_limiter.hpp"
 #include "user_prime_store.hpp"
 #include "version.hpp"
 
@@ -39,6 +41,15 @@ struct Metrics {
     long long upstream_failures = 0;    // transport failures (unreachable/timeout)
     long long short_circuited = 0;      // requests refused without touching the upstream
     long long retries = 0;
+    // MCP path (0.20.0): requests let through, refused for the key, refused for the rate.
+    long long mcp_accepted = 0;
+    long long mcp_unauthorized = 0;
+    long long mcp_rate_limited = 0;
+
+    void observe_mcp(long long Metrics::*counter) {
+        std::lock_guard<std::mutex> lock(mu);
+        ++(this->*counter);
+    }
 
     void observe_response(int status) {
         std::lock_guard<std::mutex> lock(mu);
@@ -94,6 +105,11 @@ struct ProxyState {
     // at zero (the host clock) on every start — see ClockOffset for why this is an in-process offset
     // and not the system clock.
     ClockOffset clock;
+    // The MCP path's credential and per-key limit (0.20.0). Built only when CPROXY_MCP_PATH is set.
+    // A key store that fails to load stays EMPTY, and every MCP request then answers 401 -- fail
+    // closed like the day-key store, but confined to the one path; nothing else depends on it.
+    std::optional<McpKeyStore> mcp_keys;
+    std::optional<RateLimiter> mcp_limiter;
 
     explicit ProxyState(const Config& cfg, CloudRangeStore* shared_ranges)
         : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
@@ -137,6 +153,27 @@ struct ProxyState {
                 "\"accounts\":{},\"admins\":{},\"error\":\"{}\"}}",
                 degraded ? (cfg.jwt_require_user ? "ERROR" : "WARN") : "INFO",
                 user_prime_store->size(), user_prime_store->admin_count(), load_error));
+        }
+        if (cfg.mcp_enabled()) {
+            mcp_limiter.emplace(cfg.mcp_rate_per_minute, cfg.mcp_burst);
+            if (cfg.mcp_keys_db_path.empty()) {
+                log_raw("{\"service\":\"cproxy\",\"level\":\"ERROR\",\"msg\":\"CPROXY_MCP_KEYS_DB "
+                        "is unset: every MCP request will answer 401\"}");
+            } else {
+                try {
+                    mcp_keys.emplace(cfg.mcp_keys_db_path, cfg.mcp_keys_reload_seconds);
+                    // WARN on zero: valid (every key revoked) but almost certainly not intended.
+                    log_raw(std::format(
+                        "{{\"service\":\"cproxy\",\"level\":\"{}\",\"msg\":\"MCP key store loaded\","
+                        "\"keys\":{}}}",
+                        mcp_keys->size() == 0 ? "WARN" : "INFO", mcp_keys->size()));
+                } catch (const std::exception& ex) {
+                    log_raw(std::format(
+                        "{{\"service\":\"cproxy\",\"level\":\"ERROR\","
+                        "\"msg\":\"MCP key database failed to load, every MCP request will 401: {}\"}}",
+                        ex.what()));
+                }
+            }
         }
         if (!cfg.cloudrange_db_path.empty()) {
             try {
@@ -534,7 +571,7 @@ Upstream select_upstream(const Config& cfg, ProxyState& state, const httplib::Re
  * response back. Every guard below applies to both upstreams identically.
  */
 void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Request& req,
-                     httplib::Response& res) {
+                     httplib::Response& res, bool via_tls) {
     const std::string rid = request_id(req);
     res.set_header("X-Request-Id", rid);
 
@@ -609,7 +646,57 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // it just means "guest". So the open surface stays open, and docapi can still tell a registered
     // user or an admin from an anonymous caller without ever being asked to believe the caller.
     std::string role = "guest";
-    if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
+    // The MCP path (0.20.0) has its OWN credential and is exempt from the day-key gate below -- an
+    // MCP client cannot hold a token that dies at UTC midnight. Matched on both forms of the path, the
+    // same union as the gate, and decided here, after the traversal guard, so no request can be
+    // re-pointed at another route once it has been let through as MCP.
+    //
+    // A refused key answers 401 with WWW-Authenticate, not the opaque 500 of the day-key gate: an MCP
+    // client acts on a 401 (it reports "authentication failed" instead of "server error"), and what a
+    // prober learns -- "this path wants a key" -- is nothing, given a 256-bit random key.
+    const bool mcp = cfg.is_mcp_path(req.path) || cfg.is_mcp_path(target_path);
+    std::string mcp_key_id;
+    if (mcp) {
+        if (!via_tls && !cfg.mcp_allow_plain) {
+            write_error(res, 404, "not_found", "No route");
+            log_request(std::format("{} {} -> 404 (mcp is served over TLS only)", req.method, req.path),
+                        req.remote_addr, rid);
+            return;
+        }
+        if (req.body.size() > static_cast<std::size_t>(cfg.mcp_max_payload_bytes)) {
+            write_error(res, 413, "payload_too_large", "Request body too large");
+            log_request(std::format("{} {} -> 413 (mcp body {} bytes)", req.method, req.path, req.body.size()),
+                        req.remote_addr, rid);
+            return;
+        }
+        const std::string token = bearer_token(req.get_header_value("Authorization"));
+        std::optional<McpKey> key;
+        if (!token.empty() && state.mcp_keys.has_value()) {
+            key = state.mcp_keys->find(token, state.clock.now());
+        }
+        if (!key) {
+            state.metrics.observe_mcp(&Metrics::mcp_unauthorized);
+            res.set_header("WWW-Authenticate", "Bearer realm=\"fishfind-mcp\"");
+            write_error(res, 401, "unauthorized", "Missing or invalid MCP key");
+            const char* reason = token.empty()                 ? "no bearer token presented"
+                                 : !state.mcp_keys.has_value() ? "mcp key store unavailable"
+                                                               : "unknown, disabled or expired mcp key";
+            log_request(std::format("{} {} -> 401 ({})", req.method, req.path, reason), req.remote_addr, rid);
+            return;
+        }
+        int retry_after = 0;
+        if (!state.mcp_limiter->allow(key->key_id, std::chrono::steady_clock::now(), retry_after)) {
+            state.metrics.observe_mcp(&Metrics::mcp_rate_limited);
+            res.set_header("Retry-After", std::to_string(retry_after));
+            write_error(res, 429, "rate_limited", "Too many requests for this MCP key");
+            log_request(std::format("{} {} -> 429 (mcp={} rate limited, retry {}s)", req.method, req.path,
+                                    key->key_id, retry_after),
+                        req.remote_addr, rid);
+            return;
+        }
+        state.metrics.observe_mcp(&Metrics::mcp_accepted);
+        mcp_key_id = key->key_id;
+    } else if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const CredentialCheck credential =
             check_gate_credential(cfg, state, req, state.clock.now());
         if (!credential.ok) {
@@ -650,7 +737,11 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     out.path = target;
     out.body = req.body;
     for (const auto& [k, v] : req.headers) {
-        if (!is_unforwardable(k)) out.set_header(k.c_str(), v.c_str());
+        if (is_unforwardable(k)) continue;
+        // The MCP key is cproxy's credential, not docapi's: it stops here, so it never sits in an
+        // upstream log or a heap dump on the other droplet.
+        if (mcp && iequals(k, "Authorization")) continue;
+        out.set_header(k.c_str(), v.c_str());
     }
     // is_unforwardable drops Content-Type because the RESPONSE side reads it straight off the
     // upstream's own reply instead of copying it — but for the OUTBOUND request that means no
@@ -664,7 +755,7 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // Standard forwarding provenance headers + the correlation id.
     out.set_header("X-Forwarded-For", req.remote_addr);
     out.set_header("X-Forwarded-Host", req.get_header_value("Host"));
-    out.set_header("X-Forwarded-Proto", "http");
+    out.set_header("X-Forwarded-Proto", via_tls ? "https" : "http");
     out.set_header("X-Request-Id", rid);
     // The verified role. The inbound X-Fish-Role, if any, was dropped by is_unforwardable, so this is
     // the only one docapi ever sees.
@@ -720,7 +811,8 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         if (!is_unforwardable(k)) res.set_header(k.c_str(), v.c_str());
     }
     res.set_content(answer->body, content_type.c_str());
-    log_request(std::format("{} {} -> {} ({}ms)", req.method, req.path, answer->status, took),
+    log_request(std::format("{} {} -> {} ({}ms){}", req.method, req.path, answer->status, took,
+                            mcp_key_id.empty() ? std::string{} : " mcp=" + mcp_key_id),
                 req.remote_addr, rid);
 }
 
@@ -759,6 +851,13 @@ std::string render_metrics(const ProxyState& state, bool waterapi_enabled) {
         out += "# HELP cproxy_short_circuited_total Requests refused with the breaker open.\n";
         out += "# TYPE cproxy_short_circuited_total counter\n";
         out += std::format("cproxy_short_circuited_total {}\n", state.metrics.short_circuited);
+        out += "# HELP cproxy_mcp_requests_total MCP-path requests, by gate outcome.\n";
+        out += "# TYPE cproxy_mcp_requests_total counter\n";
+        out += std::format("cproxy_mcp_requests_total{{outcome=\"accepted\"}} {}\n", state.metrics.mcp_accepted);
+        out += std::format("cproxy_mcp_requests_total{{outcome=\"unauthorized\"}} {}\n",
+                           state.metrics.mcp_unauthorized);
+        out += std::format("cproxy_mcp_requests_total{{outcome=\"rate_limited\"}} {}\n",
+                           state.metrics.mcp_rate_limited);
     }
     out += "# HELP cproxy_breaker_state Upstream circuit breaker: 0 closed, 1 open, 2 half-open.\n";
     out += "# TYPE cproxy_breaker_state gauge\n";
@@ -775,7 +874,8 @@ std::string render_metrics(const ProxyState& state, bool waterapi_enabled) {
 
 }  // namespace
 
-void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore* shared_ranges) {
+void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore* shared_ranges,
+                    httplib::Server* tls_server) {
     // Per-server state (breaker + counters), captured by value into every handler so it lives
     // exactly as long as they do. See ProxyState for why this is not a global.
     auto state = std::make_shared<ProxyState>(cfg, shared_ranges);
@@ -785,12 +885,13 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
 
     // Liveness: is the proxy process itself serving? Never depends on the upstream, so an upstream
     // outage does not make an orchestrator kill an otherwise-healthy proxy.
-    server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    const auto health = [](const httplib::Request&, httplib::Response& res) {
         res.set_content(
             std::format("{{\"status\":\"UP\",\"service\":\"cproxy\",\"version\":\"{}\"}}",
                         CPROXY_VERSION),
             "application/json");
-    });
+    };
+    server.Get("/health", health);
 
     // Readiness: can this proxy currently serve useful traffic? Reports the breaker's view of the
     // upstream (503 while open) rather than probing on demand, which would hammer a sick upstream.
@@ -820,7 +921,7 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
     // limit would never fire. Registered routes get the body read (and capped) first.
     const std::string pattern = regex_escape(cfg.route_prefix) + ".*";
     const auto forward = [&cfg, state](const httplib::Request& req, httplib::Response& res) {
-        proxy_to_docapi(cfg, *state, req, res);
+        proxy_to_docapi(cfg, *state, req, res, false);
     };
     server.Get(pattern, forward);  // also serves HEAD
     server.Post(pattern, forward);
@@ -832,7 +933,7 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
     // Fires for every >=400 response; our own handlers already wrote a JSON body, so only the
     // server-generated fallbacks (no-route 404, oversized 413) arrive here empty. Logging them
     // makes scanner probing visible (/health stays unlogged - the HEALTHCHECK runs every 30s).
-    server.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+    const auto on_error = [](const httplib::Request& req, httplib::Response& res) {
         if (!res.body.empty()) return;
         const char* code = res.status == 404   ? "not_found"
                            : res.status == 413 ? "payload_too_large"
@@ -845,14 +946,33 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
                         "application/json");
         log_request(std::format("{} {} -> {}", req.method, req.path, res.status), req.remote_addr,
                     request_id(req));
-    });
+    };
+    server.set_error_handler(on_error);
 
     // Runs for EVERY response (after the error handler, before the bytes go out), so it is the one
     // place that sees every status exactly once - proxied, local, and server-generated alike.
-    server.set_post_routing_handler(
-        [state](const httplib::Request&, const httplib::Response& res) {
-            state->metrics.observe_response(res.status);
-        });
+    const auto count_response = [state](const httplib::Request&, const httplib::Response& res) {
+        state->metrics.observe_response(res.status);
+    };
+    server.set_post_routing_handler(count_response);
+
+    // The TLS listener (0.20.0): /health and the MCP path, nothing else -- not /metrics, not
+    // /health/ready, not the rest of /api/. It shares this state (breakers, counters, key store, rate
+    // limits) with the plain listener, so a key's budget is one budget whichever port it arrives on.
+    if (tls_server != nullptr && cfg.mcp_enabled()) {
+        tls_server->set_payload_max_length(static_cast<size_t>(cfg.mcp_max_payload_bytes));
+        tls_server->Get("/health", health);
+        const std::string mcp_pattern = regex_escape(cfg.mcp_path) + "/?";
+        const auto forward_tls = [&cfg, state](const httplib::Request& req, httplib::Response& res) {
+            proxy_to_docapi(cfg, *state, req, res, true);
+        };
+        tls_server->Get(mcp_pattern, forward_tls);
+        tls_server->Post(mcp_pattern, forward_tls);
+        tls_server->Delete(mcp_pattern, forward_tls);
+        tls_server->Options(mcp_pattern, forward_tls);
+        tls_server->set_error_handler(on_error);
+        tls_server->set_post_routing_handler(count_response);
+    }
 }
 
 }  // namespace cproxy

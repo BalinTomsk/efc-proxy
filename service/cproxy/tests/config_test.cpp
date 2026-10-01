@@ -593,6 +593,91 @@ void a_bad_waterapi_config_is_a_startup_error() {
     CHECK(problems({{"CPROXY_WATERAPI_PREFIX", "/water/"}}).empty());
 }
 
+void mcp_and_tls_are_off_by_default() {
+    Config c = load_config(make_env({}));
+    CHECK(!c.mcp_enabled());
+    CHECK(!c.is_mcp_path("/api/v1/mcp"));
+    CHECK(!c.mcp_allow_plain);
+    CHECK(c.mcp_rate_per_minute == 60);
+    CHECK(c.mcp_burst == 20);
+    CHECK(c.mcp_max_payload_bytes == 65536);
+    CHECK(c.mcp_keys_reload_seconds == 60);
+    CHECK(!c.tls_enabled());
+    CHECK(validate_config(c).empty());
+}
+
+void the_mcp_path_is_normalized_and_matched_exactly() {
+    Config c = load_config(make_env({{"CPROXY_MCP_PATH", " /API/v1/MCP/ "}}));
+    CHECK(c.mcp_path == "/api/v1/mcp");
+    CHECK(c.is_mcp_path("/api/v1/mcp"));
+    CHECK(c.is_mcp_path("/API/V1/Mcp/"));
+    // Exact, never a prefix: nothing UNDER the path, and no longer sibling, borrows its exemption.
+    CHECK(!c.is_mcp_path("/api/v1/mcp/tools"));
+    CHECK(!c.is_mcp_path("/api/v1/mcpx"));
+    CHECK(!c.is_mcp_path("/api/v1"));
+    CHECK(validate_config(c).empty());
+
+    CHECK(!load_config(make_env({{"CPROXY_MCP_PATH", "NONE"}})).mcp_enabled());
+    CHECK(!load_config(make_env({{"CPROXY_MCP_PATH", "/"}})).mcp_enabled());
+}
+
+void mcp_and_tls_settings_work_through_the_real_environment() {
+    put_real_env("CPROXY_MCP_PATH", "/api/v1/mcp");
+    put_real_env("CPROXY_MCP_ALLOW_PLAIN", "true");
+    put_real_env("CPROXY_MCP_RATE_PER_MINUTE", "30");
+    put_real_env("CPROXY_TLS_PORT", "8443");
+    put_real_env("CPROXY_TLS_CERT", "/etc/cproxy/tls/fullchain.pem");
+    put_real_env("CPROXY_TLS_KEY", "/etc/cproxy/tls/privkey.pem");
+    Config c = load_config(system_env);
+    CHECK(c.is_mcp_path("/api/v1/mcp"));
+    CHECK(c.mcp_allow_plain);
+    CHECK(c.mcp_rate_per_minute == 30);
+    CHECK(c.tls_port == 8443);
+    CHECK(validate_config(c).empty());
+    // Empty reads as unset, which here means "no MCP route" and "plain refused" -- the safe direction.
+    put_real_env("CPROXY_MCP_PATH", "");
+    put_real_env("CPROXY_MCP_ALLOW_PLAIN", "");
+    put_real_env("CPROXY_TLS_PORT", "");
+    Config off = load_config(system_env);
+    CHECK(!off.mcp_enabled());
+    CHECK(!off.mcp_allow_plain);
+    CHECK(!off.tls_enabled());
+    for (const char* name : {"CPROXY_MCP_PATH", "CPROXY_MCP_ALLOW_PLAIN", "CPROXY_MCP_RATE_PER_MINUTE",
+                             "CPROXY_TLS_PORT", "CPROXY_TLS_CERT", "CPROXY_TLS_KEY"}) {
+        put_real_env(name, nullptr);
+    }
+}
+
+void a_bad_mcp_or_tls_config_is_a_startup_error() {
+    auto problems = [](std::map<std::string, std::string> env) {
+        return validate_config(load_config(make_env(std::move(env))));
+    };
+    // Outside the route prefix: the forwarding routes would never see it.
+    CHECK(!problems({{"CPROXY_MCP_PATH", "/mcp"}}).empty());
+    // Under the water prefix: it would be sent to waterapi.
+    CHECK(!problems({{"CPROXY_MCP_PATH", "/api/v1/water/mcp"},
+                     {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"}}).empty());
+    CHECK(!problems({{"CPROXY_MCP_PATH", "/api/v1/mcp"}, {"CPROXY_MCP_BURST", "0"}}).empty());
+    CHECK(!problems({{"CPROXY_MCP_PATH", "/api/v1/mcp"}, {"CPROXY_MCP_RATE_PER_MINUTE", "-1"}}).empty());
+    // TLS needs a certificate, a key, its own port, and the one path it exists to serve.
+    const std::map<std::string, std::string> tls = {{"CPROXY_MCP_PATH", "/api/v1/mcp"},
+                                                    {"CPROXY_TLS_PORT", "8443"},
+                                                    {"CPROXY_TLS_CERT", "/c.pem"},
+                                                    {"CPROXY_TLS_KEY", "/k.pem"}};
+    CHECK(problems(tls).empty());
+    auto without = [&](const char* key) {
+        auto m = tls;
+        m.erase(key);
+        return problems(m);
+    };
+    CHECK(!without("CPROXY_TLS_CERT").empty());
+    CHECK(!without("CPROXY_TLS_KEY").empty());
+    CHECK(!without("CPROXY_MCP_PATH").empty());
+    auto same_port = tls;
+    same_port["CPROXY_TLS_PORT"] = "8080";
+    CHECK(!problems(same_port).empty());
+}
+
 }  // namespace
 
 int main() {
@@ -623,6 +708,10 @@ int main() {
     an_empty_clock_sync_variable_reads_as_unset_not_as_off();
     a_ceiling_below_the_threshold_is_refused();
     a_zero_ceiling_is_legal_and_pins_the_host_clock();
+    mcp_and_tls_are_off_by_default();
+    the_mcp_path_is_normalized_and_matched_exactly();
+    mcp_and_tls_settings_work_through_the_real_environment();
+    a_bad_mcp_or_tls_config_is_a_startup_error();
     std::cout << "config_test: all assertions passed\n";
     return 0;
 }
