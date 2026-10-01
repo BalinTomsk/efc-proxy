@@ -108,7 +108,7 @@ does **not** turn file logging off — it falls back to `logs`.
 
 A REST call whose peer address falls in published datacenter space is refused with an opaque `500`
 before any other guard runs. This is the cproxy half of the frontend's `dbo.CloudProviderIpRange`
-control (see `aspnet/Account/CLAUDE.md`): real anglers come from residential and mobile ISPs, so
+control (see `aspnet/Account/AGENTS.md`): real anglers come from residential and mobile ISPs, so
 sustained traffic from AWS/GCP/Azure/Oracle/DigitalOcean/Alibaba and friends is bots and scrapers.
 
 - **Same shape as the frontend's table** — one row per published CIDR, expanded to an inclusive
@@ -235,7 +235,7 @@ docapi stays private (not bound to `0.0.0.0`; `10.112.32.3:8080` refuses from th
 day-key-gated write surface (see "Day-key store" above); every other write verb still 405s.
 
 The docapi dual-bind is baked into that service's `update-docapi` skill so future docapi deploys keep it.
-See `CLAUDE.md` → Deployment for the run command and lock-down options.
+See `AGENTS.md` → Deployment for the run command and lock-down options.
 
 ## Access control & hardened run config (`deploy/`)
 
@@ -299,7 +299,7 @@ Two arms decide what is gated, and either one is enough:
   value reads as *unset* and leaves the default in place.
 
 The database is generated out-of-band (never from source) and deployed like any other secret — see
-`secret/daykeys.sqlite` (gitignored) and `CLAUDE.md` → "Day-key store" for the full design and deploy
+`secret/daykeys.sqlite` (gitignored) and `AGENTS.md` → "Day-key store" for the full design and deploy
 path.
 
 ### JWT credential (0.10.0; the only credential since 0.13.0)

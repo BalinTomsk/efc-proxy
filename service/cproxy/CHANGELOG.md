@@ -1,12 +1,12 @@
 # cproxy Changelog
 
-Split out of `CLAUDE.md` for readability. `CLAUDE.md` stays local-only (gitignored); this file is
+Split out of `AGENTS.md` for readability. `AGENTS.md` stays local-only (gitignored); this file is
 tracked. Newest entries first.
 
 > **Addresses here are placeholders.** This repo is public, so every real host is written as
 > `<cproxy-droplet>`, `<docapi-droplet>`, `<second-droplet>`, `<docapi-vpc>`, `<vpc-cidr>`,
 > `<admin-ip>` (`EXTERNAL_ADMIN`), `<frontend-ip>` / `<frontend-egress-ip>` (`EXTERNAL_FRONTEND`).
-> The real values live in the gitignored `CLAUDE.md` → Deployment/Reachability and in `secret/`.
+> The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
 - 2026-09-24: **0.19.0 — no portal name in the public source; three settings now come only from the
@@ -150,7 +150,7 @@ tracked. Newest entries first.
     `docs/gen-postman.py` → regenerated `docs/postman-collection.json` (**57 requests, was 54**: two
     gate negatives plus an *ungated* `/news/list` positive that fails if the id gate is ever widened
     too far — the positive lives in the News folder, not in the negatives folder whose contract is
-    "everything here is refused"), `README.md`, `CLAUDE.md`, `docs/specification.md`, `.env.example`.
+    "everything here is refused"), `README.md`, `AGENTS.md`, `docs/specification.md`, `.env.example`.
   - **DEPLOYED and verified live 2026-09-14**, digest
     `sha256:dc7b9b460ecbdfdc46fa086ac633fc3efac27fc877d253104dbdb833aa229b68`, pinned in
     `deploy/compose.yml`. `/health` → `0.15.0`, 0 restarts, startup clean (day-key store 3,652 days,
@@ -614,7 +614,7 @@ tracked. Newest entries first.
 
 - 2026-09-02: **0.8.0 — datacenter / cloud-provider IP blocking, with an in-process fortnightly
   feed refresher.**
-  Ports the frontend's `dbo.CloudProviderIpRange` control (`aspnet/Account/CLAUDE.md`) to the
+  Ports the frontend's `dbo.CloudProviderIpRange` control (`aspnet/Account/AGENTS.md`) to the
   gateway: a REST call whose peer address falls in published datacenter space is refused with the
   same opaque `500` as a failed day-key, **before every other guard**. Real anglers come from
   residential/mobile ISPs; sustained traffic from AWS/GCP/Azure/Oracle/DO/Alibaba is bots.
@@ -705,7 +705,7 @@ tracked. Newest entries first.
     sentinel (the same idiom `CPROXY_ALLOWED_METHODS` already uses for `ALL`) and added a test that
     asserts the empty case through `system_env` itself so the discrepancy cannot come back.
   - **`CPROXY_LOG_DIR` had the identical trap, and is fixed in this same 0.7.0 (undeployed, so no
-    released behaviour changes).** CLAUDE.md and the spec both documented `CPROXY_LOG_DIR=""` as the
+    released behaviour changes).** AGENTS.md and the spec both documented `CPROXY_LOG_DIR=""` as the
     console-only switch; through a real process environment it never was one — `system_env` collapses
     an empty variable to `nullopt`, the `if (auto ld = env(...))` never fired, and the service went on
     writing rolling files. Confirmed in a container: `-e CPROXY_LOG_DIR=` logs `"log_dir":"logs"`,
@@ -729,7 +729,7 @@ tracked. Newest entries first.
       the bug:** rebuilt the old `config.cpp` against the new test with the `make_env` sentinel
       assertions removed, and the real-environment test alone fails
       (`CHECK failed: load_config().log_dir.empty()`).
-    - **Docs corrected** (all four had documented the broken behaviour as working): `CLAUDE.md`,
+    - **Docs corrected** (all four had documented the broken behaviour as working): `AGENTS.md`,
       `docs/specification.md`, `README.md`, `.env.example` — plus a general rule in each: *empty always
       means "use the default", every off switch is a word* (`ALL` / `NONE`), and a new switch must be
       asserted through `system_env` and the real environment. Noted the one asymmetry: the dotenv layer

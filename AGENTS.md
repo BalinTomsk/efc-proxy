@@ -10,4 +10,4 @@
 
 ## Documentation
 
-- **README files must NEVER contain external (public) real IP addresses.** Redact any to a placeholder (a documentation IP or a `<host>` token) and remove any that already exist. Real deploy addresses belong in the gitignored operational docs (`CLAUDE.md`, `docs/do-update.md`), not in a tracked README.
+- **README files must NEVER contain external (public) real IP addresses.** Redact any to a placeholder (a documentation IP or a `<host>` token) and remove any that already exist. Real deploy addresses belong in the gitignored operational docs (`AGENTS.md`, `docs/do-update.md`), not in a tracked README.
