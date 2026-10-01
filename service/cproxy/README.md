@@ -96,6 +96,13 @@ probing is visible.
 | `CPROXY_UPSTREAM_RETRY` | `1` | retry idempotent requests once on a transport failure (`0` disables) |
 | `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `NONE` = console-only (an empty value reads as unset) |
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
+| `CPROXY_MCP_PATH` | (empty = no MCP route) | exact path of docapi's MCP endpoint, e.g. `/api/v1/mcp` (see "MCP path" below) |
+| `CPROXY_MCP_KEYS_DB` | (empty = every MCP request 401s) | SQLite file of hashed MCP client keys (`deploy/mcp-keys.py`) |
+| `CPROXY_MCP_KEYS_RELOAD_SECONDS` | `60` | how often the key file is checked for changes (`0` = every request) |
+| `CPROXY_MCP_RATE_PER_MINUTE` / `CPROXY_MCP_BURST` | `60` / `20` | per-key token bucket; over it `429` + `Retry-After` |
+| `CPROXY_MCP_MAX_PAYLOAD_BYTES` | `65536` | MCP request bodies above this are rejected `413` |
+| `CPROXY_MCP_ALLOW_PLAIN` | `false` | also serve the MCP path on the plain-HTTP listener (local testing) |
+| `CPROXY_TLS_PORT` / `CPROXY_TLS_CERT` / `CPROXY_TLS_KEY` | `0` (off) | HTTPS listener serving only `/health` and the MCP path |
 
 See `.env.example`. No config file — everything is env, so one image runs anywhere.
 
@@ -350,9 +357,33 @@ blocks a request: `/news/list` stays open, and a token that does not verify is j
 only ever be given the first 100 rows; a user or admin is forwarded untouched. The account
 mirror is opened whenever a JWT secret is configured.
 
+## MCP path (0.20.0)
+
+docapi 1.20.0 serves a read-only Model Context Protocol endpoint (`POST /api/v1/mcp`) for Claude Code and
+Claude Desktop. An MCP client is configured once with a static header, so it cannot carry the day-key
+JWT (which expires at UTC midnight). That one path therefore has its own credential and is exempt from
+the day-key gate:
+
+- **Per-client keys.** `Authorization: Bearer <key>`, checked against SHA-256 hashes in
+  `CPROXY_MCP_KEYS_DB`. `deploy/mcp-keys.py add <id>` creates a key and prints its token once;
+  `disable <id>` revokes it. The file is re-read when it changes, so no restart is needed (mount its
+  directory, not the file). A refused key is `401` with `WWW-Authenticate: Bearer`.
+- **Exact path only.** Anything under it, and every other write, still needs the day-key token. The key
+  is not forwarded upstream, and docapi is told the caller is a `guest`.
+- **Rate-limited per key** (`429` + `Retry-After`) so one runaway client cannot trip docapi's breaker.
+- **HTTPS only.** `CPROXY_TLS_PORT` starts a second listener, in this process, that serves only `/health`
+  and the MCP path. The plain listener answers the MCP path `404` unless `CPROXY_MCP_ALLOW_PLAIN=true`.
+  TLS is terminated here rather than in front so that the real peer address stays visible to the
+  datacenter block and the logs.
+
+```bash
+claude mcp add --transport http fishfind https://<mcp-host>/api/v1/mcp --header "Authorization: Bearer <key>"
+```
+
 ## Tests
 
-`ctest` runs nine suites: `config_test` (config parsing — defaults, overrides, method allow-list,
+`ctest` runs eleven suites (`clock_offset_test` and, since 0.20.0, `mcp_key_store_test` — key hashing,
+revocation, live reload and the per-key rate limiter — join the ones described here): `config_test` (config parsing — defaults, overrides, method allow-list,
 malformed-value fallback), `secret_codec_test`, `proxy_test`, `breaker_test`, `day_key_store_test`
 (the yesterday/today/tomorrow window, both directions of the year boundary, the leap-day-366 clamp,
 and the fail-loud-on-a-bad-database cases), `cloud_range_store_test`, `account_mirror_store_test`,

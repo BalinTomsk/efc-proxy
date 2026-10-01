@@ -44,6 +44,15 @@ namespace cproxy {
  * | CPROXY_CLOUDRANGE_REFRESH_HOURS | 336 (fortnightly)         | interval between provider-feed refreshes  |
  * | CPROXY_CLOUDRANGE_PROVIDERS | (all known)                   | CSV of provider feeds ("NONE" disables the refresh) |
  * | CPROXY_CLOUDRANGE_EXEMPT_IPS| (empty)                       | CSV never blocked (admin/frontend always exempt) |
+ * | CPROXY_MCP_PATH             | (empty = no MCP route)        | exact path of docapi's MCP endpoint, e.g. /api/v1/mcp |
+ * | CPROXY_MCP_KEYS_DB          | (empty)                       | SQLite of hashed MCP client keys; empty = every MCP request 401s |
+ * | CPROXY_MCP_KEYS_RELOAD_SECONDS | 60                         | how often the key file's mtime is checked (0 = every request) |
+ * | CPROXY_MCP_RATE_PER_MINUTE  | 60                            | sustained MCP requests per key per minute |
+ * | CPROXY_MCP_BURST            | 20                            | MCP requests a key may make back to back  |
+ * | CPROXY_MCP_MAX_PAYLOAD_BYTES| 65536                         | MCP request bodies above this are rejected 413 |
+ * | CPROXY_MCP_ALLOW_PLAIN      | false                         | true = also serve the MCP path on the plain-HTTP listener |
+ * | CPROXY_TLS_PORT             | (0 = off)                     | HTTPS listener serving ONLY /health and the MCP path |
+ * | CPROXY_TLS_CERT / _KEY      | (empty)                       | PEM certificate chain / private key for that listener |
  */
 struct Config {
     std::string listen_addr = "0.0.0.0";
@@ -76,6 +85,46 @@ struct Config {
 
     /** True when `path` (the decoded request path) is served by waterapi rather than docapi. */
     bool routes_to_waterapi(const std::string& path) const;
+
+    // --- MCP path (0.20.0) -------------------------------------------------------------------
+    // docapi's Model Context Protocol endpoint (POST /api/v1/mcp, docapi 1.20.0), for Claude Code /
+    // Claude Desktop. It cannot use the gateway credential: that JWT expires at UTC midnight and is
+    // minted for a portal session, while an MCP client is configured once with a static header. So
+    // this ONE path has its own credential (McpKeyStore: long-lived per-client keys, hashed), its own
+    // per-key rate limit, and is exempt from the day-key gate -- POST included. Everything else about
+    // it is the ordinary docapi route: datacenter block, method allow-list, traversal guard, breaker.
+    //
+    // Matched EXACTLY (case-folded, trailing slash ignored), never as a prefix: nothing under it is
+    // exempted. Empty (the default) means no MCP route -- a POST there is gated like any other write.
+    std::string mcp_path;
+    std::string mcp_keys_db_path;
+    int mcp_keys_reload_seconds = 60;
+    int mcp_rate_per_minute = 60;
+    int mcp_burst = 20;
+    // A JSON-RPC message is a few hundred bytes; nothing an MCP client sends comes near 64 KiB.
+    int mcp_max_payload_bytes = 64 * 1024;
+    // The plain-HTTP listener is allowlisted to the portal and the admin address, and a long-lived key
+    // must not cross the internet in clear text, so by default the MCP path is served ONLY on the TLS
+    // listener and the plain one answers it 404. The tests (and a local run) flip this on.
+    bool mcp_allow_plain = false;
+
+    /** True when CPROXY_MCP_PATH is set, i.e. the MCP route exists. */
+    bool mcp_enabled() const { return !mcp_path.empty(); }
+
+    /** True when `path` IS the MCP path (exact match, case-folded, trailing slash ignored). */
+    bool is_mcp_path(const std::string& path) const;
+
+    // --- TLS listener (0.20.0) ----------------------------------------------------------------
+    // A second listener speaking HTTPS, serving ONLY /health and the MCP path. TLS is terminated in
+    // this process, not by a proxy in front: anything in front would make req.remote_addr its own
+    // address, and the datacenter block and every log line depend on that being the real peer.
+    // The certificate is read once at startup; a renewal needs a container restart.
+    int tls_port = 0;  // 0 = off
+    std::string tls_cert_path;
+    std::string tls_key_path;
+
+    /** True when CPROXY_TLS_PORT is set. */
+    bool tls_enabled() const { return tls_port != 0; }
 
     std::string api_key;                    // empty => no auth required
     std::set<std::string> allowed_methods;  // empty => all methods allowed (stored upper-case)

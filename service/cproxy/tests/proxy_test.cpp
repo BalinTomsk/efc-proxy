@@ -3,6 +3,7 @@
 #include "check.hpp"
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <set>
@@ -15,12 +16,16 @@
 #include <unistd.h>
 
 #include <httplib.h>
+#include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 #include <sqlite3.h>
 
 #include "cloud_range_store.hpp"
 #include "config.hpp"
 #include "day_key_store.hpp"
+#include "mcp_key_store.hpp"
 #include "proxy.hpp"
 
 using namespace cproxy;
@@ -1498,7 +1503,246 @@ void a_not_modified_answer_is_relayed_at_once() {
     CHECK(ready && ready->body.find("\"waterapi\":\"closed\"") != std::string::npos);
 }
 
+// ---- MCP path (0.20.0) ---------------------------------------------------------------------------
+
+const char* const kMcpToken = "ffmcp_test-token-0123456789";
+
+/** One active key, `laptop`, whose token is kMcpToken. */
+std::string write_mcp_key_db(const char* name) {
+    const std::string path = (std::filesystem::temp_directory_path() / name).string();
+    std::remove(path.c_str());
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+                       "CREATE TABLE mcp_keys (key_id TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL "
+                       "UNIQUE, label TEXT NOT NULL, created_utc TEXT NOT NULL, expires_utc TEXT NULL, "
+                       "disabled INTEGER NOT NULL DEFAULT 0)",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    const std::string insert = "INSERT INTO mcp_keys VALUES ('laptop', '" + sha256_hex(kMcpToken) +
+                               "', 'test laptop', '2026-09-30', NULL, 0)";
+    CHECK(sqlite3_exec(db, insert.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+    return path;
+}
+
+/** Fake docapi MCP endpoint: echoes the body and reports what crossed the wire. */
+void install_fake_mcp_upstream(httplib::Server& s) {
+    const auto handler = [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("X-Got-Auth", req.get_header_value("Authorization"));
+        res.set_header("X-Got-Role", req.get_header_value("X-Fish-Role"));
+        res.set_header("X-Got-Proto", req.get_header_value("X-Forwarded-Proto"));
+        res.set_content("upstream:" + req.method + " " + req.path + " " + req.body, "application/json");
+    };
+    s.Post(R"(/.*)", handler);
+    s.Get(R"(/.*)", handler);
+}
+
+Config mcp_config(int upstream_port, const std::string& keys_db) {
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(upstream_port);
+    cfg.mcp_path = "/api/v1/mcp";
+    cfg.mcp_keys_db_path = keys_db;
+    cfg.mcp_allow_plain = true;
+    return cfg;
+}
+
+httplib::Headers mcp_auth(const std::string& token = kMcpToken) {
+    return {{"Authorization", "Bearer " + token}};
+}
+
+void the_mcp_path_takes_its_own_key_instead_of_the_day_key() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string keys = write_mcp_key_db("proxy_mcp_keys.sqlite");
+    // No JWT secret at all: every OTHER POST is refused by the day-key gate.
+    Config cfg = mcp_config(up.port, keys);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+    const std::string rpc = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+
+    auto none = cli.Post("/api/v1/mcp", rpc, "application/json");
+    CHECK(none && none->status == 401);
+    CHECK(none->get_header_value("WWW-Authenticate").starts_with("Bearer"));
+    CHECK(none->body.find("unauthorized") != std::string::npos);
+
+    auto wrong = cli.Post("/api/v1/mcp", mcp_auth("ffmcp_not-a-key"), rpc, "application/json");
+    CHECK(wrong && wrong->status == 401);
+
+    auto ok = cli.Post("/api/v1/mcp", mcp_auth(), rpc, "application/json");
+    CHECK(ok && ok->status == 200);
+    CHECK(ok->body == "upstream:POST /api/v1/mcp " + rpc);
+    // The key is cproxy's credential: it never reaches docapi. The role is always guest.
+    CHECK(ok->get_header_value("X-Got-Auth").empty());
+    CHECK(ok->get_header_value("X-Got-Role") == "guest");
+    CHECK(ok->get_header_value("X-Got-Proto") == "http");
+
+    // Case and a trailing slash do not escape the match. (The /api/ route prefix itself is matched
+    // case-sensitively by the router, as it always has been, so the folding is tested after it.)
+    auto cased = cli.Post("/api/V1/Mcp/", mcp_auth(), rpc, "application/json");
+    CHECK(cased && cased->status == 200);
+
+    // The exemption is the exact path only, and the MCP key opens nothing else.
+    auto other = cli.Post("/api/v1/river/fish/x", mcp_auth(), "[]", "application/json");
+    CHECK(other && other->status == 500);
+    auto nested = cli.Post("/api/v1/mcp/tools", mcp_auth(), rpc, "application/json");
+    CHECK(nested && nested->status == 500);
+    std::remove(keys.c_str());
+}
+
+void the_mcp_path_is_tls_only_unless_plain_is_allowed() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string keys = write_mcp_key_db("proxy_mcp_plain.sqlite");
+    Config cfg = mcp_config(up.port, keys);
+    cfg.mcp_allow_plain = false;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto r = cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json");
+    CHECK(r && r->status == 404);
+    std::remove(keys.c_str());
+}
+
+void without_a_key_store_every_mcp_request_is_refused() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    Config cfg = mcp_config(up.port, "");
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto r = cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json");
+    CHECK(r && r->status == 401);
+}
+
+void each_mcp_key_is_rate_limited() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string keys = write_mcp_key_db("proxy_mcp_rate.sqlite");
+    Config cfg = mcp_config(up.port, keys);
+    cfg.mcp_rate_per_minute = 1;
+    cfg.mcp_burst = 2;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json")->status == 200);
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json")->status == 200);
+    auto limited = cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json");
+    CHECK(limited && limited->status == 429);
+    CHECK(std::stoi(limited->get_header_value("Retry-After")) >= 1);
+    // A refused key does not spend the budget.
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth("nope"), "{}", "application/json")->status == 401);
+
+    auto metrics = cli.Get("/metrics");
+    CHECK(metrics && metrics->body.find("cproxy_mcp_requests_total{outcome=\"accepted\"} 2") != std::string::npos);
+    CHECK(metrics->body.find("cproxy_mcp_requests_total{outcome=\"rate_limited\"} 1") != std::string::npos);
+    CHECK(metrics->body.find("cproxy_mcp_requests_total{outcome=\"unauthorized\"} 1") != std::string::npos);
+    std::remove(keys.c_str());
+}
+
+void an_oversized_mcp_body_is_refused() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string keys = write_mcp_key_db("proxy_mcp_size.sqlite");
+    Config cfg = mcp_config(up.port, keys);
+    cfg.mcp_max_payload_bytes = 100;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto big = cli.Post("/api/v1/mcp", mcp_auth(), std::string(200, 'x'), "application/json");
+    CHECK(big && big->status == 413);
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json")->status == 200);
+    std::remove(keys.c_str());
+}
+
+/** A throwaway self-signed P-256 certificate + key, written as PEM. */
+void write_self_signed(const std::string& cert_path, const std::string& key_path) {
+    EVP_PKEY* pkey = EVP_EC_gen("P-256");
+    CHECK(pkey != nullptr);
+    X509* x = X509_new();
+    X509_set_version(x, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
+    X509_gmtime_adj(X509_getm_notBefore(x), 0);
+    X509_gmtime_adj(X509_getm_notAfter(x), 3600);
+    X509_set_pubkey(x, pkey);
+    X509_NAME* name = X509_get_subject_name(x);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+    X509_set_issuer_name(x, name);
+    CHECK(X509_sign(x, pkey, EVP_sha256()) > 0);
+    FILE* c = std::fopen(cert_path.c_str(), "wb");
+    CHECK(c != nullptr && PEM_write_X509(c, x) == 1);
+    std::fclose(c);
+    FILE* k = std::fopen(key_path.c_str(), "wb");
+    CHECK(k != nullptr && PEM_write_PrivateKey(k, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    std::fclose(k);
+    X509_free(x);
+    EVP_PKEY_free(pkey);
+}
+
+void the_tls_listener_serves_only_health_and_the_mcp_path() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string keys = write_mcp_key_db("proxy_mcp_tls.sqlite");
+    const auto dir = std::filesystem::temp_directory_path();
+    const std::string cert = (dir / "proxy_test_cert.pem").string();
+    const std::string key = (dir / "proxy_test_key.pem").string();
+    write_self_signed(cert, key);
+
+    Config cfg = mcp_config(up.port, keys);
+    cfg.mcp_allow_plain = false;  // production default: MCP over TLS only
+    httplib::SSLServer tls(cert.c_str(), key.c_str());
+    CHECK(tls.is_valid());
+    TestServer proxy;
+    install_routes(proxy.server, cfg, nullptr, &tls);
+    proxy.start();
+    const int tls_port = tls.bind_to_any_port("127.0.0.1");
+    CHECK(tls_port > 0);
+    std::thread tls_thread([&tls] { tls.listen_after_bind(); });
+    tls.wait_until_ready();
+
+    {
+        httplib::SSLClient cli("127.0.0.1", tls_port);
+        cli.enable_server_certificate_verification(false);
+        auto health = cli.Get("/health");
+        CHECK(health && health->status == 200);
+
+        auto ok = cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json");
+        CHECK(ok && ok->status == 200);
+        CHECK(ok->get_header_value("X-Got-Proto") == "https");
+        CHECK(ok->get_header_value("X-Got-Auth").empty());
+        auto none = cli.Post("/api/v1/mcp", "{}", "application/json");
+        CHECK(none && none->status == 401);
+
+        // Nothing else is reachable over TLS -- not the rest of /api/, not the ops endpoints.
+        CHECK(cli.Get("/api/v1/fish/search?q=trout")->status == 404);
+        CHECK(cli.Get("/metrics")->status == 404);
+        CHECK(cli.Get("/health/ready")->status == 404);
+    }
+    // And the same key over plain HTTP is refused, because plain is not allowed.
+    httplib::Client plain("127.0.0.1", proxy.port);
+    CHECK(plain.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json")->status == 404);
+
+    tls.stop();
+    tls_thread.join();
+    std::remove(keys.c_str());
+    std::remove(cert.c_str());
+    std::remove(key.c_str());
+}
+
 }  // namespace
+
 
 int main() {
     health_is_local();
@@ -1542,6 +1786,12 @@ int main() {
     a_compressed_upstream_body_passes_through_untouched();
     the_water_route_goes_through_every_guard();
     a_not_modified_answer_is_relayed_at_once();
+    the_mcp_path_takes_its_own_key_instead_of_the_day_key();
+    the_mcp_path_is_tls_only_unless_plain_is_allowed();
+    without_a_key_store_every_mcp_request_is_refused();
+    each_mcp_key_is_rate_limited();
+    an_oversized_mcp_body_is_refused();
+    the_tls_listener_serves_only_health_and_the_mcp_path();
     std::cout << "proxy_test: all assertions passed\n";
     return 0;
 }

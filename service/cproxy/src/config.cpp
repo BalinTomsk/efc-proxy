@@ -180,6 +180,10 @@ bool Config::routes_to_waterapi(const std::string& path) const {
     return p.starts_with(waterapi_prefix);
 }
 
+bool Config::is_mcp_path(const std::string& path) const {
+    return mcp_enabled() && normalize_gate_path(path) == mcp_path;
+}
+
 bool Config::cloudrange_exempt(const std::string& ip) const {
     if (ip.empty()) return false;
     // The frontend host and the admin address are exempt unconditionally. Both are ordinary
@@ -214,6 +218,23 @@ Config load_config(const EnvLookup& env) {
         if (prefix.back() != '/') prefix.push_back('/');
         cfg.waterapi_prefix = prefix;
     }
+    {
+        // Canonical form, same as the day-key paths: lower-case, leading '/', no trailing '/'. "NONE"
+        // is accepted as an explicit off for symmetry with the other path switches.
+        const std::string mcp = get_str(env, "CPROXY_MCP_PATH", "");
+        cfg.mcp_path = to_upper(mcp) == "NONE" ? std::string{} : normalize_gate_path(mcp);
+        if (cfg.mcp_path == "/") cfg.mcp_path.clear();
+    }
+    cfg.mcp_keys_db_path = get_str(env, "CPROXY_MCP_KEYS_DB", cfg.mcp_keys_db_path);
+    cfg.mcp_keys_reload_seconds =
+        get_int(env, "CPROXY_MCP_KEYS_RELOAD_SECONDS", cfg.mcp_keys_reload_seconds);
+    cfg.mcp_rate_per_minute = get_int(env, "CPROXY_MCP_RATE_PER_MINUTE", cfg.mcp_rate_per_minute);
+    cfg.mcp_burst = get_int(env, "CPROXY_MCP_BURST", cfg.mcp_burst);
+    cfg.mcp_max_payload_bytes = get_int(env, "CPROXY_MCP_MAX_PAYLOAD_BYTES", cfg.mcp_max_payload_bytes);
+    cfg.mcp_allow_plain = get_bool(env, "CPROXY_MCP_ALLOW_PLAIN", cfg.mcp_allow_plain);
+    cfg.tls_port = get_int(env, "CPROXY_TLS_PORT", cfg.tls_port);
+    cfg.tls_cert_path = get_str(env, "CPROXY_TLS_CERT", cfg.tls_cert_path);
+    cfg.tls_key_path = get_str(env, "CPROXY_TLS_KEY", cfg.tls_key_path);
     cfg.api_key = get_str(env, "CPROXY_API_KEY", cfg.api_key);
     cfg.connect_timeout_ms = get_int(env, "CPROXY_CONNECT_TIMEOUT_MS", cfg.connect_timeout_ms);
     cfg.read_timeout_ms = get_int(env, "CPROXY_READ_TIMEOUT_MS", cfg.read_timeout_ms);
@@ -396,6 +417,31 @@ std::vector<std::string> validate_config(const Config& cfg) {
         if (!cfg.waterapi_prefix.starts_with(route) || cfg.waterapi_prefix.size() <= route.size())
             errors.push_back("CPROXY_WATERAPI_PREFIX must be a sub-path of CPROXY_ROUTE_PREFIX, e.g. "
                              "/api/v1/water/");
+    }
+    if (cfg.mcp_enabled()) {
+        // Inside the route prefix, or the forwarding routes never see it; outside the water prefix,
+        // or it would be sent to waterapi, which has no MCP endpoint.
+        const std::string route = to_lower(cfg.route_prefix);
+        if (!(cfg.mcp_path + "/").starts_with(route) || cfg.mcp_path.size() + 1 <= route.size())
+            errors.push_back("CPROXY_MCP_PATH must be a path under CPROXY_ROUTE_PREFIX, e.g. /api/v1/mcp");
+        if (cfg.routes_to_waterapi(cfg.mcp_path))
+            errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_WATERAPI_PREFIX");
+        if (cfg.mcp_rate_per_minute <= 0) errors.push_back("CPROXY_MCP_RATE_PER_MINUTE must be positive");
+        if (cfg.mcp_burst <= 0) errors.push_back("CPROXY_MCP_BURST must be positive");
+        if (cfg.mcp_max_payload_bytes <= 0)
+            errors.push_back("CPROXY_MCP_MAX_PAYLOAD_BYTES must be positive");
+        if (cfg.mcp_keys_reload_seconds < 0)
+            errors.push_back("CPROXY_MCP_KEYS_RELOAD_SECONDS must be >= 0");
+    }
+    if (cfg.tls_enabled()) {
+        if (cfg.tls_port < 1 || cfg.tls_port > 65535) errors.push_back("CPROXY_TLS_PORT must be 1-65535");
+        if (cfg.tls_port == cfg.listen_port)
+            errors.push_back("CPROXY_TLS_PORT must differ from CPROXY_LISTEN_PORT");
+        if (cfg.tls_cert_path.empty() || cfg.tls_key_path.empty())
+            errors.push_back("CPROXY_TLS_PORT needs CPROXY_TLS_CERT and CPROXY_TLS_KEY");
+        // The TLS listener exists only for the MCP path; without one it would serve nothing but /health.
+        if (!cfg.mcp_enabled())
+            errors.push_back("CPROXY_TLS_PORT needs CPROXY_MCP_PATH (it serves only that path)");
     }
     if (cfg.jwt_leeway_seconds < 0)
         errors.push_back("CPROXY_JWT_LEEWAY_SECONDS must be >= 0");

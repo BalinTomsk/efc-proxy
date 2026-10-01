@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.19.0 LANGUAGES CXX)
+project(cproxy VERSION 0.20.0 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -70,8 +70,10 @@ add_library(cproxy_core STATIC
   src/clock_offset.cpp
   src/jwt_verifier.cpp
   src/log.cpp
+  src/mcp_key_store.cpp
   src/proxy.cpp
   src/rabbit_event_consumer.cpp
+  src/rate_limiter.cpp
   src/secret_codec.cpp
   src/user_prime_store.cpp
 )
@@ -131,3 +133,6 @@ add_executable(clock_offset_test tests/clock_offset_test.cpp)
 target_link_libraries(clock_offset_test PRIVATE cproxy_core)
 add_test(NAME clock_offset_test COMMAND clock_offset_test)
 
+add_executable(mcp_key_store_test tests/mcp_key_store_test.cpp)
+target_link_libraries(mcp_key_store_test PRIVATE cproxy_core)
+add_test(NAME mcp_key_store_test COMMAND mcp_key_store_test)

@@ -3,7 +3,9 @@
 #include <format>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
+#include <thread>
 
 #include <httplib.h>
 
@@ -19,10 +21,12 @@
 namespace {
 
 httplib::Server* g_server = nullptr;
+httplib::Server* g_tls_server = nullptr;
 
 void on_signal(int /*sig*/) {
     // stop() unblocks listen() so the process exits cleanly on SIGTERM/SIGINT (docker stop).
     if (g_server != nullptr) g_server->stop();
+    if (g_tls_server != nullptr) g_tls_server->stop();
 }
 
 const char* set_or_unset(const std::string& v) { return v.empty() ? "unset" : "set"; }
@@ -83,7 +87,22 @@ int main() {
     // atomically, so new ranges take effect without a restart and no reader ever blocks.
     // Declared before install_routes so it outlives the handlers that capture a pointer to it.
     cproxy::CloudRangeStore cloud_ranges;
-    cproxy::install_routes(server, cfg, &cloud_ranges);
+
+    // The HTTPS listener for the MCP path (0.20.0). A certificate that will not load disables THIS
+    // listener only, loudly; the plain edge the portal depends on must never go down with it.
+    std::unique_ptr<httplib::SSLServer> tls_server;
+    if (cfg.tls_enabled()) {
+        tls_server = std::make_unique<httplib::SSLServer>(cfg.tls_cert_path.c_str(),
+                                                          cfg.tls_key_path.c_str());
+        if (!tls_server->is_valid()) {
+            cproxy::log_raw(std::format(
+                "{{\"service\":\"cproxy\",\"level\":\"ERROR\",\"msg\":\"TLS listener disabled: "
+                "certificate '{}' or key '{}' failed to load\"}}",
+                cfg.tls_cert_path, cfg.tls_key_path));
+            tls_server.reset();
+        }
+    }
+    cproxy::install_routes(server, cfg, &cloud_ranges, tls_server.get());
 
     cproxy::CloudRangeRefresher refresher(cfg, cloud_ranges);
     refresher.start();
@@ -98,7 +117,7 @@ int main() {
         "\"waterapi\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
-        "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\","
+        "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"tls\":\"{}\","
         "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.waterapi_enabled() ? std::format("{} -> {}", cfg.waterapi_prefix, cfg.waterapi_upstream)
@@ -123,6 +142,12 @@ int main() {
         cfg.jwt_clock_sync ? std::format("on (>{}s, max {}s)", cfg.jwt_clock_sync_threshold_seconds,
                                          cfg.jwt_clock_sync_max_seconds)
                            : std::string("off (host clock only)"),
+        cfg.mcp_enabled()
+            ? std::format("{} ({}, {}/min burst {})", cfg.mcp_path,
+                          cfg.mcp_allow_plain ? "tls + plain" : "tls only", cfg.mcp_rate_per_minute,
+                          cfg.mcp_burst)
+            : std::string("off"),
+        tls_server ? std::format("{}:{}", cfg.listen_addr, cfg.tls_port) : std::string("off"),
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
     // Without a secret no token can be verified, and since 0.13.0 there is no other credential, so
@@ -149,13 +174,32 @@ int main() {
             "ignored: X-Day-Guid was removed in 0.13.0 and a bearer JWT is the only credential\"}");
     }
 
+    std::thread tls_thread;
+    if (tls_server) {
+        g_tls_server = tls_server.get();
+        tls_thread = std::thread([&tls_server, &cfg] {
+            if (!tls_server->listen(cfg.listen_addr, cfg.tls_port)) {
+                cproxy::log_raw(std::format("{{\"service\":\"cproxy\",\"level\":\"ERROR\","
+                                            "\"msg\":\"failed to bind TLS listener {}:{}\"}}",
+                                            cfg.listen_addr, cfg.tls_port));
+            }
+        });
+    }
+    // Stops and joins the TLS listener; every exit path below runs it.
+    const auto stop_tls = [&] {
+        if (tls_server) tls_server->stop();
+        if (tls_thread.joinable()) tls_thread.join();
+    };
+
     if (!server.listen(cfg.listen_addr, cfg.listen_port)) {
+        stop_tls();
         rabbit_events.stop();
         cproxy::log_raw(std::format("{{\"service\":\"cproxy\",\"level\":\"FATAL\","
                                     "\"msg\":\"failed to bind {}:{}\"}}",
                                     cfg.listen_addr, cfg.listen_port));
         return 1;
     }
+    stop_tls();
     rabbit_events.stop();
     return 0;
 }

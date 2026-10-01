@@ -121,6 +121,8 @@ service/cproxy/
 │   ├── jwt_verifier.hpp/.cpp     # HS512-pinned compact-JWS verify (OpenSSL HMAC + nlohmann)
 │   ├── clock_offset.hpp/.cpp     # in-process clock correction, moved only by an admin token
 │   ├── user_prime_store.hpp/.cpp # `user` claim -> account, out of the RabbitMQ mirror's SQLite
+│   ├── mcp_key_store.hpp/.cpp    # MCP path credential: hashed per-client keys, reloaded on change (0.20.0)
+│   ├── rate_limiter.hpp/.cpp     # per-key token bucket for the MCP path (0.20.0)
 │   ├── proxy.hpp/.cpp      # install_routes(): /health, prefix-forward, header filtering, 502
 │   └── main.cpp            # load dotenv, load config, init logging, signals, listen
 └── tests/
@@ -516,6 +518,43 @@ route (the prefix reaches docapi and 404s), so the image is safe to deploy befor
   regenerate — see the RabbitMQ warning above), then the usual build → push → pin digest → compose up.
   `compose.yml` must not carry the address (public repo, deployed verbatim). Steps: `docs/do-update.md`.
 
+### MCP path + TLS listener (0.20.0 — built, NOT deployed)
+
+`CPROXY_MCP_PATH` (`/api/v1/mcp` in `compose.yml`) fronts docapi 1.20.0's read-only MCP server for Claude
+Code / Claude Desktop. **It is the only path exempt from the day-key gate**, POST included, because an MCP
+client is configured once with a static header and cannot carry a token that dies at UTC midnight. It
+takes its own credential instead. Deploy prerequisites are in `docs/do-update.md` → "0.20.0".
+
+- **Credential = `McpKeyStore`.** `Authorization: Bearer <key>` → SHA-256 → lookup in
+  `mcp_keys(key_id, token_sha256, label, created_utc, expires_utc, disabled)`. Keys are made and revoked
+  with `deploy/mcp-keys.py` (it prints the token ONCE; the user runs it, never Claude). **Reloaded, unlike
+  DayKeyStore**: mtime checked every `CPROXY_MCP_KEYS_RELOAD_SECONDS`, so revoking needs no restart; a
+  broken replacement keeps the last good set (ERROR). **Mount the directory, not the file** — a single-file
+  bind pins the old inode and a replaced file would never be seen. Missing/unloadable store ⇒ every MCP
+  request 401 (fail closed, but only this path).
+- **401 + `WWW-Authenticate`, not the opaque 500.** Deliberate: MCP clients act on a 401, and a 256-bit
+  random key gives a prober nothing. Do not "make it consistent" with the day-key gate.
+- **Exact match** (`Config::is_mcp_path`: case-folded, trailing slash ignored), decided AFTER the
+  traversal guard, on the decoded path OR the raw target (same union as the gate). Nothing under it is
+  exempt — `proxy_test` pins `/api/v1/mcp/tools` and other POSTs still hitting the day-key gate.
+  The `/api/` route prefix itself is still matched case-sensitively by the router, as always.
+- **Per-key `RateLimiter`** (60/min, burst 20) → 429 + `Retry-After`, checked after the key so a refused
+  key costs no budget. Body cap 64 KiB (413). The key is **not forwarded** upstream; role is `guest`.
+- **TLS listener** (`CPROXY_TLS_PORT`/`_CERT`/`_KEY`): `httplib::SSLServer` started by `main` on its own
+  thread, given to `install_routes` as `tls_server`, sharing `ProxyState`. Serves ONLY `/health` and the
+  MCP path (no `/metrics`, no `/health/ready`, no rest of `/api/`). **TLS terminates in-process on purpose**
+  — a proxy in front would become `req.remote_addr`, silently breaking the datacenter block and logs.
+  Cert read once: renewal = restart (certbot deploy hook). Cert load failure disables only this listener.
+  `X-Forwarded-Proto` is `https` there, `http` on the plain listener.
+- **TLS only by default**: the plain listener answers the MCP path 404 unless `CPROXY_MCP_ALLOW_PLAIN`.
+- **Firewall**: `PUBLIC_TCP_PORTS=443` in the unit; the script matches it with `--ctorigdstport` because
+  DOCKER-USER sees packets after DNAT (`--dport` would be 8443). Port 80 stays allowlisted.
+- **Clients**: Claude Code `claude mcp add --transport http … --header "Authorization: Bearer <key>"`;
+  Claude Desktop via `npx mcp-remote … --header`. Both connect from the user's own IP — a client on a
+  cloud VM is refused by the datacenter block like anything else.
+- **Verified 2026-09-30**: 11/11 ctest in the build stage; end to end in the Rancher VM against the docapi
+  1.20.0 image (see CHANGELOG 0.20.0).
+
 ### Catch-all via pre_routing_handler
 
 Routing is done in `Server::set_pre_routing_handler`, invoked for **every** method+path — the single
@@ -567,8 +606,8 @@ differently from `-e` — one more reason not to give `""` a meaning.
 
 - Local: `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && ctest --test-dir build`.
 - Docker: multi-stage; `cmake build` + `ctest` run in the **build** stage so a broken build never
-  ships. cpp-httplib TLS/zlib/brotli integrations are turned **OFF** (lean binary; cproxy speaks HTTP
-  to internal upstreams — public TLS termination is a fronting concern, not this process's).
+  ships. cpp-httplib's OpenSSL integration is **ON** (since 0.8.0 for the cloud-range feeds, and since
+  0.20.0 it also terminates TLS for the MCP listener); zlib/brotli stay OFF. Upstreams are still plain HTTP.
 - **Base images:** referenced by tag (`debian:trixie` / `trixie-slim`); pin by digest for release
   reproducibility (matches the sibling services' convention).
 

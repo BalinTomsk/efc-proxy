@@ -5,9 +5,13 @@
 # so applying this can never lock out droplet administration.
 # Allow file: one IPv4 address or CIDR per line, '#' comments allowed. Real deploy addresses stay on the
 # host (the file is not tracked in git), so this script carries no deployment IPs.
+# PUBLIC_TCP_PORTS (0.20.0): host ports open to EVERY address, e.g. "443" for the MCP TLS listener, which
+# carries its own per-client key and rate limit. Matched on the ORIGINAL destination port: DOCKER-USER sees
+# packets after Docker's DNAT, where --dport would be the container port (8443), not the published one.
 set -e
 PUB_IF="${PUB_IF:-eth0}"
 ALLOW_FILE="${ALLOW_FILE:-/usr/local/etc/cproxy-firewall.allow}"
+PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS:-}"
 
 if [ ! -r "$ALLOW_FILE" ]; then
   iptables -F DOCKER-USER                              # fail CLOSED: no allow file -> nobody reaches the containers
@@ -24,6 +28,9 @@ while IFS= read -r line || [ -n "$line" ]; do
   addr=$(printf '%s' "$addr" | tr -d ' \t\r')
   [ -n "$addr" ] && iptables -A DOCKER-USER -i "$PUB_IF" -s "$addr" -j RETURN              # allowed caller
 done < "$ALLOW_FILE"
+for port in $(printf '%s' "$PUBLIC_TCP_PORTS" | tr ',' ' '); do                            # public ports: anyone may connect
+  iptables -A DOCKER-USER -i "$PUB_IF" -p tcp -m conntrack --ctorigdstport "$port" --ctdir ORIGINAL -j RETURN
+done
 iptables -A DOCKER-USER -i "$PUB_IF" -j DROP                                               # everyone else: no access to published containers
 iptables -A DOCKER-USER -j RETURN                                                          # non-public-interface traffic continues normal processing
 
