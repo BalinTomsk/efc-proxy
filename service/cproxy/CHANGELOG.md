@@ -9,6 +9,24 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-10-01: **0.20.1 — a key file that appears after startup is picked up without a restart. DEPLOYED
+  2026-10-01**: digest `399bc87d…e240`, rollback 0.20.0 `231416de…e480`. The droplet's `compose.yml` matched git before
+  replacement (backup `compose.yml.bak-0.20.0`). Startup: version 0.20.1, `MCP key store loaded keys 1`, TLS on 8443,
+  no ERROR lines. Verified: a real Claude Code MCP call through `<mcp-host>` was answered 200 (`mcp=laptop3`);
+  public `/health` reports 0.20.1; a keyless POST is 401; docapi, waterapi and news routes are 200; `restarts=0` a minute
+  later. ctest 11/11 was re-run from a clean (no-cache) build before shipping. In 0.20.0 `ProxyState` built `McpKeyStore` once, in its constructor; when the
+  file did not exist yet (the normal state on a fresh deploy) the store stayed empty, and the mtime reload
+  lives inside the store, so every MCP request answered 401 until `docker restart cproxy`. That is what
+  happened in prod on 2026-10-01 when the first key file was uploaded. Now an MCP request that presents a
+  bearer token and finds no store tries to build it again, at most once per
+  `CPROXY_MCP_KEYS_RELOAD_SECONDS` (`ProxyState::mcp_key_store`, behind a mutex and a last-attempt time;
+  requests run on httplib worker threads, and the store is never replaced once built). Success logs
+  `MCP key store loaded` (INFO, WARN on zero keys) exactly as at startup. Still fail-closed: 401 while
+  it cannot load. The startup ERROR now says it will be retried; a retry that fails the same way logs
+  nothing, one that fails differently (e.g. the file appeared but has no table) logs one WARN. A request
+  with no bearer token never triggers a retry.
+  - **Tests:** `proxy_test` +1 (start with no key file → 401, retry still 401 and creates no file, write
+    the file → 200 with reload 0, wrong key still 401).
 - 2026-09-30: **0.20.0 — the MCP path: its own key, its own rate limit, served over HTTPS. DEPLOYED 2026-10-01
   — but INACTIVE until a certificate and keys exist.** Digest `231416de…e480`, rollback 0.19.0 `238655881593…e7ab`.
   The droplet's `compose.yml` matched git before it was replaced (backup `compose.yml.bak-0.19.0`); `mcpkeys/`

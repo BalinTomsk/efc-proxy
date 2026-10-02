@@ -1621,6 +1621,34 @@ void without_a_key_store_every_mcp_request_is_refused() {
     CHECK(r && r->status == 401);
 }
 
+// 0.20.0 built the store once, at startup: a key file that was not there yet (a fresh deploy) left
+// every MCP request at 401 until a restart. The missing store is now retried on an MCP request.
+void a_key_file_that_appears_after_startup_is_picked_up() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string keys = (std::filesystem::temp_directory_path() / "proxy_mcp_late.sqlite").string();
+    std::remove(keys.c_str());
+    Config cfg = mcp_config(up.port, keys);
+    cfg.mcp_keys_reload_seconds = 0;  // retry on every request
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+
+    auto before = cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json");
+    CHECK(before && before->status == 401);
+    // Still fail-closed on a retry, and the retry did not leave an empty file behind.
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json")->status == 401);
+    CHECK(!std::filesystem::exists(keys));
+
+    CHECK(write_mcp_key_db("proxy_mcp_late.sqlite") == keys);
+    auto after = cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json");
+    CHECK(after && after->status == 200);
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth("ffmcp_not-a-key"), "{}", "application/json")->status == 401);
+    std::remove(keys.c_str());
+}
+
 void each_mcp_key_is_rate_limited() {
     TestServer up;
     install_fake_mcp_upstream(up.server);
@@ -1789,6 +1817,7 @@ int main() {
     the_mcp_path_takes_its_own_key_instead_of_the_day_key();
     the_mcp_path_is_tls_only_unless_plain_is_allowed();
     without_a_key_store_every_mcp_request_is_refused();
+    a_key_file_that_appears_after_startup_is_picked_up();
     each_mcp_key_is_rate_limited();
     an_oversized_mcp_body_is_refused();
     the_tls_listener_serves_only_health_and_the_mcp_path();

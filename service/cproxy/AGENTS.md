@@ -531,7 +531,12 @@ takes its own credential instead. Deploy prerequisites are in `docs/do-update.md
   DayKeyStore**: mtime checked every `CPROXY_MCP_KEYS_RELOAD_SECONDS`, so revoking needs no restart; a
   broken replacement keeps the last good set (ERROR). **Mount the directory, not the file** — a single-file
   bind pins the old inode and a replaced file would never be seen. Missing/unloadable store ⇒ every MCP
-  request 401 (fail closed, but only this path).
+  request 401 (fail closed, but only this path). **Since 0.20.1 a missing store is retried** on an MCP
+  request carrying a bearer token, at most once per `CPROXY_MCP_KEYS_RELOAD_SECONDS`
+  (`ProxyState::mcp_key_store`, mutex-guarded; once built it is never replaced). Before that, a key file
+  absent at startup needed `docker restart cproxy` — the store's own mtime reload only runs inside a store
+  that exists (prod, 2026-10-01). Always reach the store through `mcp_key_store()`, never `mcp_keys`
+  directly: it is the one piece of `ProxyState` that changes after startup.
 - **401 + `WWW-Authenticate`, not the opaque 500.** Deliberate: MCP clients act on a 401, and a 256-bit
   random key gives a prober nothing. Do not "make it consistent" with the day-key gate.
 - **Exact match** (`Config::is_mcp_path`: case-folded, trailing slash ignored), decided AFTER the
