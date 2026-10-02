@@ -108,8 +108,34 @@ struct ProxyState {
     // The MCP path's credential and per-key limit (0.20.0). Built only when CPROXY_MCP_PATH is set.
     // A key store that fails to load stays EMPTY, and every MCP request then answers 401 -- fail
     // closed like the day-key store, but confined to the one path; nothing else depends on it.
+    //
+    // EMPTY IS NOT FOREVER (0.20.1). The store's own mtime reload only runs inside a store that
+    // exists, so in 0.20.0 a key file that was absent at startup -- the normal state on a fresh
+    // deploy -- was never picked up until a restart. Now an MCP request that finds no store tries
+    // to build it again, at most once per CPROXY_MCP_KEYS_RELOAD_SECONDS. Read and written only
+    // through mcp_key_store() below: requests run on worker threads, and the optional is the one
+    // piece of shared state here that changes after startup. Once built it is never replaced.
     std::optional<McpKeyStore> mcp_keys;
     std::optional<RateLimiter> mcp_limiter;
+    std::mutex mcp_keys_mu;
+    std::chrono::steady_clock::time_point mcp_keys_last_attempt{};
+    std::string mcp_keys_last_error;  // logged once per distinct failure, not on every retry
+
+    /**
+     * The MCP key store, building it first if it is missing and the retry interval has passed;
+     * nullptr while it still cannot be loaded (the caller answers 401). Thread-safe.
+     */
+    McpKeyStore* mcp_key_store(const Config& cfg) {
+        std::lock_guard<std::mutex> lock(mcp_keys_mu);
+        if (mcp_keys.has_value()) return &*mcp_keys;
+        if (cfg.mcp_keys_db_path.empty()) return nullptr;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mcp_keys_last_attempt < std::chrono::seconds(std::max(0, cfg.mcp_keys_reload_seconds))) {
+            return nullptr;
+        }
+        load_mcp_keys(cfg, now, /*at_startup=*/false);
+        return mcp_keys.has_value() ? &*mcp_keys : nullptr;
+    }
 
     explicit ProxyState(const Config& cfg, CloudRangeStore* shared_ranges)
         : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
@@ -160,19 +186,8 @@ struct ProxyState {
                 log_raw("{\"service\":\"cproxy\",\"level\":\"ERROR\",\"msg\":\"CPROXY_MCP_KEYS_DB "
                         "is unset: every MCP request will answer 401\"}");
             } else {
-                try {
-                    mcp_keys.emplace(cfg.mcp_keys_db_path, cfg.mcp_keys_reload_seconds);
-                    // WARN on zero: valid (every key revoked) but almost certainly not intended.
-                    log_raw(std::format(
-                        "{{\"service\":\"cproxy\",\"level\":\"{}\",\"msg\":\"MCP key store loaded\","
-                        "\"keys\":{}}}",
-                        mcp_keys->size() == 0 ? "WARN" : "INFO", mcp_keys->size()));
-                } catch (const std::exception& ex) {
-                    log_raw(std::format(
-                        "{{\"service\":\"cproxy\",\"level\":\"ERROR\","
-                        "\"msg\":\"MCP key database failed to load, every MCP request will 401: {}\"}}",
-                        ex.what()));
-                }
+                std::lock_guard<std::mutex> lock(mcp_keys_mu);
+                load_mcp_keys(cfg, std::chrono::steady_clock::now(), /*at_startup=*/true);
             }
         }
         if (!cfg.cloudrange_db_path.empty()) {
@@ -194,6 +209,39 @@ struct ProxyState {
                            : "cloud-range database failed to load, nothing will be IP-blocked",
                     ex.what()));
             }
+        }
+    }
+
+private:
+    /** One attempt to build the MCP key store. Called with mcp_keys_mu held. */
+    void load_mcp_keys(const Config& cfg, std::chrono::steady_clock::time_point now, bool at_startup) {
+        mcp_keys_last_attempt = now;
+        try {
+            mcp_keys.emplace(cfg.mcp_keys_db_path, cfg.mcp_keys_reload_seconds);
+            mcp_keys_last_error.clear();
+            // WARN on zero: valid (every key revoked) but almost certainly not intended.
+            log_raw(std::format(
+                "{{\"service\":\"cproxy\",\"level\":\"{}\",\"msg\":\"MCP key store loaded\","
+                "\"keys\":{}}}",
+                mcp_keys->size() == 0 ? "WARN" : "INFO", mcp_keys->size()));
+        } catch (const std::exception& ex) {
+            // ERROR at startup, where it explains the 401s to come. A retry that fails the same way
+            // says nothing new, so it is silent; a retry that fails DIFFERENTLY (the file appeared
+            // but is half-copied or has no table) is worth one WARN.
+            const std::string error = ex.what();
+            if (at_startup) {
+                log_raw(std::format(
+                    "{{\"service\":\"cproxy\",\"level\":\"ERROR\","
+                    "\"msg\":\"MCP key database failed to load, every MCP request will 401 until it "
+                    "does (retried at most every {}s): {}\"}}",
+                    std::max(0, cfg.mcp_keys_reload_seconds), error));
+            } else if (error != mcp_keys_last_error) {
+                log_raw(std::format(
+                    "{{\"service\":\"cproxy\",\"level\":\"WARN\","
+                    "\"msg\":\"MCP key database still failed to load: {}\"}}",
+                    error));
+            }
+            mcp_keys_last_error = error;
         }
     }
 };
@@ -670,16 +718,15 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
             return;
         }
         const std::string token = bearer_token(req.get_header_value("Authorization"));
+        McpKeyStore* const key_store = token.empty() ? nullptr : state.mcp_key_store(cfg);
         std::optional<McpKey> key;
-        if (!token.empty() && state.mcp_keys.has_value()) {
-            key = state.mcp_keys->find(token, state.clock.now());
-        }
+        if (key_store != nullptr) key = key_store->find(token, state.clock.now());
         if (!key) {
             state.metrics.observe_mcp(&Metrics::mcp_unauthorized);
             res.set_header("WWW-Authenticate", "Bearer realm=\"fishfind-mcp\"");
             write_error(res, 401, "unauthorized", "Missing or invalid MCP key");
             const char* reason = token.empty()                 ? "no bearer token presented"
-                                 : !state.mcp_keys.has_value() ? "mcp key store unavailable"
+                                 : key_store == nullptr        ? "mcp key store unavailable"
                                                                : "unknown, disabled or expired mcp key";
             log_request(std::format("{} {} -> 401 ({})", req.method, req.path, reason), req.remote_addr, rid);
             return;

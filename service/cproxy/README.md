@@ -98,7 +98,7 @@ probing is visible.
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
 | `CPROXY_MCP_PATH` | (empty = no MCP route) | exact path of docapi's MCP endpoint, e.g. `/api/v1/mcp` (see "MCP path" below) |
 | `CPROXY_MCP_KEYS_DB` | (empty = every MCP request 401s) | SQLite file of hashed MCP client keys (`deploy/mcp-keys.py`) |
-| `CPROXY_MCP_KEYS_RELOAD_SECONDS` | `60` | how often the key file is checked for changes (`0` = every request) |
+| `CPROXY_MCP_KEYS_RELOAD_SECONDS` | `60` | how often the key file is checked for changes, and how often a key file that was missing or unloadable is tried again (`0` = every request) |
 | `CPROXY_MCP_RATE_PER_MINUTE` / `CPROXY_MCP_BURST` | `60` / `20` | per-key token bucket; over it `429` + `Retry-After` |
 | `CPROXY_MCP_MAX_PAYLOAD_BYTES` | `65536` | MCP request bodies above this are rejected `413` |
 | `CPROXY_MCP_ALLOW_PLAIN` | `false` | also serve the MCP path on the plain-HTTP listener (local testing) |
