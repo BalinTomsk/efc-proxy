@@ -122,6 +122,7 @@ service/cproxy/
 │   ├── clock_offset.hpp/.cpp     # in-process clock correction, moved only by an admin token
 │   ├── user_prime_store.hpp/.cpp # `user` claim -> account, out of the RabbitMQ mirror's SQLite
 │   ├── mcp_key_store.hpp/.cpp    # MCP path credential: hashed per-client keys, reloaded on change (0.20.0)
+│   ├── user_mcp_key_store.hpp/.cpp # self-service MCP keys out of the account mirror (0.21.0)
 │   ├── rate_limiter.hpp/.cpp     # per-key token bucket for the MCP path (0.20.0)
 │   ├── proxy.hpp/.cpp      # install_routes(): /health, prefix-forward, header filtering, 502
 │   └── main.cpp            # load dotenv, load config, init logging, signals, listen
@@ -537,6 +538,13 @@ takes its own credential instead. Deploy prerequisites are in `docs/do-update.md
   absent at startup needed `docker restart cproxy` — the store's own mtime reload only runs inside a store
   that exists (prod, 2026-10-01). Always reach the store through `mcp_key_store()`, never `mcp_keys`
   directly: it is the one piece of `ProxyState` that changes after startup.
+- **Second key source: self-service keys (0.21.0 — DEPLOYED 2026-10-02, digest `8fc59969…`).** `UserMcpKeyStore` reads the
+  account mirror's `user_mcp_key` table (filled by the portal's `account.mcp_key` events, Profile → MCP tab;
+  SQL Server side is `dbo.user_mcp_key`). It is asked AFTER `McpKeyStore`, with one read-only query per
+  request and no snapshot, so a revocation bites as soon as its event lands. A key is live only while its
+  owner is live in `users_sync`. **The event is applied by key id alone**, so the portal checks ownership
+  before it publishes a `revoked`. Do not publish one from anywhere that has not. Unknown event types are
+  ignored by older consumers, which is why cproxy must be deployed before the portal page.
 - **401 + `WWW-Authenticate`, not the opaque 500.** Deliberate: MCP clients act on a 401, and a 256-bit
   random key gives a prober nothing. Do not "make it consistent" with the day-key gate.
 - **Exact match** (`Config::is_mcp_path`: case-folded, trailing slash ignored), decided AFTER the

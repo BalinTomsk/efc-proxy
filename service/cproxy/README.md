@@ -97,7 +97,7 @@ probing is visible.
 | `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `NONE` = console-only (an empty value reads as unset) |
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
 | `CPROXY_MCP_PATH` | (empty = no MCP route) | exact path of docapi's MCP endpoint, e.g. `/api/v1/mcp` (see "MCP path" below) |
-| `CPROXY_MCP_KEYS_DB` | (empty = every MCP request 401s) | SQLite file of hashed MCP client keys (`deploy/mcp-keys.py`) |
+| `CPROXY_MCP_KEYS_DB` | (empty = only self-service keys from the account mirror) | SQLite file of hand-issued, hashed MCP client keys (`deploy/mcp-keys.py`) |
 | `CPROXY_MCP_KEYS_RELOAD_SECONDS` | `60` | how often the key file is checked for changes, and how often a key file that was missing or unloadable is tried again (`0` = every request) |
 | `CPROXY_MCP_RATE_PER_MINUTE` / `CPROXY_MCP_BURST` | `60` / `20` | per-key token bucket; over it `429` + `Retry-After` |
 | `CPROXY_MCP_MAX_PAYLOAD_BYTES` | `65536` | MCP request bodies above this are rejected `413` |
@@ -368,6 +368,11 @@ the day-key gate:
   `CPROXY_MCP_KEYS_DB`. `deploy/mcp-keys.py add <id>` creates a key and prints its token once;
   `disable <id>` revokes it. The file is re-read when it changes, so no restart is needed (mount its
   directory, not the file). A refused key is `401` with `WWW-Authenticate: Bearer`.
+- **Self-service keys (0.21.0).** Registered users create and revoke their own keys on the portal. Each
+  one reaches cproxy as an `account.mcp_key` event in the account mirror (`user_mcp_key`: the key's
+  SHA-256 only, never the token). The MCP path checks the hand-issued key file first, then the mirror,
+  one indexed lookup per request. A mirror key is refused once revoked, or once its owner is suspended
+  or deleted in `users_sync`. Logs and the per-key rate limit name it `user:<key id>`.
 - **Exact path only.** Anything under it, and every other write, still needs the day-key token. The key
   is not forwarded upstream, and docapi is told the caller is a `guest`.
 - **Rate-limited per key** (`429` + `Retry-After`) so one runaway client cannot trip docapi's breaker.

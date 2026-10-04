@@ -22,6 +22,7 @@
 #include <openssl/x509.h>
 #include <sqlite3.h>
 
+#include "account_mirror_store.hpp"
 #include "cloud_range_store.hpp"
 #include "config.hpp"
 #include "day_key_store.hpp"
@@ -1574,9 +1575,9 @@ void the_mcp_path_takes_its_own_key_instead_of_the_day_key() {
     auto ok = cli.Post("/api/v1/mcp", mcp_auth(), rpc, "application/json");
     CHECK(ok && ok->status == 200);
     CHECK(ok->body == "upstream:POST /api/v1/mcp " + rpc);
-    // The key is cproxy's credential: it never reaches docapi. The role is always guest.
+    // The key is cproxy's credential: it never reaches docapi. A hand-made key is the operator's: admin.
     CHECK(ok->get_header_value("X-Got-Auth").empty());
-    CHECK(ok->get_header_value("X-Got-Role") == "guest");
+    CHECK(ok->get_header_value("X-Got-Role") == "admin");
     CHECK(ok->get_header_value("X-Got-Proto") == "http");
 
     // Case and a trailing slash do not escape the match. (The /api/ route prefix itself is matched
@@ -1647,6 +1648,67 @@ void a_key_file_that_appears_after_startup_is_picked_up() {
     CHECK(after && after->status == 200);
     CHECK(cli.Post("/api/v1/mcp", mcp_auth("ffmcp_not-a-key"), "{}", "application/json")->status == 401);
     std::remove(keys.c_str());
+}
+
+// 0.21.0: a key a registered user created on the portal reaches cproxy as an account.mcp_key event
+// in the account mirror. It must work with NO hand-made key file at all, and stop on revocation.
+void a_self_service_key_from_the_account_mirror_is_accepted_until_revoked() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string mirror = (std::filesystem::temp_directory_path() / "proxy_mcp_mirror.sqlite").string();
+    std::remove(mirror.c_str());
+    const std::string user = "0190bbbb-0000-7000-8000-000000000001";
+    const std::string token = "ffmcp_self-service-token";
+    AccountMirrorStore store(mirror);
+    store.ensure_schema();
+    CHECK(store.apply_event({{"eventId", "us-1"}, {"eventType", "acme.account.user_sync"}, {"action", "created"},
+                             {"occurredUtc", "2026-10-01T10:00:00Z"},
+                             {"user", {{"id", user}, {"usersId", 1}, {"userName", "u"}, {"email", "u@example.test"},
+                                       {"lastVisit", ""}, {"access", 0}, {"suspended", false},
+                                       {"authType", "Local"}, {"deleted", false}, {"deletedUtc", nullptr},
+                                       {"prime", 0}, {"primeExpired", nullptr}}}}));
+    const auto key_event = [&](const char* id, const char* action) {
+        return nlohmann::json{{"eventId", id}, {"eventType", "acme.account.mcp_key"}, {"action", action},
+                              {"occurredUtc", "2026-10-01T10:01:00Z"},
+                              {"mcpKey", {{"keyId", "k1"}, {"userId", user}, {"tokenSha256", sha256_hex(token)},
+                                          {"createdUtc", "2026-10-01T10:01:00Z"}}}};
+    };
+    CHECK(store.apply_event(key_event("mk-1", "created")));
+
+    Config cfg = mcp_config(up.port, "");  // no hand-made key file
+    cfg.account_mirror_db_path = mirror;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+
+    auto ok = cli.Post("/api/v1/mcp", mcp_auth(token), "{}", "application/json");
+    CHECK(ok && ok->status == 200);
+    CHECK(ok->get_header_value("X-Got-Auth").empty());  // the key is never forwarded upstream
+    // 0.22.0: the owner is a plain account (access 0) -> "user", and a caller cannot claim more.
+    CHECK(ok->get_header_value("X-Got-Role") == "user");
+    httplib::Headers spoofed = mcp_auth(token);
+    spoofed.emplace("X-Fish-Role", "admin");
+    auto claimed = cli.Post("/api/v1/mcp", spoofed, "{}", "application/json");
+    CHECK(claimed && claimed->get_header_value("X-Got-Role") == "user");
+    // Promote the owner to superAdmin: the next request is admin, without a new key or a restart.
+    CHECK(store.apply_event({{"eventId", "us-2"}, {"eventType", "acme.account.user_sync"}, {"action", "updated"},
+                             {"occurredUtc", "2026-10-01T10:02:00Z"},
+                             {"user", {{"id", user}, {"usersId", 1}, {"userName", "u"}, {"email", "u@example.test"},
+                                       {"lastVisit", ""}, {"access", 255}, {"suspended", false},
+                                       {"authType", "Local"}, {"deleted", false}, {"deletedUtc", nullptr},
+                                       {"prime", 0}, {"primeExpired", nullptr}}}}));
+    auto admin = cli.Post("/api/v1/mcp", mcp_auth(token), "{}", "application/json");
+    CHECK(admin && admin->get_header_value("X-Got-Role") == "admin");
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth("ffmcp_not-a-key"), "{}", "application/json")->status == 401);
+    // The key is an MCP key only: on any other POST it is just an unverifiable Bearer token.
+    CHECK(cli.Post("/api/v1/river/fish/x", mcp_auth(token), "[]", "application/json")->status == 500);
+
+    CHECK(store.apply_event(key_event("mk-2", "revoked")));
+    auto revoked = cli.Post("/api/v1/mcp", mcp_auth(token), "{}", "application/json");
+    CHECK(revoked && revoked->status == 401);
+    std::remove(mirror.c_str());
 }
 
 void each_mcp_key_is_rate_limited() {
@@ -1818,6 +1880,7 @@ int main() {
     the_mcp_path_is_tls_only_unless_plain_is_allowed();
     without_a_key_store_every_mcp_request_is_refused();
     a_key_file_that_appears_after_startup_is_picked_up();
+    a_self_service_key_from_the_account_mirror_is_accepted_until_revoked();
     each_mcp_key_is_rate_limited();
     an_oversized_mcp_body_is_refused();
     the_tls_listener_serves_only_health_and_the_mcp_path();

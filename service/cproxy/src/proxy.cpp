@@ -25,6 +25,7 @@
 #include "log.hpp"
 #include "mcp_key_store.hpp"
 #include "rate_limiter.hpp"
+#include "user_mcp_key_store.hpp"
 #include "user_prime_store.hpp"
 #include "version.hpp"
 
@@ -117,6 +118,10 @@ struct ProxyState {
     // piece of shared state here that changes after startup. Once built it is never replaced.
     std::optional<McpKeyStore> mcp_keys;
     std::optional<RateLimiter> mcp_limiter;
+    // Self-service keys from the portal's Profile page (0.21.0), read out of the account mirror. Asked
+    // after mcp_key_store(), so a hand-made key never depends on the mirror. Built with the limiter and
+    // never replaced; it opens the mirror per lookup and guards its own error string.
+    std::optional<UserMcpKeyStore> user_mcp_keys;
     std::mutex mcp_keys_mu;
     std::chrono::steady_clock::time_point mcp_keys_last_attempt{};
     std::string mcp_keys_last_error;  // logged once per distinct failure, not on every retry
@@ -182,9 +187,10 @@ struct ProxyState {
         }
         if (cfg.mcp_enabled()) {
             mcp_limiter.emplace(cfg.mcp_rate_per_minute, cfg.mcp_burst);
+            user_mcp_keys.emplace(cfg.account_mirror_db_path);
             if (cfg.mcp_keys_db_path.empty()) {
-                log_raw("{\"service\":\"cproxy\",\"level\":\"ERROR\",\"msg\":\"CPROXY_MCP_KEYS_DB "
-                        "is unset: every MCP request will answer 401\"}");
+                log_raw("{\"service\":\"cproxy\",\"level\":\"WARN\",\"msg\":\"CPROXY_MCP_KEYS_DB "
+                        "is unset: only self-service keys from the account mirror will be accepted\"}");
             } else {
                 std::lock_guard<std::mutex> lock(mcp_keys_mu);
                 load_mcp_keys(cfg, std::chrono::steady_clock::now(), /*at_startup=*/true);
@@ -721,13 +727,17 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         McpKeyStore* const key_store = token.empty() ? nullptr : state.mcp_key_store(cfg);
         std::optional<McpKey> key;
         if (key_store != nullptr) key = key_store->find(token, state.clock.now());
+        if (!key && !token.empty() && state.user_mcp_keys) key = state.user_mcp_keys->find(token);
         if (!key) {
             state.metrics.observe_mcp(&Metrics::mcp_unauthorized);
             res.set_header("WWW-Authenticate", "Bearer realm=\"fishfind-mcp\"");
             write_error(res, 401, "unauthorized", "Missing or invalid MCP key");
-            const char* reason = token.empty()                 ? "no bearer token presented"
-                                 : key_store == nullptr        ? "mcp key store unavailable"
-                                                               : "unknown, disabled or expired mcp key";
+            // "store unavailable" only when NEITHER source could be asked: with self-service keys a
+            // missing hand-made key file is a normal state, not an outage.
+            const bool mirror_failed = state.user_mcp_keys && !state.user_mcp_keys->last_error().empty();
+            const char* reason = token.empty()                               ? "no bearer token presented"
+                                 : key_store == nullptr && mirror_failed      ? "mcp key store unavailable"
+                                                                             : "unknown, revoked or expired mcp key";
             log_request(std::format("{} {} -> 401 ({})", req.method, req.path, reason), req.remote_addr, rid);
             return;
         }
@@ -743,6 +753,9 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         }
         state.metrics.observe_mcp(&Metrics::mcp_accepted);
         mcp_key_id = key->key_id;
+        // 0.22.0: the key's owner decides the role -- docapi shows fish information to admins only. Never
+        // guest: the key was verified, and an inbound X-Fish-Role is dropped (is_unforwardable).
+        role = key->admin ? "admin" : "user";
     } else if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const CredentialCheck credential =
             check_gate_credential(cfg, state, req, state.clock.now());
