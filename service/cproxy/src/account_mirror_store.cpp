@@ -287,6 +287,53 @@ void upsert_api_key(sqlite3* db, const nlohmann::json& key, const nlohmann::json
     }
 }
 
+// A self-service MCP key (dbo.user_mcp_key), published by the portal's Profile page. Two actions:
+//   'created' -> record the key's hash. Never clears revoked_utc: if the 'revoked' event of the same
+//                key arrived first, the key must stay dead.
+//   'revoked' -> stamp revoked_utc once (the first stamp wins). Inserts a placeholder row when the
+//                key is not known yet, so a later out-of-order 'created' cannot bring it to life.
+// Any other action is ignored rather than guessed at.
+void apply_mcp_key(sqlite3* db, const nlohmann::json& key, const nlohmann::json& event) {
+    const std::string action = str_or_empty(event, "action");
+    const bool revoke = action == "revoked";
+    if (!revoke && action != "created") return;
+
+    sqlite3_stmt* stmt = nullptr;
+    static const char* const created_sql =
+        "INSERT INTO user_mcp_key (key_id, user_id, token_sha256, created_utc, revoked_utc, updated_utc) "
+        "VALUES (?, ?, ?, ?, NULL, ?) "
+        "ON CONFLICT(key_id) DO UPDATE SET "
+        "user_id=excluded.user_id, token_sha256=excluded.token_sha256, "
+        "created_utc=excluded.created_utc, updated_utc=excluded.updated_utc";
+    static const char* const revoked_sql =
+        "INSERT INTO user_mcp_key (key_id, user_id, token_sha256, created_utc, revoked_utc, updated_utc) "
+        "VALUES (?, ?, '', '', ?, ?) "
+        "ON CONFLICT(key_id) DO UPDATE SET "
+        "revoked_utc=COALESCE(user_mcp_key.revoked_utc, excluded.revoked_utc), "
+        "updated_utc=excluded.updated_utc";
+    if (sqlite3_prepare_v2(db, revoke ? revoked_sql : created_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(std::format("prepare mcp key upsert: {}", sqlite3_errmsg(db)));
+    }
+
+    const std::string now = str_or_empty(event, "occurredUtc");
+    bind_text(stmt, 1, str_or_empty(key, "keyId"));
+    bind_text(stmt, 2, str_or_empty(key, "userId"));
+    if (revoke) {
+        bind_text(stmt, 3, now);
+        bind_text(stmt, 4, now);
+    } else {
+        bind_text(stmt, 3, str_or_empty(key, "tokenSha256"));
+        bind_text(stmt, 4, str_or_empty(key, "createdUtc"));
+        bind_text(stmt, 5, now);
+    }
+
+    const int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error(std::format("upsert mcp key: {}", sqlite3_errmsg(db)));
+    }
+}
+
 // One account's per-day primes (dbo.Users_Prime). ONE event carries the whole 365-entry array rather
 // than 365 events: dbo.sp_user_prime_assign writes all 365 rows in a single INSERT and a T-SQL
 // trigger is statement-level, so dbo.TR_Users_Prime_SyncOutbox aggregates them. Row-per-prime would
@@ -427,7 +474,21 @@ void AccountMirrorStore::ensure_schema() {
         "  updated_utc TEXT NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS ix_user_api_key_user ON user_api_key(user_id, created_utc DESC);"
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_user_api_key_secret ON user_api_key(api_key) WHERE api_key <> '';";
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_user_api_key_secret ON user_api_key(api_key) WHERE api_key <> '';"
+        // Self-service MCP keys (dbo.user_mcp_key, 0.21.0): the SHA-256 of each key only -- the portal
+        // never sends the token, so this table grants nothing to whoever copies it. Read by
+        // UserMcpKeyStore. No label (user-entered text cproxy has no use for) and NOT unique on the
+        // hash, for the same reason user_prime_sync is not: out-of-order delivery must not hard-fail.
+        // A whole new table, so CREATE TABLE IF NOT EXISTS does add it to an existing mirror.
+        "CREATE TABLE IF NOT EXISTS user_mcp_key ("
+        "  key_id TEXT PRIMARY KEY,"
+        "  user_id TEXT NOT NULL DEFAULT '',"
+        "  token_sha256 TEXT NOT NULL DEFAULT '',"
+        "  created_utc TEXT NOT NULL DEFAULT '',"
+        "  revoked_utc TEXT NULL,"
+        "  updated_utc TEXT NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS ix_user_mcp_key_sha256 ON user_mcp_key(token_sha256);";
     exec(handle.db, ddl, "create account mirror schema");
 
     // Migrations for mirror databases created before a column existed (see add_column_if_missing).
@@ -464,6 +525,8 @@ bool AccountMirrorStore::apply_event(const nlohmann::json& event) {
         upsert_user(handle.db, event.contains("user") ? event["user"] : nlohmann::json::object(), event);
     } else if (type == "account.api_key") {
         upsert_api_key(handle.db, event.contains("apiKey") ? event["apiKey"] : nlohmann::json::object(), event);
+    } else if (type == "account.mcp_key") {
+        apply_mcp_key(handle.db, event.contains("mcpKey") ? event["mcpKey"] : nlohmann::json::object(), event);
     } else if (type == "account.user_sync") {
         upsert_user_sync(handle.db, event.contains("user") ? event["user"] : nlohmann::json::object(), event);
     } else if (type == "account.user_prime_sync") {

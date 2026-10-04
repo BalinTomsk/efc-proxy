@@ -17,6 +17,10 @@ struct McpKey {
     std::string label;
     // Last valid UTC day, inclusive; nullopt = no expiry.
     std::optional<std::chrono::sys_days> expires;
+    // 0.22.0: whether the caller is an admin, sent to docapi as X-Fish-Role "admin" (else "user"); docapi
+    // shows fish information to admins only. A hand-made key (this store) is the operator's own and is
+    // always admin; a self-service key is admin when its owning account is a superAdmin (access 255).
+    bool admin = false;
 };
 
 /**

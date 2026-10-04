@@ -9,6 +9,45 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-10-03: **0.22.0 — MCP requests carry the key owner's role. DEPLOYED 2026-10-03**: digest
+  `sha256:24039f32…`, rollback 0.21.1 (`sha256:46f2f7d0…`); `/health` 0.22.0, healthy, `restarts=0`, clean startup;
+  a live MCP search through it answered normally (docapi 1.20.2 ignores the header).
+  - Before, every MCP request reached docapi as `X-Fish-Role: guest`. Now `admin` when the key is a hand-issued
+    operator key (`McpKeyStore`) or its owning account has `users_sync.access = 255`, else `user`.
+    `UserMcpKeyStore` reads `access` on every lookup, so a promotion or demotion applies on the next request.
+    An inbound `X-Fish-Role` is still dropped.
+  - Why: docapi 1.21.0 shows fish information over MCP to admins only.
+  - Tests: `proxy_test` — a hand-made key is `admin`; a self-service key is `user`, a spoofed header does not
+    change that, and promoting the owner makes the next request `admin`. 11/11 ctest.
+
+- 2026-10-01: **0.21.0 — self-service MCP keys for registered users. DEPLOYED 2026-10-02** (03:14 UTC): digest
+  `8fc59969…7567`, rollback 0.20.1 `399bc87d…f240` (droplet backup `compose.yml.bak-0.20.1`). Verified: healthy,
+  restarts 0, one startup line, key file loaded (1 key), and a real MCP call answered 200 as `mcp=laptop3`. Two deploy
+  snags: `docker inspect … RepoDigests 0` returned the LOCAL `cproxy@sha256:…` name, and the droplet's GHCR login had
+  lapsed (`unauthorized`); see do-update.md. ctest 11/11 in the build stage. Registered users create and revoke their own MCP
+  keys on the portal (Profile → MCP tab). The portal generates the `ffmcp_` token and stores only its SHA-256
+  (`dbo.user_mcp_key`, envfish-db). Each create or revoke is published as a confirmed `account.mcp_key` event
+  (`action` `created` / `revoked`, `mcpKey{keyId,userId,tokenSha256,createdUtc}`) onto the existing account
+  queue. The page refuses to report success unless RabbitMQ says `routed:true`.
+  - **Mirror:** a new `user_mcp_key(key_id, user_id, token_sha256, created_utc, revoked_utc, updated_utc)` table.
+    It is a whole new table, so `CREATE TABLE IF NOT EXISTS` adds it to the deployed mirror. A `revoked` that
+    arrives before its `created` inserts a placeholder that stays revoked. The hash is not unique (same reason
+    as `user_prime_sync`), and no label is stored.
+  - **Lookup:** new `UserMcpKeyStore`. The MCP path asks the hand-issued `McpKeyStore` first, then this. It
+    runs one read-only indexed query per request against the mirror, joined to `users_sync`. A key is live
+    only if not revoked AND its owner is neither suspended nor deleted, so suspending an account kills its
+    keys with no extra step. There is no snapshot, so a revocation bites as soon as its event is applied. The
+    `user_id` join is `COLLATE NOCASE` (two producers of the GUID text). Tokens without the `ffmcp_` prefix are
+    refused without opening the mirror. Mirror keys appear in logs and in the rate limiter as `user:<key id>`.
+  - `CPROXY_MCP_KEYS_DB` unset is now a WARN ("only self-service keys"), not an ERROR. The 401 log reason is
+    "mcp key store unavailable" only when neither source could be asked.
+  - **Tests:** `account_mirror_store_test` +4 (created key found, then revoke bites at once; revoke-before-create
+    stays dead; a suspended/deleted/unknown owner refuses the key; a missing mirror refuses and is not created).
+    `proxy_test` +1 (self-service key → 200 with no key file, not forwarded upstream, useless on other POSTs,
+    401 after revocation).
+  - **Deploy order:** DB objects → cproxy 0.21.0 → `FishTracker.dll` + `Account/Profile.aspx`. Until cproxy is
+    on 0.21.0 the old consumer ignores `account.mcp_key` events (unknown type), so keys made then would never
+    work. Deploy cproxy first.
 - 2026-10-01: **0.20.1 — a key file that appears after startup is picked up without a restart. DEPLOYED
   2026-10-01**: digest `399bc87d…e240`, rollback 0.20.0 `231416de…e480`. The droplet's `compose.yml` matched git before
   replacement (backup `compose.yml.bak-0.20.0`). Startup: version 0.20.1, `MCP key store loaded keys 1`, TLS on 8443,

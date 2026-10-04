@@ -71,6 +71,7 @@ std::shared_ptr<const std::unordered_map<std::string, McpKey>> load_keys(const s
     int rc;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         McpKey key;
+        key.admin = true;  // hand-made keys are the operator's own (see McpKey::admin)
         key.key_id = column_text(stmt, 0);
         std::string hash = column_text(stmt, 1);
         std::transform(hash.begin(), hash.end(), hash.begin(),

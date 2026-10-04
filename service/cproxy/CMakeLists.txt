@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.20.1 LANGUAGES CXX)
+project(cproxy VERSION 0.22.0 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -75,6 +75,7 @@ add_library(cproxy_core STATIC
   src/rabbit_event_consumer.cpp
   src/rate_limiter.cpp
   src/secret_codec.cpp
+  src/user_mcp_key_store.cpp
   src/user_prime_store.cpp
 )
 target_include_directories(cproxy_core PUBLIC

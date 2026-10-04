@@ -1,11 +1,15 @@
 #include "check.hpp"
+#include <chrono>
 #include <cstdio>
+#include <format>
 #include <iostream>
 
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
 #include "account_mirror_store.hpp"
+#include "mcp_key_store.hpp"
+#include "user_mcp_key_store.hpp"
 
 using namespace cproxy;
 
@@ -486,7 +490,139 @@ void adds_user_prime_table_to_an_existing_mirror() {
 
 }  // namespace
 
+// ---- self-service MCP keys (0.21.0): account.mcp_key events + UserMcpKeyStore -------------------
+
+nlohmann::json user_sync_event(const std::string& event_id, const std::string& user_id, bool suspended,
+                               bool deleted) {
+    return {{"eventId", event_id},
+            {"eventType", "acme.account.user_sync"},
+            {"action", "updated"},
+            {"aggregateId", user_id},
+            {"occurredUtc", "2026-10-01T10:00:00Z"},
+            {"user", {{"id", user_id}, {"usersId", 1}, {"userName", "u"}, {"email", user_id + "@example.test"},
+                      {"lastVisit", ""}, {"access", 0}, {"suspended", suspended}, {"authType", "Local"},
+                      {"deleted", deleted}, {"deletedUtc", nullptr}, {"prime", 0}, {"primeExpired", nullptr}}}};
+}
+
+std::string iso_utc_days_ago(int days) {
+    const auto t = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()) -
+                   std::chrono::days(days);
+    return std::format("{:%FT%T}.1234567Z", t);
+}
+
+nlohmann::json mcp_key_event(const std::string& event_id, const std::string& action, const std::string& key_id,
+                             const std::string& user_id, const std::string& token,
+                             const std::string& created_utc = iso_utc_days_ago(0)) {
+    return {{"eventId", event_id},
+            {"eventType", "acme.account.mcp_key"},
+            {"action", action},
+            {"aggregateId", key_id},
+            {"occurredUtc", "2026-10-01T10:01:00Z"},
+            {"mcpKey", {{"keyId", key_id}, {"userId", user_id}, {"tokenSha256", sha256_hex(token)},
+                        {"createdUtc", created_utc}}}};
+}
+
+void an_mcp_key_older_than_seven_days_is_refused() {
+    const std::string db_path = "account_mirror_store_test_mcpkey_expiry.sqlite";
+    std::remove(db_path.c_str());
+    AccountMirrorStore store(db_path);
+    store.ensure_schema();
+    const std::string user = "0190aaaa-0000-7000-8000-000000000004";
+    CHECK(store.apply_event(user_sync_event("us-7", user, false, false)));
+    CHECK(store.apply_event(mcp_key_event("mk-7", "created", "key-5", user, "ffmcp_six-days", iso_utc_days_ago(6))));
+    CHECK(store.apply_event(mcp_key_event("mk-8", "created", "key-6", user, "ffmcp_eight-days", iso_utc_days_ago(8))));
+
+    UserMcpKeyStore keys(db_path);
+    CHECK(keys.find("ffmcp_six-days").has_value());
+    CHECK(!keys.find("ffmcp_eight-days").has_value());
+    CHECK(keys.last_error().empty());
+    std::remove(db_path.c_str());
+}
+
+void a_created_mcp_key_of_a_live_account_is_found_and_revoking_it_bites_at_once() {
+    const std::string db_path = "account_mirror_store_test_mcpkey.sqlite";
+    std::remove(db_path.c_str());
+    AccountMirrorStore store(db_path);
+    store.ensure_schema();
+    const std::string token = "ffmcp_user-token-one";
+
+    CHECK(store.apply_event(user_sync_event("us-1", "0190aaaa-0000-7000-8000-000000000001", false, false)));
+    // Upper-case GUID from the other producer: matched case-insensitively.
+    CHECK(store.apply_event(mcp_key_event("mk-1", "created", "key-1", "0190AAAA-0000-7000-8000-000000000001", token)));
+
+    UserMcpKeyStore keys(db_path);
+    auto found = keys.find(token);
+    CHECK(found.has_value());
+    CHECK(found->key_id == "user:key-1");
+    CHECK(keys.last_error().empty());
+    CHECK(!keys.find("ffmcp_some-other-token").has_value());
+    CHECK(!keys.find("user-token-without-prefix").has_value());
+
+    CHECK(store.apply_event(mcp_key_event("mk-2", "revoked", "key-1", "0190aaaa-0000-7000-8000-000000000001", token)));
+    CHECK(!keys.find(token).has_value());
+    std::remove(db_path.c_str());
+}
+
+void a_revoke_that_arrives_first_keeps_the_key_dead() {
+    const std::string db_path = "account_mirror_store_test_mcpkey_order.sqlite";
+    std::remove(db_path.c_str());
+    AccountMirrorStore store(db_path);
+    store.ensure_schema();
+    const std::string token = "ffmcp_user-token-two";
+    const std::string user = "0190aaaa-0000-7000-8000-000000000002";
+
+    CHECK(store.apply_event(user_sync_event("us-2", user, false, false)));
+    CHECK(store.apply_event(mcp_key_event("mk-3", "revoked", "key-2", user, token)));
+    CHECK(store.apply_event(mcp_key_event("mk-4", "created", "key-2", user, token)));
+
+    UserMcpKeyStore keys(db_path);
+    CHECK(!keys.find(token).has_value());
+    std::remove(db_path.c_str());
+}
+
+void a_suspended_or_deleted_owner_loses_every_key() {
+    const std::string db_path = "account_mirror_store_test_mcpkey_owner.sqlite";
+    std::remove(db_path.c_str());
+    AccountMirrorStore store(db_path);
+    store.ensure_schema();
+    const std::string token = "ffmcp_user-token-three";
+    const std::string user = "0190aaaa-0000-7000-8000-000000000003";
+
+    CHECK(store.apply_event(user_sync_event("us-3", user, false, false)));
+    CHECK(store.apply_event(mcp_key_event("mk-5", "created", "key-3", user, token)));
+    UserMcpKeyStore keys(db_path);
+    CHECK(keys.find(token).has_value());
+
+    CHECK(store.apply_event(user_sync_event("us-4", user, true, false)));
+    CHECK(!keys.find(token).has_value());
+    CHECK(store.apply_event(user_sync_event("us-5", user, false, true)));
+    CHECK(!keys.find(token).has_value());
+    CHECK(store.apply_event(user_sync_event("us-6", user, false, false)));
+    CHECK(keys.find(token).has_value());
+
+    // A key whose owner the mirror has never heard of is refused, not trusted.
+    CHECK(store.apply_event(mcp_key_event("mk-6", "created", "key-4", "0190aaaa-0000-7000-8000-00000000ffff",
+                                          "ffmcp_orphan")));
+    CHECK(!keys.find("ffmcp_orphan").has_value());
+    std::remove(db_path.c_str());
+}
+
+void a_missing_mirror_refuses_and_reports() {
+    UserMcpKeyStore keys("account_mirror_store_test_no_such_file.sqlite");
+    CHECK(!keys.find("ffmcp_anything").has_value());
+    CHECK(!keys.last_error().empty());
+    // And the read-only open must not have created it.
+    std::FILE* f = std::fopen("account_mirror_store_test_no_such_file.sqlite", "rb");
+    CHECK(f == nullptr);
+    if (f != nullptr) std::fclose(f);
+}
+
 int main() {
+    a_created_mcp_key_of_a_live_account_is_found_and_revoking_it_bites_at_once();
+    a_revoke_that_arrives_first_keeps_the_key_dead();
+    a_suspended_or_deleted_owner_loses_every_key();
+    an_mcp_key_older_than_seven_days_is_refused();
+    a_missing_mirror_refuses_and_reports();
     applies_user_and_api_key_events_idempotently();
     applies_user_sync_events_idempotently_and_upserts_on_update();
     preserves_users_id_beyond_32_bits();
