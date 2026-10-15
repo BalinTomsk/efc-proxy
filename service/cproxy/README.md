@@ -22,6 +22,7 @@ frontend.service ──HTTP──►  cproxy (10.12.22.225)  ──HTTP──►
 | `GET /health/ready` | readiness — `503` while the upstream circuit breaker is open |
 | `GET /metrics` | Prometheus text counters (requests by status, upstream latency, failures, breaker state) |
 | `<CPROXY_WATERAPI_PREFIX>…` (default `/api/v1/water/`) | reverse-proxied to the waterapi upstream (station map) when `CPROXY_WATERAPI_UPSTREAM` is set — same guards, its own circuit breaker (0.18.0) |
+| `<CPROXY_NEWSFIND_PREFIX>…` (default `/api/v1/newsfind/`) | reverse-proxied to the news_find upstream (semantic news search) when `CPROXY_NEWSFIND_UPSTREAM` is set — same guards, its own circuit breaker (0.23.0) |
 | `<CPROXY_ROUTE_PREFIX>…` (default `/api/`) | reverse-proxied to the docapi upstream |
 | anything else | `404` |
 
@@ -59,6 +60,8 @@ probing is visible.
 | `CPROXY_ROUTE_PREFIX` | `/api/` | path prefix forwarded to docapi |
 | `CPROXY_WATERAPI_UPSTREAM` | (empty = no water route) | waterapi origin (`scheme://host:port`) |
 | `CPROXY_WATERAPI_PREFIX` | `/api/v1/water/` | sub-path of the route prefix sent to waterapi instead of docapi |
+| `CPROXY_NEWSFIND_UPSTREAM` | (empty = no news_find route) | news_find origin (`scheme://host:port`) |
+| `CPROXY_NEWSFIND_PREFIX` | `/api/v1/newsfind/` | sub-path of the route prefix sent to news_find instead of docapi |
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |
