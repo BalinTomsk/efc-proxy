@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <format>
 #include <iostream>
 #include <mutex>
 #include <set>
@@ -1427,6 +1428,87 @@ void the_water_route_goes_through_every_guard() {
     CHECK(r->get_header_value("X-Got-Role-Count") == "1");
 }
 
+// ---- Third upstream: news_find (0.23.0) -------------------------------------------------------
+
+void three_upstreams_each_get_their_own_prefix() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+    TestServer water;
+    install_tagged_upstream(water.server, "waterapi");
+    water.start();
+    TestServer news;
+    install_tagged_upstream(news.server, "news_find");
+    news.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.waterapi_upstream = "http://127.0.0.1:" + std::to_string(water.port);
+    cfg.newsfind_upstream = "http://127.0.0.1:" + std::to_string(news.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto n = cli.Get("/api/v1/newsfind/search?q=walleye%20limits&limit=3");
+    CHECK(n && n->status == 200);
+    CHECK(n->body == "news_find:/api/v1/newsfind/search?q=walleye%20limits&limit=3");
+    // docapi's keyword search is untouched, and so is the water route.
+    auto k = cli.Get("/api/v1/news/search?q=walleye");
+    CHECK(k && k->body.starts_with("docapi:"));
+    auto w = cli.Get("/api/v1/water/station/map?country=US");
+    CHECK(w && w->body.starts_with("waterapi:"));
+    auto upper = cli.Get("/api/v1/NewsFind/search?q=x");
+    CHECK(upper && upper->body.starts_with("news_find:"));
+
+    // The caller's own role never rides along; news_find sees cproxy's, once.
+    auto r = cli.Get("/api/v1/newsfind/search?q=x", {{"X-Fish-Role", "admin"}});
+    CHECK(r && r->get_header_value("X-Got-Role") == "guest");
+    CHECK(r->get_header_value("X-Got-Role-Count") == "1");
+
+    // A write is gated like everything else (no secret configured, so it can never pass).
+    auto post = cli.Post("/api/v1/newsfind/search", "{}", "application/json");
+    CHECK(post && post->status == 500);
+
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->body.find("\"news_find\":\"closed\"") != std::string::npos);
+    auto m = cli.Get("/metrics");
+    CHECK(m && m->body.find("cproxy_newsfind_breaker_state 0") != std::string::npos);
+}
+
+void a_newsfind_outage_never_trips_docapi_or_readiness() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.newsfind_upstream = "http://127.0.0.1:1";  // nothing listens there
+    cfg.connect_timeout_ms = 300;
+    cfg.breaker_threshold = 2;
+    cfg.breaker_cooldown_ms = 60000;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_read_timeout(5, 0);
+    for (int i = 0; i < 2; ++i) {
+        auto r = cli.Get("/api/v1/newsfind/search?q=x");
+        CHECK(r && r->status == 502);
+        CHECK(r->body.find("Upstream news_find is unreachable") != std::string::npos);
+    }
+    auto fast = cli.Get("/api/v1/newsfind/search?q=x");
+    CHECK(fast && fast->body.find("upstream_unavailable") != std::string::npos);
+
+    auto d = cli.Get("/api/v1/news/search?q=x");
+    CHECK(d && d->status == 200 && d->body.starts_with("docapi:"));
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->status == 200);
+    CHECK(ready->body.find("\"news_find\":\"open\"") != std::string::npos);
+    CHECK(ready->body.find("waterapi") == std::string::npos);
+}
+
 
 /**
  * A 304 Not Modified with no Content-Length on a kept-alive connection -- the way Kestrel (waterapi)
@@ -1668,11 +1750,15 @@ void a_self_service_key_from_the_account_mirror_is_accepted_until_revoked() {
                                        {"lastVisit", ""}, {"access", 0}, {"suspended", false},
                                        {"authType", "Local"}, {"deleted", false}, {"deletedUtc", nullptr},
                                        {"prime", 0}, {"primeExpired", nullptr}}}}));
+    // createdUtc must be recent: a self-service key expires 7 days after it (UserMcpKeyStore). A fixed
+    // 2026-10-01 here made this test fail every build from 2026-10-08 on.
+    const std::string created = std::format(
+        "{:%FT%T}Z", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
     const auto key_event = [&](const char* id, const char* action) {
         return nlohmann::json{{"eventId", id}, {"eventType", "acme.account.mcp_key"}, {"action", action},
                               {"occurredUtc", "2026-10-01T10:01:00Z"},
                               {"mcpKey", {{"keyId", "k1"}, {"userId", user}, {"tokenSha256", sha256_hex(token)},
-                                          {"createdUtc", "2026-10-01T10:01:00Z"}}}};
+                                          {"createdUtc", created}}}};
     };
     CHECK(store.apply_event(key_event("mk-1", "created")));
 
@@ -1875,6 +1961,8 @@ int main() {
     a_waterapi_outage_never_trips_the_docapi_breaker();
     a_compressed_upstream_body_passes_through_untouched();
     the_water_route_goes_through_every_guard();
+    three_upstreams_each_get_their_own_prefix();
+    a_newsfind_outage_never_trips_docapi_or_readiness();
     a_not_modified_answer_is_relayed_at_once();
     the_mcp_path_takes_its_own_key_instead_of_the_day_key();
     the_mcp_path_is_tls_only_unless_plain_is_allowed();

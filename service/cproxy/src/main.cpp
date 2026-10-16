@@ -114,13 +114,15 @@ int main() {
     cproxy::log_raw(std::format(
         "{{\"service\":\"cproxy\",\"version\":\"{}\",\"msg\":\"starting\","
         "\"listen\":\"{}:{}\",\"route_prefix\":\"{}\",\"docapi_upstream\":\"{}\","
-        "\"waterapi\":\"{}\","
+        "\"waterapi\":\"{}\",\"news_find\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
         "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"tls\":\"{}\","
         "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.waterapi_enabled() ? std::format("{} -> {}", cfg.waterapi_prefix, cfg.waterapi_upstream)
+                               : std::string("off"),
+        cfg.newsfind_enabled() ? std::format("{} -> {}", cfg.newsfind_prefix, cfg.newsfind_upstream)
                                : std::string("off"),
         cfg.auth_required() ? "true" : "false",
         cfg.allowed_methods.empty() ? "ALL" : "restricted",

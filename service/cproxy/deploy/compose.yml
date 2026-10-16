@@ -3,7 +3,7 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:24039f32b29e737f42b209ff69474368b79b594ff908c4e3b631e1b9e8d2379d  # 0.22.0 pinned by digest (rollback: 0.21.1 = sha256:46f2f7d0ec85c9f479bf2df55b5a6c2968e526bd1d83b2def0a7d5240f2593ae)
+    image: ghcr.io/balintomsk/cproxy@sha256:687218258bdad07cb97a4299d121e5aed230c48cb46796b2f86e922987c6afa8  # 0.23.0 pinned by digest (rollback: 0.22.0 = sha256:24039f32b29e737f42b209ff69474368b79b594ff908c4e3b631e1b9e8d2379d)
     container_name: cproxy
     restart: unless-stopped
     ports:
@@ -22,6 +22,8 @@ services:
       # CPROXY_DOCAPI_UPSTREAM: it is a real address and this file deploys verbatim from a public repo.
       # It comes from /mnt/volume_cnode/cproxy/.env; while absent there is no water route at all and
       # /api/v1/water/* reaches docapi (a 404). CPROXY_WATERAPI_PREFIX keeps its default, /api/v1/water/.
+      # CPROXY_NEWSFIND_UPSTREAM (0.23.0) likewise lives only in the droplet dotenv; unset = no
+      # /api/v1/newsfind/ route. CPROXY_NEWSFIND_PREFIX keeps its default, /api/v1/newsfind/.
       CPROXY_ALLOWED_METHODS: GET,POST,PATCH             # POST and PATCH are both gated by the Bearer JWT below, not open
       # MCP (0.20.0). docapi 1.20.0's read-only MCP server, for Claude Code / Claude Desktop. This ONE
       # path is exempt from the day-key JWT (an MCP client cannot renew a token that dies at UTC

@@ -9,6 +9,27 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-10-15: **0.23.0 — third upstream: news_find (semantic news search). DEPLOYED 2026-10-15**, digest
+  `sha256:68721825…afa8`, rollback 0.22.0 (`sha256:24039f32…`). Startup line `"news_find":"/api/v1/newsfind/ -> …"`, healthy,
+  `restarts=0`; through the public edge: search 200 in 0.26 s, blank `q` 400, POST 500 (gated), readiness
+  `"news_find":"closed"`, docapi fish + news search and the water map 200. Dotenv backup `.env.bak-prenewsfind`,
+  compose backup `compose.yml.bak-0.22.0`.
+  - `CPROXY_NEWSFIND_UPSTREAM` (unset = no route) and `CPROXY_NEWSFIND_PREFIX` (default `/api/v1/newsfind/`).
+    Paths under the prefix go to news_find (`efcs-backend/service/news_find`) through every existing guard, the
+    gate and `X-Fish-Role`, with a circuit breaker of their own. `/health/ready` reports `"news_find"` but
+    readiness still follows docapi only. New metric `cproxy_newsfind_breaker_state`. The startup line names the route.
+  - Startup refuses: no scheme; a prefix outside or equal to the route prefix; a prefix that overlaps the water
+    prefix in either direction; an MCP path under it.
+  - Why: news_find runs on its own host and was reachable only directly, over plain HTTP. Fronting it here gives
+    it the same edge as everything else, and the direct port can then be closed.
+  - Tests: `config_test` +2 (matching, normalisation, bad configs); `proxy_test` +2 (three upstreams each get
+    their own prefix, docapi's `/news/search` stays docapi's; a news_find outage opens only its own breaker).
+  - Deploy: append `CPROXY_NEWSFIND_UPSTREAM=<news-find-origin>` to the droplet dotenv (append, never regenerate).
+  - **Fixed a time bomb in `proxy_test`:** `a_self_service_key_from_the_account_mirror_is_accepted_until_revoked`
+    hard-coded `createdUtc: 2026-10-01`. Self-service keys expire 7 days after creation, so from 2026-10-08 the
+    key was "expired", the request was 401, and **the Docker build of an unchanged `main` failed**. That was
+    confirmed by building HEAD. It now uses the current time. 11/11 ctest in the Docker build stage.
+
 - 2026-10-03: **0.22.0 — MCP requests carry the key owner's role. DEPLOYED 2026-10-03**: digest
   `sha256:24039f32…`, rollback 0.21.1 (`sha256:46f2f7d0…`); `/health` 0.22.0, healthy, `restarts=0`, clean startup;
   a live MCP search through it answered normally (docapi 1.20.2 ignores the header).
