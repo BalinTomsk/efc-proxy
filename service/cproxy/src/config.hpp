@@ -20,8 +20,10 @@ namespace cproxy {
  * | CPROXY_ROUTE_PREFIX         | /api/                         | path prefix forwarded to docapi           |
  * | CPROXY_WATERAPI_UPSTREAM    | (empty = no waterapi route)   | waterapi origin (scheme://host:port)      |
  * | CPROXY_WATERAPI_PREFIX      | /api/v1/water/                | sub-prefix of the route prefix sent to waterapi |
- * | CPROXY_NEWSFIND_UPSTREAM    | (empty = no news_find route)  | news_find origin (scheme://host:port)     |
- * | CPROXY_NEWSFIND_PREFIX      | /api/v1/newsfind/             | sub-prefix of the route prefix sent to news_find |
+ * | CPROXY_NEWSIDX_UPSTREAM    | (empty = no news_idx route)  | news_idx origin (scheme://host:port)     |
+ * | CPROXY_NEWSIDX_PREFIX      | /api/v1/newsidx/             | sub-prefix of the route prefix sent to news_idx |
+ * | CPROXY_NEWSSEARCH_UPSTREAM  | (empty = no news_search route) | news_search origin (scheme://host:port)  |
+ * | CPROXY_NEWSSEARCH_PREFIX    | /api/v1/newssearch/          | sub-prefix of the route prefix sent to news_search |
  * | CPROXY_API_KEY              | (empty)                       | if set, require header X-API-Key to match |
  * | CPROXY_ALLOWED_METHODS      | (empty = all)                 | CSV allow-list, e.g. "GET,HEAD"           |
  * | CPROXY_CONNECT_TIMEOUT_MS   | 3000                          | upstream connect timeout                  |
@@ -88,19 +90,32 @@ struct Config {
     /** True when `path` (the decoded request path) is served by waterapi rather than docapi. */
     bool routes_to_waterapi(const std::string& path) const;
 
-    // --- Third upstream: news_find (0.23.0) --------------------------------------------------
-    // Semantic news search (efcs-backend/service/news_find), on its own host. Same rules as the
+    // --- Third upstream: news_idx (0.23.0) --------------------------------------------------
+    // Semantic news search (efcs-backend/service/news_idx), on its own host. Same rules as the
     // waterapi route above: every guard, the gate and X-Fish-Role apply unchanged; only the origin
     // and the breaker differ, and empty means no route (the prefix then reaches docapi and 404s). Its
     // own namespace because docapi owns /api/v1/news/*. Must not overlap the water prefix.
-    std::string newsfind_upstream;
-    std::string newsfind_prefix = "/api/v1/newsfind/";
+    std::string newsidx_upstream;
+    std::string newsidx_prefix = "/api/v1/newsidx/";
 
-    /** True when CPROXY_NEWSFIND_UPSTREAM is set, i.e. the news_find route exists. */
-    bool newsfind_enabled() const { return !newsfind_upstream.empty(); }
+    /** True when CPROXY_NEWSIDX_UPSTREAM is set, i.e. the news_idx route exists. */
+    bool newsidx_enabled() const { return !newsidx_upstream.empty(); }
 
-    /** True when `path` (the decoded request path) is served by news_find. */
-    bool routes_to_newsfind(const std::string& path) const;
+    /** True when `path` (the decoded request path) is served by news_idx. */
+    bool routes_to_newsidx(const std::string& path) const;
+
+    // --- Fourth upstream: news_search (0.25.0) -----------------------------------------------
+    // The portal's per-engine news search (efcs-backend/service/news_search, on csnode beside waterapi):
+    // one endpoint per engine so the page shows each result set as it lands. Same rules as the routes
+    // above; must not overlap the water or news_idx prefixes.
+    std::string newssearch_upstream;
+    std::string newssearch_prefix = "/api/v1/newssearch/";
+
+    /** True when CPROXY_NEWSSEARCH_UPSTREAM is set, i.e. the news_search route exists. */
+    bool newssearch_enabled() const { return !newssearch_upstream.empty(); }
+
+    /** True when `path` (the decoded request path) is served by news_search. */
+    bool routes_to_newssearch(const std::string& path) const;
 
     // --- MCP path (0.20.0) -------------------------------------------------------------------
     // docapi's Model Context Protocol endpoint (POST /api/v1/mcp, docapi 1.20.0), for Claude Code /

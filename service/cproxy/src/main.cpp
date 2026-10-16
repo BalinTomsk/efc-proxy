@@ -114,7 +114,7 @@ int main() {
     cproxy::log_raw(std::format(
         "{{\"service\":\"cproxy\",\"version\":\"{}\",\"msg\":\"starting\","
         "\"listen\":\"{}:{}\",\"route_prefix\":\"{}\",\"docapi_upstream\":\"{}\","
-        "\"waterapi\":\"{}\",\"news_find\":\"{}\","
+        "\"waterapi\":\"{}\",\"news_idx\":\"{}\",\"news_search\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
         "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"tls\":\"{}\","
@@ -122,8 +122,10 @@ int main() {
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.waterapi_enabled() ? std::format("{} -> {}", cfg.waterapi_prefix, cfg.waterapi_upstream)
                                : std::string("off"),
-        cfg.newsfind_enabled() ? std::format("{} -> {}", cfg.newsfind_prefix, cfg.newsfind_upstream)
+        cfg.newsidx_enabled() ? std::format("{} -> {}", cfg.newsidx_prefix, cfg.newsidx_upstream)
                                : std::string("off"),
+        cfg.newssearch_enabled() ? std::format("{} -> {}", cfg.newssearch_prefix, cfg.newssearch_upstream)
+                                 : std::string("off"),
         cfg.auth_required() ? "true" : "false",
         cfg.allowed_methods.empty() ? "ALL" : "restricted",
         cfg.log_dir.empty() ? "(stdout only)" : cfg.log_dir,

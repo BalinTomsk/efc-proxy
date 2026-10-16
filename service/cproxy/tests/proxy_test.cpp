@@ -1428,7 +1428,7 @@ void the_water_route_goes_through_every_guard() {
     CHECK(r->get_header_value("X-Got-Role-Count") == "1");
 }
 
-// ---- Third upstream: news_find (0.23.0) -------------------------------------------------------
+// ---- Third upstream: news_idx (0.23.0) -------------------------------------------------------
 
 void three_upstreams_each_get_their_own_prefix() {
     TestServer doc;
@@ -1438,52 +1438,52 @@ void three_upstreams_each_get_their_own_prefix() {
     install_tagged_upstream(water.server, "waterapi");
     water.start();
     TestServer news;
-    install_tagged_upstream(news.server, "news_find");
+    install_tagged_upstream(news.server, "news_idx");
     news.start();
 
     Config cfg;
     cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
     cfg.waterapi_upstream = "http://127.0.0.1:" + std::to_string(water.port);
-    cfg.newsfind_upstream = "http://127.0.0.1:" + std::to_string(news.port);
+    cfg.newsidx_upstream = "http://127.0.0.1:" + std::to_string(news.port);
     TestServer proxy;
     install_routes(proxy.server, cfg);
     proxy.start();
 
     httplib::Client cli("127.0.0.1", proxy.port);
-    auto n = cli.Get("/api/v1/newsfind/search?q=walleye%20limits&limit=3");
+    auto n = cli.Get("/api/v1/newsidx/search?q=walleye%20limits&limit=3");
     CHECK(n && n->status == 200);
-    CHECK(n->body == "news_find:/api/v1/newsfind/search?q=walleye%20limits&limit=3");
+    CHECK(n->body == "news_idx:/api/v1/newsidx/search?q=walleye%20limits&limit=3");
     // docapi's keyword search is untouched, and so is the water route.
     auto k = cli.Get("/api/v1/news/search?q=walleye");
     CHECK(k && k->body.starts_with("docapi:"));
     auto w = cli.Get("/api/v1/water/station/map?country=US");
     CHECK(w && w->body.starts_with("waterapi:"));
-    auto upper = cli.Get("/api/v1/NewsFind/search?q=x");
-    CHECK(upper && upper->body.starts_with("news_find:"));
+    auto upper = cli.Get("/api/v1/NewsIdx/search?q=x");
+    CHECK(upper && upper->body.starts_with("news_idx:"));
 
-    // The caller's own role never rides along; news_find sees cproxy's, once.
-    auto r = cli.Get("/api/v1/newsfind/search?q=x", {{"X-Fish-Role", "admin"}});
+    // The caller's own role never rides along; news_idx sees cproxy's, once.
+    auto r = cli.Get("/api/v1/newsidx/search?q=x", {{"X-Fish-Role", "admin"}});
     CHECK(r && r->get_header_value("X-Got-Role") == "guest");
     CHECK(r->get_header_value("X-Got-Role-Count") == "1");
 
     // A write is gated like everything else (no secret configured, so it can never pass).
-    auto post = cli.Post("/api/v1/newsfind/search", "{}", "application/json");
+    auto post = cli.Post("/api/v1/newsidx/search", "{}", "application/json");
     CHECK(post && post->status == 500);
 
     auto ready = cli.Get("/health/ready");
-    CHECK(ready && ready->body.find("\"news_find\":\"closed\"") != std::string::npos);
+    CHECK(ready && ready->body.find("\"news_idx\":\"closed\"") != std::string::npos);
     auto m = cli.Get("/metrics");
-    CHECK(m && m->body.find("cproxy_newsfind_breaker_state 0") != std::string::npos);
+    CHECK(m && m->body.find("cproxy_newsidx_breaker_state 0") != std::string::npos);
 }
 
-void a_newsfind_outage_never_trips_docapi_or_readiness() {
+void a_newsidx_outage_never_trips_docapi_or_readiness() {
     TestServer doc;
     install_tagged_upstream(doc.server, "docapi");
     doc.start();
 
     Config cfg;
     cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
-    cfg.newsfind_upstream = "http://127.0.0.1:1";  // nothing listens there
+    cfg.newsidx_upstream = "http://127.0.0.1:1";  // nothing listens there
     cfg.connect_timeout_ms = 300;
     cfg.breaker_threshold = 2;
     cfg.breaker_cooldown_ms = 60000;
@@ -1494,19 +1494,80 @@ void a_newsfind_outage_never_trips_docapi_or_readiness() {
     httplib::Client cli("127.0.0.1", proxy.port);
     cli.set_read_timeout(5, 0);
     for (int i = 0; i < 2; ++i) {
-        auto r = cli.Get("/api/v1/newsfind/search?q=x");
+        auto r = cli.Get("/api/v1/newsidx/search?q=x");
         CHECK(r && r->status == 502);
-        CHECK(r->body.find("Upstream news_find is unreachable") != std::string::npos);
+        CHECK(r->body.find("Upstream news_idx is unreachable") != std::string::npos);
     }
-    auto fast = cli.Get("/api/v1/newsfind/search?q=x");
+    auto fast = cli.Get("/api/v1/newsidx/search?q=x");
     CHECK(fast && fast->body.find("upstream_unavailable") != std::string::npos);
 
     auto d = cli.Get("/api/v1/news/search?q=x");
     CHECK(d && d->status == 200 && d->body.starts_with("docapi:"));
     auto ready = cli.Get("/health/ready");
     CHECK(ready && ready->status == 200);
-    CHECK(ready->body.find("\"news_find\":\"open\"") != std::string::npos);
+    CHECK(ready->body.find("\"news_idx\":\"open\"") != std::string::npos);
     CHECK(ready->body.find("waterapi") == std::string::npos);
+}
+
+// ---- Fourth upstream: news_search (0.25.0) -----------------------------------------------------
+
+void four_upstreams_each_get_their_own_prefix_and_breaker() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+    TestServer idx;
+    install_tagged_upstream(idx.server, "news_idx");
+    idx.start();
+    TestServer search;
+    install_tagged_upstream(search.server, "news_search");
+    search.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.newsidx_upstream = "http://127.0.0.1:" + std::to_string(idx.port);
+    cfg.newssearch_upstream = "http://127.0.0.1:" + std::to_string(search.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto s = cli.Get("/api/v1/newssearch/vector?q=pike");
+    CHECK(s && s->status == 200);
+    CHECK(s->body == "news_search:/api/v1/newssearch/vector?q=pike");
+    CHECK(cli.Get("/api/v1/news/search?q=pike")->body.starts_with("docapi:"));
+    CHECK(cli.Get("/api/v1/newsidx/search?q=pike")->body.starts_with("news_idx:"));
+
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->body.find("\"news_search\":\"closed\"") != std::string::npos);
+    auto m = cli.Get("/metrics");
+    CHECK(m && m->body.find("cproxy_newssearch_breaker_state 0") != std::string::npos);
+}
+
+void a_newssearch_outage_never_trips_docapi() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.newssearch_upstream = "http://127.0.0.1:1";
+    cfg.connect_timeout_ms = 300;
+    cfg.breaker_threshold = 2;
+    cfg.breaker_cooldown_ms = 60000;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_read_timeout(5, 0);
+    for (int i = 0; i < 2; ++i) {
+        auto r = cli.Get("/api/v1/newssearch/vector?q=x");
+        CHECK(r && r->status == 502);
+    }
+    CHECK(cli.Get("/api/v1/news/search?q=x")->body.starts_with("docapi:"));
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->status == 200);
+    CHECK(ready->body.find("\"news_search\":\"open\"") != std::string::npos);
 }
 
 
@@ -1962,7 +2023,9 @@ int main() {
     a_compressed_upstream_body_passes_through_untouched();
     the_water_route_goes_through_every_guard();
     three_upstreams_each_get_their_own_prefix();
-    a_newsfind_outage_never_trips_docapi_or_readiness();
+    a_newsidx_outage_never_trips_docapi_or_readiness();
+    four_upstreams_each_get_their_own_prefix_and_breaker();
+    a_newssearch_outage_never_trips_docapi();
     a_not_modified_answer_is_relayed_at_once();
     the_mcp_path_takes_its_own_key_instead_of_the_day_key();
     the_mcp_path_is_tls_only_unless_plain_is_allowed();

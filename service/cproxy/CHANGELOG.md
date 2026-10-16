@@ -9,6 +9,29 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-10-16: **0.25.0 — fourth upstream: news_search (per-engine news search on csnode). DEPLOYED 2026-10-16**,
+  digest `sha256:d647c70e…b77c`, rollback 0.24.0 (`sha256:9afcaec9…`). Healthy, `restarts=0`; through the edge: `/newssearch/sources`
+  and `/newssearch/vector` 200 (0.26 s), unknown engine 404, readiness `"news_search":"closed"`, docapi, news_idx and water 200.
+  Dotenv backup `.env.bak-prenewssearch`, compose backup `compose.yml.bak-0.24.0`.
+  - `CPROXY_NEWSSEARCH_UPSTREAM` (unset = no route) / `CPROXY_NEWSSEARCH_PREFIX` (default `/api/v1/newssearch/`), its
+    own breaker, readiness field `"news_search"` (never affects readiness), metric `cproxy_newssearch_breaker_state`.
+    Startup refuses a prefix that overlaps the water or news_idx prefix.
+  - Why: the portal asks each search engine in parallel and shows results as they land. SQL LIKE stays on
+    docapi (jnode); vector, and later BM25 and image, go through news_search on csnode, so either node can fail alone.
+  - Tests: `config_test` +1, `proxy_test` +2; 11/11 ctest.
+
+- 2026-10-16: **0.24.0 — the third upstream is renamed news_find → news_idx. DEPLOYED 2026-10-16**, digest
+  `sha256:9afcaec9…4f8f`, rollback 0.23.0 (`sha256:68721825…`). Healthy, `restarts=0`; through the edge: `/api/v1/newsidx/search` 200,
+  `/api/v1/newsfind/` 404, readiness `"news_idx":"closed"`, docapi and water 200. Dotenv backup `.env.bak-prenewsidx`,
+  compose backup `compose.yml.bak-0.23.0`.
+  - Keys `CPROXY_NEWSIDX_UPSTREAM` / `CPROXY_NEWSIDX_PREFIX` (default `/api/v1/newsidx/`). The old
+    `CPROXY_NEWSFIND_*` keys are no longer read, so `/api/v1/newsfind/*` now reaches docapi and gets a 404.
+    Readiness field `"news_idx"`, metric `cproxy_newsidx_breaker_state`. Behaviour is otherwise identical to 0.23.0.
+  - Why: the owner renamed the service to news_idx (efcs-backend `service/news_idx` 0.2.0, which runs on CTRL
+    only). No client used the old route yet.
+  - Deploy: append `CPROXY_NEWSIDX_UPSTREAM=<news-idx-origin>` to the droplet dotenv (append, never regenerate).
+    The old key can stay; it is ignored.
+
 - 2026-10-15: **0.23.0 — third upstream: news_find (semantic news search). DEPLOYED 2026-10-15**, digest
   `sha256:68721825…afa8`, rollback 0.22.0 (`sha256:24039f32…`). Startup line `"news_find":"/api/v1/newsfind/ -> …"`, healthy,
   `restarts=0`; through the public edge: search 200 in 0.26 s, blank `q` 400, POST 500 (gated), readiness

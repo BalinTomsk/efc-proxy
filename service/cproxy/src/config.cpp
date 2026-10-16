@@ -180,11 +180,17 @@ bool Config::routes_to_waterapi(const std::string& path) const {
     return p.starts_with(waterapi_prefix);
 }
 
-bool Config::routes_to_newsfind(const std::string& path) const {
-    if (!newsfind_enabled()) return false;
+bool Config::routes_to_newsidx(const std::string& path) const {
+    if (!newsidx_enabled()) return false;
     // Same matching as routes_to_waterapi: case-insensitive, the bare prefix included.
     const std::string p = to_lower(path) + "/";
-    return p.starts_with(newsfind_prefix);
+    return p.starts_with(newsidx_prefix);
+}
+
+bool Config::routes_to_newssearch(const std::string& path) const {
+    if (!newssearch_enabled()) return false;
+    const std::string p = to_lower(path) + "/";
+    return p.starts_with(newssearch_prefix);
 }
 
 bool Config::is_mcp_path(const std::string& path) const {
@@ -225,13 +231,20 @@ Config load_config(const EnvLookup& env) {
         if (prefix.back() != '/') prefix.push_back('/');
         cfg.waterapi_prefix = prefix;
     }
-    cfg.newsfind_upstream = get_str(env, "CPROXY_NEWSFIND_UPSTREAM", cfg.newsfind_upstream);
+    cfg.newsidx_upstream = get_str(env, "CPROXY_NEWSIDX_UPSTREAM", cfg.newsidx_upstream);
     {
         // Same canonical form as the water prefix.
-        std::string prefix = to_lower(get_str(env, "CPROXY_NEWSFIND_PREFIX", cfg.newsfind_prefix));
+        std::string prefix = to_lower(get_str(env, "CPROXY_NEWSIDX_PREFIX", cfg.newsidx_prefix));
         if (prefix.empty() || prefix.front() != '/') prefix.insert(prefix.begin(), '/');
         if (prefix.back() != '/') prefix.push_back('/');
-        cfg.newsfind_prefix = prefix;
+        cfg.newsidx_prefix = prefix;
+    }
+    cfg.newssearch_upstream = get_str(env, "CPROXY_NEWSSEARCH_UPSTREAM", cfg.newssearch_upstream);
+    {
+        std::string prefix = to_lower(get_str(env, "CPROXY_NEWSSEARCH_PREFIX", cfg.newssearch_prefix));
+        if (prefix.empty() || prefix.front() != '/') prefix.insert(prefix.begin(), '/');
+        if (prefix.back() != '/') prefix.push_back('/');
+        cfg.newssearch_prefix = prefix;
     }
     {
         // Canonical form, same as the day-key paths: lower-case, leading '/', no trailing '/'. "NONE"
@@ -433,18 +446,34 @@ std::vector<std::string> validate_config(const Config& cfg) {
             errors.push_back("CPROXY_WATERAPI_PREFIX must be a sub-path of CPROXY_ROUTE_PREFIX, e.g. "
                              "/api/v1/water/");
     }
-    if (cfg.newsfind_enabled()) {
-        if (cfg.newsfind_upstream.rfind("http://", 0) != 0 &&
-            cfg.newsfind_upstream.rfind("https://", 0) != 0)
-            errors.push_back("CPROXY_NEWSFIND_UPSTREAM must be scheme://host[:port] with http or https");
+    if (cfg.newsidx_enabled()) {
+        if (cfg.newsidx_upstream.rfind("http://", 0) != 0 &&
+            cfg.newsidx_upstream.rfind("https://", 0) != 0)
+            errors.push_back("CPROXY_NEWSIDX_UPSTREAM must be scheme://host[:port] with http or https");
         const std::string route = to_lower(cfg.route_prefix);
-        if (!cfg.newsfind_prefix.starts_with(route) || cfg.newsfind_prefix.size() <= route.size())
-            errors.push_back("CPROXY_NEWSFIND_PREFIX must be a sub-path of CPROXY_ROUTE_PREFIX, e.g. "
-                             "/api/v1/newsfind/");
+        if (!cfg.newsidx_prefix.starts_with(route) || cfg.newsidx_prefix.size() <= route.size())
+            errors.push_back("CPROXY_NEWSIDX_PREFIX must be a sub-path of CPROXY_ROUTE_PREFIX, e.g. "
+                             "/api/v1/newsidx/");
         // Nested prefixes would make the destination depend on check order; refuse them outright.
-        if (cfg.waterapi_enabled() && (cfg.newsfind_prefix.starts_with(cfg.waterapi_prefix) ||
-                                       cfg.waterapi_prefix.starts_with(cfg.newsfind_prefix)))
-            errors.push_back("CPROXY_NEWSFIND_PREFIX and CPROXY_WATERAPI_PREFIX must not overlap");
+        if (cfg.waterapi_enabled() && (cfg.newsidx_prefix.starts_with(cfg.waterapi_prefix) ||
+                                       cfg.waterapi_prefix.starts_with(cfg.newsidx_prefix)))
+            errors.push_back("CPROXY_NEWSIDX_PREFIX and CPROXY_WATERAPI_PREFIX must not overlap");
+    }
+    if (cfg.newssearch_enabled()) {
+        if (cfg.newssearch_upstream.rfind("http://", 0) != 0 &&
+            cfg.newssearch_upstream.rfind("https://", 0) != 0)
+            errors.push_back("CPROXY_NEWSSEARCH_UPSTREAM must be scheme://host[:port] with http or https");
+        const std::string route = to_lower(cfg.route_prefix);
+        if (!cfg.newssearch_prefix.starts_with(route) || cfg.newssearch_prefix.size() <= route.size())
+            errors.push_back("CPROXY_NEWSSEARCH_PREFIX must be a sub-path of CPROXY_ROUTE_PREFIX, e.g. "
+                             "/api/v1/newssearch/");
+        const auto overlaps = [&](const std::string& other) {
+            return cfg.newssearch_prefix.starts_with(other) || other.starts_with(cfg.newssearch_prefix);
+        };
+        if (cfg.waterapi_enabled() && overlaps(cfg.waterapi_prefix))
+            errors.push_back("CPROXY_NEWSSEARCH_PREFIX and CPROXY_WATERAPI_PREFIX must not overlap");
+        if (cfg.newsidx_enabled() && overlaps(cfg.newsidx_prefix))
+            errors.push_back("CPROXY_NEWSSEARCH_PREFIX and CPROXY_NEWSIDX_PREFIX must not overlap");
     }
     if (cfg.mcp_enabled()) {
         // Inside the route prefix, or the forwarding routes never see it; outside the water prefix,
@@ -454,8 +483,10 @@ std::vector<std::string> validate_config(const Config& cfg) {
             errors.push_back("CPROXY_MCP_PATH must be a path under CPROXY_ROUTE_PREFIX, e.g. /api/v1/mcp");
         if (cfg.routes_to_waterapi(cfg.mcp_path))
             errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_WATERAPI_PREFIX");
-        if (cfg.routes_to_newsfind(cfg.mcp_path))
-            errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_NEWSFIND_PREFIX");
+        if (cfg.routes_to_newsidx(cfg.mcp_path))
+            errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_NEWSIDX_PREFIX");
+        if (cfg.routes_to_newssearch(cfg.mcp_path))
+            errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_NEWSSEARCH_PREFIX");
         if (cfg.mcp_rate_per_minute <= 0) errors.push_back("CPROXY_MCP_RATE_PER_MINUTE must be positive");
         if (cfg.mcp_burst <= 0) errors.push_back("CPROXY_MCP_BURST must be positive");
         if (cfg.mcp_max_payload_bytes <= 0)
