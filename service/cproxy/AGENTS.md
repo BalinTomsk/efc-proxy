@@ -18,11 +18,11 @@ internal backend droplets. It runs in Docker on **Debian 13 ("trixie")** on drop
   (`../../efcs-backend/service/waterapi`, station map) on the second backend droplet `137.184.218.128`
   (`debian-csnode`), for `/api/v1/water/*`. Off until `CPROXY_WATERAPI_UPSTREAM` is set. See
   "Second upstream: waterapi" below. The transport is VPC peering default-tor1 ↔ default-nyc1.
-- **0.23.0 (DEPLOYED 2026-10-15, route live):** a third upstream, **news_find**
-  (`../../efcs-backend/service/news_find`, semantic news search) on the vector host (Windows Server +
-  Rancher Desktop, on the owner's network, not DigitalOcean), for `/api/v1/newsfind/*`. Off until
-  `CPROXY_NEWSFIND_UPSTREAM` is set. There is no VPC to it: the origin is the router's forwarded port, plain
-  HTTP over the internet. Closing that port to anyone but cproxy is the follow-up; news_find's
+- **0.24.0 (DEPLOYED 2026-10-16, route live; 0.23.0 called it news_find):** a third upstream, **news_idx**
+  (`../../efcs-backend/service/news_idx`, semantic news search) on the vector host (Windows Server +
+  Rancher Desktop, on the owner's network, not DigitalOcean), for `/api/v1/newsidx/*`. Off until
+  `CPROXY_NEWSIDX_UPSTREAM` is set. There is no VPC to it: the origin is the router's forwarded port, plain
+  HTTP over the internet. Closing that port to anyone but cproxy is the follow-up; news_idx's
   git-ignored `docs/do-update.md` has the plan.
 
 ```

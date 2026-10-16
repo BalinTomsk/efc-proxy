@@ -593,45 +593,45 @@ void a_bad_waterapi_config_is_a_startup_error() {
     CHECK(problems({{"CPROXY_WATERAPI_PREFIX", "/water/"}}).empty());
 }
 
-void newsfind_route_is_off_until_an_upstream_is_set_and_matches_its_prefix() {
+void newsidx_route_is_off_until_an_upstream_is_set_and_matches_its_prefix() {
     Config off = load_config(make_env({}));
-    CHECK(!off.newsfind_enabled());
-    CHECK(off.newsfind_prefix == "/api/v1/newsfind/");
-    CHECK(!off.routes_to_newsfind("/api/v1/newsfind/search"));
+    CHECK(!off.newsidx_enabled());
+    CHECK(off.newsidx_prefix == "/api/v1/newsidx/");
+    CHECK(!off.routes_to_newsidx("/api/v1/newsidx/search"));
 
-    Config c = load_config(make_env({{"CPROXY_NEWSFIND_UPSTREAM", "http://news.example.test:4324"},
-                                     {"CPROXY_NEWSFIND_PREFIX", " /API/v1/NewsFind "}}));
-    CHECK(c.newsfind_enabled());
-    CHECK(c.newsfind_prefix == "/api/v1/newsfind/");
-    CHECK(c.routes_to_newsfind("/api/v1/newsfind/search"));
-    CHECK(c.routes_to_newsfind("/API/V1/NEWSFIND/search"));
-    CHECK(c.routes_to_newsfind("/api/v1/newsfind"));
-    CHECK(!c.routes_to_newsfind("/api/v1/news/search"));     // docapi's keyword search stays docapi's
-    CHECK(!c.routes_to_newsfind("/api/v1/newsfinder/x"));
+    Config c = load_config(make_env({{"CPROXY_NEWSIDX_UPSTREAM", "http://news.example.test:4324"},
+                                     {"CPROXY_NEWSIDX_PREFIX", " /API/v1/NewsIdx "}}));
+    CHECK(c.newsidx_enabled());
+    CHECK(c.newsidx_prefix == "/api/v1/newsidx/");
+    CHECK(c.routes_to_newsidx("/api/v1/newsidx/search"));
+    CHECK(c.routes_to_newsidx("/API/V1/NEWSIDX/search"));
+    CHECK(c.routes_to_newsidx("/api/v1/newsidx"));
+    CHECK(!c.routes_to_newsidx("/api/v1/news/search"));     // docapi's keyword search stays docapi's
+    CHECK(!c.routes_to_newsidx("/api/v1/newsidxer/x"));
     CHECK(validate_config(c).empty());
 }
 
-void a_bad_newsfind_config_is_a_startup_error() {
+void a_bad_newsidx_config_is_a_startup_error() {
     auto problems = [](std::map<std::string, std::string> env) {
         return validate_config(load_config(make_env(std::move(env))));
     };
-    CHECK(!problems({{"CPROXY_NEWSFIND_UPSTREAM", "news.example.test:4324"}}).empty());  // no scheme
-    CHECK(!problems({{"CPROXY_NEWSFIND_UPSTREAM", "http://news.example.test:4324"},
-                     {"CPROXY_NEWSFIND_PREFIX", "/newsfind/"}}).empty());                  // outside /api/
-    CHECK(!problems({{"CPROXY_NEWSFIND_UPSTREAM", "http://news.example.test:4324"},
-                     {"CPROXY_NEWSFIND_PREFIX", "/api/"}}).empty());                       // swallows docapi
+    CHECK(!problems({{"CPROXY_NEWSIDX_UPSTREAM", "news.example.test:4324"}}).empty());  // no scheme
+    CHECK(!problems({{"CPROXY_NEWSIDX_UPSTREAM", "http://news.example.test:4324"},
+                     {"CPROXY_NEWSIDX_PREFIX", "/newsidx/"}}).empty());                  // outside /api/
+    CHECK(!problems({{"CPROXY_NEWSIDX_UPSTREAM", "http://news.example.test:4324"},
+                     {"CPROXY_NEWSIDX_PREFIX", "/api/"}}).empty());                       // swallows docapi
     // Overlapping the water prefix in either direction.
-    CHECK(!problems({{"CPROXY_NEWSFIND_UPSTREAM", "http://news.example.test:4324"},
+    CHECK(!problems({{"CPROXY_NEWSIDX_UPSTREAM", "http://news.example.test:4324"},
                      {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"},
-                     {"CPROXY_NEWSFIND_PREFIX", "/api/v1/water/news/"}}).empty());
-    CHECK(!problems({{"CPROXY_NEWSFIND_UPSTREAM", "http://news.example.test:4324"},
+                     {"CPROXY_NEWSIDX_PREFIX", "/api/v1/water/news/"}}).empty());
+    CHECK(!problems({{"CPROXY_NEWSIDX_UPSTREAM", "http://news.example.test:4324"},
                      {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"},
-                     {"CPROXY_NEWSFIND_PREFIX", "/api/v1/"}}).empty());
-    CHECK(problems({{"CPROXY_NEWSFIND_UPSTREAM", "http://news.example.test:4324"},
+                     {"CPROXY_NEWSIDX_PREFIX", "/api/v1/"}}).empty());
+    CHECK(problems({{"CPROXY_NEWSIDX_UPSTREAM", "http://news.example.test:4324"},
                     {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"}}).empty());
-    // MCP under the news_find prefix would be sent there.
-    CHECK(!problems({{"CPROXY_NEWSFIND_UPSTREAM", "http://news.example.test:4324"},
-                     {"CPROXY_MCP_PATH", "/api/v1/newsfind/mcp"}}).empty());
+    // MCP under the news_idx prefix would be sent there.
+    CHECK(!problems({{"CPROXY_NEWSIDX_UPSTREAM", "http://news.example.test:4324"},
+                     {"CPROXY_MCP_PATH", "/api/v1/newsidx/mcp"}}).empty());
 }
 
 void mcp_and_tls_are_off_by_default() {
@@ -727,8 +727,8 @@ int main() {
     waterapi_settings_are_read_normalized_and_matched();
     waterapi_settings_work_through_the_real_environment();
     a_bad_waterapi_config_is_a_startup_error();
-    newsfind_route_is_off_until_an_upstream_is_set_and_matches_its_prefix();
-    a_bad_newsfind_config_is_a_startup_error();
+    newsidx_route_is_off_until_an_upstream_is_set_and_matches_its_prefix();
+    a_bad_newsidx_config_is_a_startup_error();
     defaults_apply_when_env_is_empty();
     overrides_are_read_and_methods_restricted();
     malformed_int_falls_back_and_all_keyword_means_unrestricted();
