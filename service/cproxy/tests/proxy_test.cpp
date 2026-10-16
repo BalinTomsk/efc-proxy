@@ -1509,6 +1509,67 @@ void a_newsidx_outage_never_trips_docapi_or_readiness() {
     CHECK(ready->body.find("waterapi") == std::string::npos);
 }
 
+// ---- Fourth upstream: news_search (0.25.0) -----------------------------------------------------
+
+void four_upstreams_each_get_their_own_prefix_and_breaker() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+    TestServer idx;
+    install_tagged_upstream(idx.server, "news_idx");
+    idx.start();
+    TestServer search;
+    install_tagged_upstream(search.server, "news_search");
+    search.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.newsidx_upstream = "http://127.0.0.1:" + std::to_string(idx.port);
+    cfg.newssearch_upstream = "http://127.0.0.1:" + std::to_string(search.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto s = cli.Get("/api/v1/newssearch/vector?q=pike");
+    CHECK(s && s->status == 200);
+    CHECK(s->body == "news_search:/api/v1/newssearch/vector?q=pike");
+    CHECK(cli.Get("/api/v1/news/search?q=pike")->body.starts_with("docapi:"));
+    CHECK(cli.Get("/api/v1/newsidx/search?q=pike")->body.starts_with("news_idx:"));
+
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->body.find("\"news_search\":\"closed\"") != std::string::npos);
+    auto m = cli.Get("/metrics");
+    CHECK(m && m->body.find("cproxy_newssearch_breaker_state 0") != std::string::npos);
+}
+
+void a_newssearch_outage_never_trips_docapi() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.newssearch_upstream = "http://127.0.0.1:1";
+    cfg.connect_timeout_ms = 300;
+    cfg.breaker_threshold = 2;
+    cfg.breaker_cooldown_ms = 60000;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_read_timeout(5, 0);
+    for (int i = 0; i < 2; ++i) {
+        auto r = cli.Get("/api/v1/newssearch/vector?q=x");
+        CHECK(r && r->status == 502);
+    }
+    CHECK(cli.Get("/api/v1/news/search?q=x")->body.starts_with("docapi:"));
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->status == 200);
+    CHECK(ready->body.find("\"news_search\":\"open\"") != std::string::npos);
+}
+
 
 /**
  * A 304 Not Modified with no Content-Length on a kept-alive connection -- the way Kestrel (waterapi)
@@ -1963,6 +2024,8 @@ int main() {
     the_water_route_goes_through_every_guard();
     three_upstreams_each_get_their_own_prefix();
     a_newsidx_outage_never_trips_docapi_or_readiness();
+    four_upstreams_each_get_their_own_prefix_and_breaker();
+    a_newssearch_outage_never_trips_docapi();
     a_not_modified_answer_is_relayed_at_once();
     the_mcp_path_takes_its_own_key_instead_of_the_day_key();
     the_mcp_path_is_tls_only_unless_plain_is_allowed();

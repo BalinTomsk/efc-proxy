@@ -22,6 +22,7 @@ frontend.service ──HTTP──►  cproxy (10.12.22.225)  ──HTTP──►
 | `GET /health/ready` | readiness — `503` while the upstream circuit breaker is open |
 | `GET /metrics` | Prometheus text counters (requests by status, upstream latency, failures, breaker state) |
 | `<CPROXY_WATERAPI_PREFIX>…` (default `/api/v1/water/`) | reverse-proxied to the waterapi upstream (station map) when `CPROXY_WATERAPI_UPSTREAM` is set — same guards, its own circuit breaker (0.18.0) |
+| `<CPROXY_NEWSSEARCH_PREFIX>…` (default `/api/v1/newssearch/`) | reverse-proxied to news_search (per-engine news search) when `CPROXY_NEWSSEARCH_UPSTREAM` is set — same guards, its own circuit breaker (0.25.0) |
 | `<CPROXY_NEWSIDX_PREFIX>…` (default `/api/v1/newsidx/`) | reverse-proxied to the news_idx upstream (semantic news search) when `CPROXY_NEWSIDX_UPSTREAM` is set — same guards, its own circuit breaker (0.23.0) |
 | `<CPROXY_ROUTE_PREFIX>…` (default `/api/`) | reverse-proxied to the docapi upstream |
 | anything else | `404` |
@@ -61,6 +62,8 @@ probing is visible.
 | `CPROXY_WATERAPI_UPSTREAM` | (empty = no water route) | waterapi origin (`scheme://host:port`) |
 | `CPROXY_WATERAPI_PREFIX` | `/api/v1/water/` | sub-path of the route prefix sent to waterapi instead of docapi |
 | `CPROXY_NEWSIDX_UPSTREAM` | (empty = no news_idx route) | news_idx origin (`scheme://host:port`) |
+| `CPROXY_NEWSSEARCH_UPSTREAM` | (empty = no news_search route) | news_search origin (`scheme://host:port`) |
+| `CPROXY_NEWSSEARCH_PREFIX` | `/api/v1/newssearch/` | sub-path of the route prefix sent to news_search instead of docapi |
 | `CPROXY_NEWSIDX_PREFIX` | `/api/v1/newsidx/` | sub-path of the route prefix sent to news_idx instead of docapi |
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |

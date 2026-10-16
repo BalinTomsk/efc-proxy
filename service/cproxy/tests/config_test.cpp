@@ -634,6 +634,34 @@ void a_bad_newsidx_config_is_a_startup_error() {
                      {"CPROXY_MCP_PATH", "/api/v1/newsidx/mcp"}}).empty());
 }
 
+void newssearch_route_is_read_matched_and_validated() {
+    Config off = load_config(make_env({}));
+    CHECK(!off.newssearch_enabled());
+    CHECK(off.newssearch_prefix == "/api/v1/newssearch/");
+
+    Config c = load_config(make_env({{"CPROXY_NEWSSEARCH_UPSTREAM", "http://127.0.0.1:8091"},
+                                     {"CPROXY_NEWSSEARCH_PREFIX", " /API/v1/NewsSearch "}}));
+    CHECK(c.newssearch_prefix == "/api/v1/newssearch/");
+    CHECK(c.routes_to_newssearch("/api/v1/newssearch/vector"));
+    CHECK(c.routes_to_newssearch("/API/V1/NEWSSEARCH/sources"));
+    CHECK(!c.routes_to_newssearch("/api/v1/news/search"));
+    CHECK(!c.routes_to_newssearch("/api/v1/newsidx/search"));
+    CHECK(validate_config(c).empty());
+
+    auto problems = [](std::map<std::string, std::string> env) {
+        return validate_config(load_config(make_env(std::move(env))));
+    };
+    CHECK(!problems({{"CPROXY_NEWSSEARCH_UPSTREAM", "127.0.0.1:8091"}}).empty());
+    CHECK(!problems({{"CPROXY_NEWSSEARCH_UPSTREAM", "http://127.0.0.1:8091"},
+                     {"CPROXY_NEWSSEARCH_PREFIX", "/api/"}}).empty());
+    CHECK(!problems({{"CPROXY_NEWSSEARCH_UPSTREAM", "http://127.0.0.1:8091"},
+                     {"CPROXY_NEWSIDX_UPSTREAM", "http://127.0.0.1:4324"},
+                     {"CPROXY_NEWSSEARCH_PREFIX", "/api/v1/newsidx/search/"}}).empty());
+    CHECK(problems({{"CPROXY_NEWSSEARCH_UPSTREAM", "http://127.0.0.1:8091"},
+                    {"CPROXY_NEWSIDX_UPSTREAM", "http://127.0.0.1:4324"},
+                    {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"}}).empty());
+}
+
 void mcp_and_tls_are_off_by_default() {
     Config c = load_config(make_env({}));
     CHECK(!c.mcp_enabled());
@@ -729,6 +757,7 @@ int main() {
     a_bad_waterapi_config_is_a_startup_error();
     newsidx_route_is_off_until_an_upstream_is_set_and_matches_its_prefix();
     a_bad_newsidx_config_is_a_startup_error();
+    newssearch_route_is_read_matched_and_validated();
     defaults_apply_when_env_is_empty();
     overrides_are_read_and_methods_restricted();
     malformed_int_falls_back_and_all_keyword_means_unrestricted();

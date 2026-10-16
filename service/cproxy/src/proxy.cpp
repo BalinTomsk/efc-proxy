@@ -87,6 +87,8 @@ struct ProxyState {
     CircuitBreaker water_breaker;
     // The news_idx route's own breaker (0.23.0), for the same reason: news_idx is on its own host.
     CircuitBreaker news_breaker;
+    // The news_search route's own breaker (0.25.0): news_search is on csnode, beside waterapi.
+    CircuitBreaker search_breaker;
     Metrics metrics;
     // Loaded best-effort: a missing/malformed day-key database must not take down the ungated GET
     // surface, so a load failure here just leaves this empty — every gated request then fails closed
@@ -147,7 +149,8 @@ struct ProxyState {
     explicit ProxyState(const Config& cfg, CloudRangeStore* shared_ranges)
         : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
           water_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
-          news_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
+          news_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
+          search_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
         if (shared_ranges != nullptr) cloud_ranges = shared_ranges;
         if (!cfg.daykey_db_path.empty()) {
             try {
@@ -621,6 +624,7 @@ struct Upstream {
 Upstream select_upstream(const Config& cfg, ProxyState& state, const httplib::Request& req) {
     if (cfg.routes_to_waterapi(req.path)) return {"waterapi", cfg.waterapi_upstream, state.water_breaker};
     if (cfg.routes_to_newsidx(req.path)) return {"news_idx", cfg.newsidx_upstream, state.news_breaker};
+    if (cfg.routes_to_newssearch(req.path)) return {"news_search", cfg.newssearch_upstream, state.search_breaker};
     return {"docapi", cfg.docapi_upstream, state.breaker};
 }
 
@@ -893,7 +897,8 @@ std::string regex_escape(const std::string& s) {
 }
 
 /** Prometheus text exposition of the current counters. */
-std::string render_metrics(const ProxyState& state, bool waterapi_enabled, bool newsidx_enabled) {
+std::string render_metrics(const ProxyState& state, bool waterapi_enabled, bool newsidx_enabled,
+                           bool newssearch_enabled) {
     std::string out;
     {
         std::lock_guard<std::mutex> lock(state.metrics.mu);
@@ -939,6 +944,12 @@ std::string render_metrics(const ProxyState& state, bool waterapi_enabled, bool 
         out += std::format("cproxy_newsidx_breaker_state {}\n",
                            static_cast<int>(state.news_breaker.state(std::chrono::steady_clock::now())));
     }
+    if (newssearch_enabled) {
+        out += "# HELP cproxy_newssearch_breaker_state news_search circuit breaker: 0 closed, 1 open, 2 half-open.\n";
+        out += "# TYPE cproxy_newssearch_breaker_state gauge\n";
+        out += std::format("cproxy_newssearch_breaker_state {}\n",
+                           static_cast<int>(state.search_breaker.state(std::chrono::steady_clock::now())));
+    }
     return out;
 }
 
@@ -981,14 +992,18 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
             cfg.newsidx_enabled()
                 ? std::format(",\"news_idx\":\"{}\"", to_string(state->news_breaker.state(now)))
                 : std::string{};
+        const std::string search =
+            cfg.newssearch_enabled()
+                ? std::format(",\"news_search\":\"{}\"", to_string(state->search_breaker.state(now)))
+                : std::string{};
         res.set_content(
-            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"{}{}}}",
-                        ready ? "UP" : "DOWN", to_string(s), water, news),
+            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"{}{}{}}}",
+                        ready ? "UP" : "DOWN", to_string(s), water, news, search),
             "application/json");
     });
 
     server.Get("/metrics", [state, &cfg](const httplib::Request&, httplib::Response& res) {
-        res.set_content(render_metrics(*state, cfg.waterapi_enabled(), cfg.newsidx_enabled()),
+        res.set_content(render_metrics(*state, cfg.waterapi_enabled(), cfg.newsidx_enabled(), cfg.newssearch_enabled()),
                         "text/plain; version=0.0.4");
     });
 

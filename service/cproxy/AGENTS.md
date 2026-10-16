@@ -39,6 +39,10 @@ fishfind.info ──►  cproxy (159.89.113.225)  ──►  docapi   (68.183.19
 **On every API change (a fronted endpoint added/removed/changed, or a change to `/health`,
 `/health/ready`, `/metrics`), you MUST update BOTH:**
 
+- **0.25.0 (DEPLOYED 2026-10-16, route live):** a fourth upstream, **news_search**
+  (`../../efcs-backend/service/news_search`, per-engine news search) on csnode beside waterapi (host port
+  8091, VPC peering), for `/api/v1/newssearch/*`. Off until `CPROXY_NEWSSEARCH_UPSTREAM` is set. SQL LIKE
+  search stays on docapi; the portal calls each engine separately.
 - **`docs/api-guide.html`** — the client-facing "Fish API Gateway" reference. Add/adjust the endpoint's
   section + table row, the nav link, and a quick-reference row; bump the `cproxy X · docapi Y — verified
   <date>` version banner and the `/health` version example. It is a full standalone HTML document (open

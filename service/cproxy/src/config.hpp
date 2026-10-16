@@ -22,6 +22,8 @@ namespace cproxy {
  * | CPROXY_WATERAPI_PREFIX      | /api/v1/water/                | sub-prefix of the route prefix sent to waterapi |
  * | CPROXY_NEWSIDX_UPSTREAM    | (empty = no news_idx route)  | news_idx origin (scheme://host:port)     |
  * | CPROXY_NEWSIDX_PREFIX      | /api/v1/newsidx/             | sub-prefix of the route prefix sent to news_idx |
+ * | CPROXY_NEWSSEARCH_UPSTREAM  | (empty = no news_search route) | news_search origin (scheme://host:port)  |
+ * | CPROXY_NEWSSEARCH_PREFIX    | /api/v1/newssearch/          | sub-prefix of the route prefix sent to news_search |
  * | CPROXY_API_KEY              | (empty)                       | if set, require header X-API-Key to match |
  * | CPROXY_ALLOWED_METHODS      | (empty = all)                 | CSV allow-list, e.g. "GET,HEAD"           |
  * | CPROXY_CONNECT_TIMEOUT_MS   | 3000                          | upstream connect timeout                  |
@@ -101,6 +103,19 @@ struct Config {
 
     /** True when `path` (the decoded request path) is served by news_idx. */
     bool routes_to_newsidx(const std::string& path) const;
+
+    // --- Fourth upstream: news_search (0.25.0) -----------------------------------------------
+    // The portal's per-engine news search (efcs-backend/service/news_search, on csnode beside waterapi):
+    // one endpoint per engine so the page shows each result set as it lands. Same rules as the routes
+    // above; must not overlap the water or news_idx prefixes.
+    std::string newssearch_upstream;
+    std::string newssearch_prefix = "/api/v1/newssearch/";
+
+    /** True when CPROXY_NEWSSEARCH_UPSTREAM is set, i.e. the news_search route exists. */
+    bool newssearch_enabled() const { return !newssearch_upstream.empty(); }
+
+    /** True when `path` (the decoded request path) is served by news_search. */
+    bool routes_to_newssearch(const std::string& path) const;
 
     // --- MCP path (0.20.0) -------------------------------------------------------------------
     // docapi's Model Context Protocol endpoint (POST /api/v1/mcp, docapi 1.20.0), for Claude Code /
