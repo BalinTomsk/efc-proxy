@@ -27,6 +27,7 @@
 #include "rate_limiter.hpp"
 #include "user_mcp_key_store.hpp"
 #include "user_prime_store.hpp"
+#include "service_status.hpp"
 #include "version.hpp"
 
 namespace cproxy {
@@ -788,6 +789,7 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     }
 
     const Upstream upstream = select_upstream(cfg, state, req);
+    service_activity().record(std::format("{} {} -> {}", req.method, route_family(req.path), upstream.name));
 
     // Fail fast while the breaker is open: an outage would otherwise make every request pay the
     // full connect timeout and hold a worker thread for it.

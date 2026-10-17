@@ -9,6 +9,14 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-10-16: **0.26.0 (not deployed) — service status for the admin page.** `ServiceStatusReporter` (`src/service_status.*`)
+  publishes `fishfind.service-status.v1` (`start`, a `heartbeat` every `CPROXY_STATUS_INTERVAL_SECONDS` = 60, `stop`
+  on shutdown) to `fishfind.servicestatus.events` over the same management API and credentials as the account mirror,
+  independent of `CPROXY_RABBITMQ_EVENTS_ENABLED`; `CPROXY_STATUS_ENABLED=false` turns it off, `CPROXY_STATUS_MACHINE`
+  names the host. Each forwarded request records `GET /api/v1/river -> docapi` (three path segments + upstream, never
+  ids). `parse_rabbit_endpoint` is now shared. Test: `service_status_test` (5 cases) — compiled and passed locally with
+  an httplib stub (no OpenSSL on the workstation); the full ctest still needs the Docker build stage. Not deployed.
+
 - 2026-10-16: **0.25.0 — fourth upstream: news_search (per-engine news search on csnode). DEPLOYED 2026-10-16**,
   digest `sha256:d647c70e…b77c`, rollback 0.24.0 (`sha256:9afcaec9…`). Healthy, `restarts=0`; through the edge: `/newssearch/sources`
   and `/newssearch/vector` 200 (0.26 s), unknown engine 404, readiness `"news_search":"closed"`, docapi, news_idx and water 200.

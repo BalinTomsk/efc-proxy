@@ -16,6 +16,7 @@
 #include "log.hpp"
 #include "proxy.hpp"
 #include "rabbit_event_consumer.hpp"
+#include "service_status.hpp"
 #include "version.hpp"
 
 namespace {
@@ -110,6 +111,9 @@ int main() {
     cproxy::RabbitEventConsumer rabbit_events(cfg);
     rabbit_events.start();
 
+    cproxy::ServiceStatusReporter status_reporter(cfg);
+    status_reporter.start();
+
     // external_admin / external_frontend are secret (encrypted at rest) — log only their presence.
     cproxy::log_raw(std::format(
         "{{\"service\":\"cproxy\",\"version\":\"{}\",\"msg\":\"starting\","
@@ -198,6 +202,7 @@ int main() {
     if (!server.listen(cfg.listen_addr, cfg.listen_port)) {
         stop_tls();
         rabbit_events.stop();
+        status_reporter.stop();
         cproxy::log_raw(std::format("{{\"service\":\"cproxy\",\"level\":\"FATAL\","
                                     "\"msg\":\"failed to bind {}:{}\"}}",
                                     cfg.listen_addr, cfg.listen_port));
@@ -205,6 +210,7 @@ int main() {
     }
     stop_tls();
     rabbit_events.stop();
+    status_reporter.stop();
     return 0;
 }
 

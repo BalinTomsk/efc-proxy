@@ -14,15 +14,8 @@
 #include "log.hpp"
 
 namespace cproxy {
-namespace {
 
-struct RabbitEndpoint {
-    std::string scheme;
-    std::string host;
-    int port = 15671;
-};
-
-RabbitEndpoint parse_endpoint(const std::string& url) {
+RabbitEndpoint parse_rabbit_endpoint(const std::string& url) {
     RabbitEndpoint out;
     std::string rest;
     if (url.rfind("https://", 0) == 0) {
@@ -50,6 +43,8 @@ RabbitEndpoint parse_endpoint(const std::string& url) {
     }
     return out;
 }
+
+namespace {
 
 std::string queue_path(const std::string& queue) {
     return "/api/queues/%2F/" + httplib::detail::encode_url(queue);
@@ -97,7 +92,7 @@ void RabbitEventConsumer::run() {
     try {
         AccountMirrorStore store(cfg_.account_mirror_db_path);
         store.ensure_schema();
-        const RabbitEndpoint endpoint = parse_endpoint(cfg_.rabbitmq_management_url);
+        const RabbitEndpoint endpoint = parse_rabbit_endpoint(cfg_.rabbitmq_management_url);
         auto client = make_client(endpoint, cfg_);
         ensure_queue(*client, cfg_);
 
