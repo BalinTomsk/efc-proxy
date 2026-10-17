@@ -281,6 +281,18 @@ struct Config {
     int rabbitmq_poll_ms = 1000;
     int rabbitmq_batch_size = 25;
 
+    // Service status for the admin page (efcs-backend adminservice -> dbo.ServiceStatus). cproxy publishes
+    // start, a heartbeat every status_interval_s and stop to fishfind.servicestatus.events over the same
+    // management API and credentials as the account mirror, independent of rabbitmq_events_enabled.
+    // CPROXY_STATUS_ENABLED=false turns it off. See status_reporting().
+    bool status_enabled = true;
+    // Host name shown on the page; empty => gethostname() (inside Docker that is the container id).
+    std::string status_machine;
+    int status_interval_s = 60;
+
+    /** True when status is on and the broker URL is https:// with a username and password. */
+    bool status_reporting() const;
+
     /** True when `ip` is exempt from cloud-range blocking (admin, frontend, or configured). */
     bool cloudrange_exempt(const std::string& ip) const;
 

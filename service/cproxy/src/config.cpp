@@ -367,6 +367,9 @@ Config load_config(const EnvLookup& env) {
         get_str(env, "CPROXY_ACCOUNT_MIRROR_DB", cfg.account_mirror_db_path);
     cfg.rabbitmq_poll_ms = get_int(env, "CPROXY_RABBITMQ_POLL_MS", cfg.rabbitmq_poll_ms);
     cfg.rabbitmq_batch_size = get_int(env, "CPROXY_RABBITMQ_BATCH_SIZE", cfg.rabbitmq_batch_size);
+    cfg.status_enabled = get_bool(env, "CPROXY_STATUS_ENABLED", cfg.status_enabled);
+    cfg.status_machine = get_str(env, "CPROXY_STATUS_MACHINE", cfg.status_machine);
+    cfg.status_interval_s = get_int(env, "CPROXY_STATUS_INTERVAL_SECONDS", cfg.status_interval_s);
 
     // Unset => every feed this build knows. "NONE" stops the refresh without disabling enforcement,
     // so the stored ranges keep blocking while the fetching is paused. (Sentinel, not "", for the
@@ -391,6 +394,11 @@ Config load_config(const EnvLookup& env) {
         }
     }
     return cfg;
+}
+
+bool Config::status_reporting() const {
+    return status_enabled && rabbitmq_management_url.rfind("https://", 0) == 0 && !rabbitmq_username.empty() &&
+           !rabbitmq_password.empty();
 }
 
 std::vector<std::string> rabbitmq_config_problems(const Config& cfg) {

@@ -746,3 +746,18 @@ it — **do not drop that bind or cproxy's `/api/*` breaks.**
 
 Moved to [`CHANGELOG.md`](./CHANGELOG.md) (same directory, also gitignored/local-only) for
 readability — this file was getting long. Newest entries first there.
+
+---
+
+## Service status (admin page) — added 2026-10-16, not deployed
+
+`ServiceStatusReporter` (`src/service_status.*`) publishes `fishfind.service-status.v1` to the RabbitMQ queue
+`fishfind.servicestatus.events` through the management API, with the account mirror's URL and credentials
+(`CPROXY_RABBITMQ_MANAGEMENT_URL` / `_USERNAME` / `_PASSWORD`, https only) but independent of
+`CPROXY_RABBITMQ_EVENTS_ENABLED`: `start`, a `heartbeat` every `CPROXY_STATUS_INTERVAL_SECONDS` (60, minimum 10),
+`stop` after the listeners stop. `CPROXY_STATUS_ENABLED=false` turns it off; `CPROXY_STATUS_MACHINE` names the host
+(else `gethostname()`, the container id in Docker). Every forwarded request records
+`<METHOD> <first three path segments> -> <upstream>` (`route_family`), never ids or query strings. A failed publish logs
+one warning per outage. Test: `tests/service_status_test.cpp` (compiled locally with an httplib stub; run the full
+ctest in the Docker build stage before deploying). Consumer and contract:
+`efcs-backend/service/adminservice/docs/specification.md`. No endpoint changed, so api-guide/Postman are untouched.
