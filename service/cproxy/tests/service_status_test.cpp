@@ -79,6 +79,12 @@ void reporting_needs_https_broker_and_credentials() {
     CHECK(!load_config(make_env({})).status_reporting());
 }
 
+void interval_is_never_below_one_minute() {
+    CHECK(load_config(make_env({})).status_interval_seconds() == 60);
+    CHECK(load_config(make_env({{"CPROXY_STATUS_INTERVAL_SECONDS", "10"}})).status_interval_seconds() == 60);
+    CHECK(load_config(make_env({{"CPROXY_STATUS_INTERVAL_SECONDS", "300"}})).status_interval_seconds() == 300);
+}
+
 void activity_keeps_the_latest() {
     ServiceActivity activity;
     CHECK(!activity.last().has_value());
@@ -95,6 +101,7 @@ int main() {
     body_without_activity_sends_nulls();
     reporting_needs_https_broker_and_credentials();
     activity_keeps_the_latest();
+    interval_is_never_below_one_minute();
     std::cout << "service_status_test: all assertions passed\n";
     return 0;
 }

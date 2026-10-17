@@ -396,6 +396,10 @@ Config load_config(const EnvLookup& env) {
     return cfg;
 }
 
+int Config::status_interval_seconds() const {
+    return status_interval_s < 60 ? 60 : status_interval_s;
+}
+
 bool Config::status_reporting() const {
     return status_enabled && rabbitmq_management_url.rfind("https://", 0) == 0 && !rabbitmq_username.empty() &&
            !rabbitmq_password.empty();

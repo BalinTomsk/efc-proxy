@@ -115,7 +115,7 @@ void ServiceStatusReporter::run() {
     log_raw(std::format("{{\"service\":\"cproxy\",\"msg\":\"Service status reporting on\",\"queue\":\"{}\","
                         "\"machine\":\"{}\"}}", kQueue, machine_));
     std::string event = "start";
-    const auto interval = std::chrono::seconds(std::max(10, cfg_.status_interval_s));
+    const auto interval = std::chrono::seconds(cfg_.status_interval_seconds());
     while (!stop_) {
         publish(event);
         event = "heartbeat";

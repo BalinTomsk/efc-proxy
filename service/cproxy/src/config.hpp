@@ -290,6 +290,9 @@ struct Config {
     std::string status_machine;
     int status_interval_s = 60;
 
+    /** Heartbeat period actually used: CPROXY_STATUS_INTERVAL_SECONDS, never below 60 (bounds RabbitMQ traffic). */
+    int status_interval_seconds() const;
+
     /** True when status is on and the broker URL is https:// with a username and password. */
     bool status_reporting() const;
 

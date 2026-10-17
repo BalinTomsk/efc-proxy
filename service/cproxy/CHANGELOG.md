@@ -9,6 +9,10 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-10-17: **[Unreleased]** **`CPROXY_STATUS_INTERVAL_SECONDS` (env file): heartbeat period, minimum 60 s** (was a 10 s floor). Lower values are raised
+  to 60, so a service never reports to RabbitMQ more often than once a minute; larger values cut traffic further (then
+  raise the page's `ServiceStatusDeadAfterSeconds` to at least 3x). Default unchanged: 60.
+
 - 2026-10-16: **0.26.0 (not deployed) — service status for the admin page.** `ServiceStatusReporter` (`src/service_status.*`)
   publishes `fishfind.service-status.v1` (`start`, a `heartbeat` every `CPROXY_STATUS_INTERVAL_SECONDS` = 60, `stop`
   on shutdown) to `fishfind.servicestatus.events` over the same management API and credentials as the account mirror,
