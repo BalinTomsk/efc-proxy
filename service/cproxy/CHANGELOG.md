@@ -9,6 +9,13 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-10-30: **0.27.0 (not deployed) — `X-Fish-User` on the MCP path.** For a self-service MCP key, cproxy now also
+  sends docapi the owning account's id (`users_sync.id`) as `X-Fish-User`, so docapi 1.29.0's catch-log writes can
+  record their author. A hand-made key (`mcp-keys.py`) has no account, so no header, and cannot write. An inbound
+  `X-Fish-User` is dropped (`is_unforwardable`), like `X-Fish-Role`. `McpKey.user_id`; `UserMcpKeyStore` selects
+  `s.id`. Includes 0.26.0 (status reporting). Test: `proxy_test` (owner forwarded once, spoofed copies
+  dropped for both key kinds).
+
 - 2026-10-17: **[Unreleased]** **`CPROXY_STATUS_INTERVAL_SECONDS` (env file): heartbeat period, minimum 60 s** (was a 10 s floor). Lower values are raised
   to 60, so a service never reports to RabbitMQ more often than once a minute; larger values cut traffic further (then
   raise the page's `ServiceStatusDeadAfterSeconds` to at least 3x). Default unchanged: 60.

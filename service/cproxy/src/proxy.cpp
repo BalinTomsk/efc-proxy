@@ -273,6 +273,7 @@ bool iequals(const std::string& a, const std::string& b) {
  * authoritative values — and httplib's set_header APPENDS to the multimap, so a copied inbound
  * (possibly spoofed) value would otherwise ride along next to ours. X-Fish-Role is the same case with
  * higher stakes: docapi trusts it outright, so a caller-supplied copy would be a self-service admin.
+ * X-Fish-User (0.27.0) likewise: docapi records MCP writes under it, so a copy would be an impersonation.
  */
 bool is_unforwardable(const std::string& key) {
     static const char* const drop[] = {
@@ -280,7 +281,7 @@ bool is_unforwardable(const std::string& key) {
         "te", "trailer", "transfer-encoding", "upgrade", "host",
         "content-length", "content-type",
         "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-request-id",
-        "x-fish-role"};
+        "x-fish-role", "x-fish-user"};
     for (const char* d : drop) {
         if (iequals(key, d)) return true;
     }
@@ -719,6 +720,7 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // prober learns -- "this path wants a key" -- is nothing, given a 256-bit random key.
     const bool mcp = cfg.is_mcp_path(req.path) || cfg.is_mcp_path(target_path);
     std::string mcp_key_id;
+    std::string mcp_user_id;
     if (mcp) {
         if (!via_tls && !cfg.mcp_allow_plain) {
             write_error(res, 404, "not_found", "No route");
@@ -765,6 +767,7 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         // 0.22.0: the key's owner decides the role -- docapi shows fish information to admins only. Never
         // guest: the key was verified, and an inbound X-Fish-Role is dropped (is_unforwardable).
         role = key->admin ? "admin" : "user";
+        mcp_user_id = key->user_id;
     } else if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const CredentialCheck credential =
             check_gate_credential(cfg, state, req, state.clock.now());
@@ -830,6 +833,9 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // The verified role. The inbound X-Fish-Role, if any, was dropped by is_unforwardable, so this is
     // the only one docapi ever sees.
     out.set_header("X-Fish-Role", role.c_str());
+    // 0.27.0: the account that owns the MCP key, for docapi's write tools. Only on the MCP path and only
+    // for a self-service key; an inbound copy was dropped by is_unforwardable.
+    if (!mcp_user_id.empty()) out.set_header("X-Fish-User", mcp_user_id.c_str());
 
     // A 304 has no body (RFC 9110 §15.4.5), but the pinned httplib (v0.15.3) only knows that about
     // 204: for a 304 sent without Content-Length -- which is how Kestrel sends one -- it reads

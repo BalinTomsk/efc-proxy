@@ -36,7 +36,7 @@ std::optional<McpKey> UserMcpKeyStore::find(const std::string& token) const {
         // two different producers (the users-sync dispatcher and the Profile page); NOCASE keeps a
         // future change of either one's GUID casing from silently refusing every key.
         static const char* const sql =
-            "SELECT k.key_id, s.access FROM user_mcp_key k "
+            "SELECT k.key_id, s.access, s.id FROM user_mcp_key k "
             "JOIN users_sync s ON s.id = k.user_id COLLATE NOCASE "
             "WHERE k.token_sha256 = ? AND k.revoked_utc IS NULL "
             "  AND datetime(substr(k.created_utc, 1, 19)) > datetime('now', '-7 days') "
@@ -55,7 +55,8 @@ std::optional<McpKey> UserMcpKeyStore::find(const std::string& token) const {
                 // The owner's privilege is read on every lookup, so a demotion takes effect on the next
                 // request, like a suspension does.
                 const bool admin = sqlite3_column_int(stmt, 1) == 255;
-                found = McpKey{key_id, key_id, std::nullopt, admin};
+                const auto* owner = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+                found = McpKey{key_id, key_id, std::nullopt, admin, owner != nullptr ? owner : ""};
             } else if (rc != SQLITE_DONE) {
                 error = std::format("user mcp key lookup in '{}' failed: {}", path_, sqlite3_errmsg(handle.db));
             }

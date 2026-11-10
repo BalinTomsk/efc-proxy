@@ -1675,6 +1675,8 @@ void install_fake_mcp_upstream(httplib::Server& s) {
         res.set_header("X-Got-Auth", req.get_header_value("Authorization"));
         res.set_header("X-Got-Role", req.get_header_value("X-Fish-Role"));
         res.set_header("X-Got-Proto", req.get_header_value("X-Forwarded-Proto"));
+        res.set_header("X-Got-User", req.get_header_value("X-Fish-User"));
+        res.set_header("X-Got-User-Count", std::to_string(req.get_header_value_count("X-Fish-User")));
         res.set_content("upstream:" + req.method + " " + req.path + " " + req.body, "application/json");
     };
     s.Post(R"(/.*)", handler);
@@ -1722,6 +1724,12 @@ void the_mcp_path_takes_its_own_key_instead_of_the_day_key() {
     CHECK(ok->get_header_value("X-Got-Auth").empty());
     CHECK(ok->get_header_value("X-Got-Role") == "admin");
     CHECK(ok->get_header_value("X-Got-Proto") == "http");
+    // 0.27.0: a hand-made key has no owning account, so no X-Fish-User -- and a caller cannot add one.
+    CHECK(ok->get_header_value("X-Got-User-Count") == "0");
+    httplib::Headers spoofed_user = mcp_auth();
+    spoofed_user.emplace("X-Fish-User", "0190bbbb-0000-7000-8000-00000000beef");
+    auto spoofed = cli.Post("/api/v1/mcp", spoofed_user, rpc, "application/json");
+    CHECK(spoofed && spoofed->get_header_value("X-Got-User-Count") == "0");
 
     // Case and a trailing slash do not escape the match. (The /api/ route prefix itself is matched
     // case-sensitively by the router, as it always has been, so the folding is tested after it.)
@@ -1835,10 +1843,15 @@ void a_self_service_key_from_the_account_mirror_is_accepted_until_revoked() {
     CHECK(ok->get_header_value("X-Got-Auth").empty());  // the key is never forwarded upstream
     // 0.22.0: the owner is a plain account (access 0) -> "user", and a caller cannot claim more.
     CHECK(ok->get_header_value("X-Got-Role") == "user");
+    // 0.27.0: the owning account crosses as X-Fish-User, exactly once.
+    CHECK(ok->get_header_value("X-Got-User") == user);
     httplib::Headers spoofed = mcp_auth(token);
     spoofed.emplace("X-Fish-Role", "admin");
+    spoofed.emplace("X-Fish-User", "0190bbbb-0000-7000-8000-00000000beef");
     auto claimed = cli.Post("/api/v1/mcp", spoofed, "{}", "application/json");
     CHECK(claimed && claimed->get_header_value("X-Got-Role") == "user");
+    CHECK(claimed->get_header_value("X-Got-User") == user);
+    CHECK(claimed->get_header_value("X-Got-User-Count") == "1");
     // Promote the owner to superAdmin: the next request is admin, without a new key or a restart.
     CHECK(store.apply_event({{"eventId", "us-2"}, {"eventType", "acme.account.user_sync"}, {"action", "updated"},
                              {"occurredUtc", "2026-10-01T10:02:00Z"},

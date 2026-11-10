@@ -21,6 +21,10 @@ struct McpKey {
     // shows fish information to admins only. A hand-made key (this store) is the operator's own and is
     // always admin; a self-service key is admin when its owning account is a superAdmin (access 255).
     bool admin = false;
+    // 0.27.0: the owning account's id (users_sync.id), sent to docapi as X-Fish-User so a write tool can
+    // record who made the change. Empty for a hand-made key (this store): it belongs to no account, and
+    // docapi refuses a write without one.
+    std::string user_id;
 };
 
 /**
