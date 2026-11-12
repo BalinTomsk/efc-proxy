@@ -9,6 +9,12 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-11-13: **Config only, no new image: `CPROXY_PUBLIC_PATHS` removed from production** (user request, once the
+  Android app signed in). The HTTPS listener now serves nothing anonymously: every `/api` route there needs a signed-in
+  token (0.29.0 `CPROXY_TLS_API=USER`), else `401 sign_in_required`. Startup reads `"public":"off"`. Verified live: an
+  anonymous `/news/list`, `/river/search` and `/newssearch/health` answer 401; the signed-in app's `/news/list` answered
+  200 (the first proof that the app's Bearer token is accepted). Droplet backup `/opt/cproxy/compose.yml.bak-0.29.0-public`;
+  rollback = put the line back and `compose up -d`. Postman: the public folder is gone (88 requests), plus a 401 check.
 - 2026-11-11: **0.29.0 (DEPLOYED 2026-11-11, digest `70725d40…f7be`; rollback 0.28.0 `3d355d6e…decdf`, droplet `/opt/cproxy/compose.yml.bak-0.28.0`) — signed-in app access on the TLS listener.** `CPROXY_TLS_API=USER` makes the
   HTTPS listener forward every route under the route prefix (GET/POST/PUT/DELETE/PATCH, then the usual allow-list)
   to a caller whose Bearer token verifies AND whose `user` claim names a live account; anyone else is answered `401`
