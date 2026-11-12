@@ -197,6 +197,17 @@ bool Config::is_mcp_path(const std::string& path) const {
     return mcp_enabled() && normalize_gate_path(path) == mcp_path;
 }
 
+bool Config::is_public_path(const std::string& path) const {
+    for (const std::string& entry : public_paths) {
+        if (entry.ends_with('/')) {
+            if (path.starts_with(entry)) return true;
+        } else if (path == entry || path == entry + "/") {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Config::cloudrange_exempt(const std::string& ip) const {
     if (ip.empty()) return false;
     // The frontend host and the admin address are exempt unconditionally. Both are ordinary
@@ -263,6 +274,29 @@ Config load_config(const EnvLookup& env) {
     cfg.tls_port = get_int(env, "CPROXY_TLS_PORT", cfg.tls_port);
     cfg.tls_cert_path = get_str(env, "CPROXY_TLS_CERT", cfg.tls_cert_path);
     cfg.tls_key_path = get_str(env, "CPROXY_TLS_KEY", cfg.tls_key_path);
+    {
+        // "NONE" is the off switch, like every other list here: an empty variable reads as unset.
+        const std::string paths = get_str(env, "CPROXY_PUBLIC_PATHS", "");
+        if (to_upper(paths) != "NONE") {
+            for (std::string p : split_csv(paths)) {
+                if (p.front() != '/') p.insert(p.begin(), '/');
+                cfg.public_paths.push_back(std::move(p));
+            }
+        }
+    }
+    {
+        // A word, like every other switch: an empty variable reads as unset. Only USER turns it on;
+        // NONE (or anything else) leaves it off, and validate_config names an unknown value.
+        const std::string mode = to_upper(get_str(env, "CPROXY_TLS_API", "NONE"));
+        cfg.tls_api_signed_in = mode == "USER";
+        if (mode != "USER" && mode != "NONE") cfg.tls_api_unknown_mode = mode;
+    }
+    cfg.public_rate_per_minute =
+        get_int(env, "CPROXY_PUBLIC_RATE_PER_MINUTE", cfg.public_rate_per_minute);
+    cfg.public_burst = get_int(env, "CPROXY_PUBLIC_BURST", cfg.public_burst);
+    cfg.public_cache_seconds = get_int(env, "CPROXY_PUBLIC_CACHE_SECONDS", cfg.public_cache_seconds);
+    cfg.public_cache_max_bytes =
+        get_int(env, "CPROXY_PUBLIC_CACHE_MAX_BYTES", cfg.public_cache_max_bytes);
     cfg.api_key = get_str(env, "CPROXY_API_KEY", cfg.api_key);
     cfg.connect_timeout_ms = get_int(env, "CPROXY_CONNECT_TIMEOUT_MS", cfg.connect_timeout_ms);
     cfg.read_timeout_ms = get_int(env, "CPROXY_READ_TIMEOUT_MS", cfg.read_timeout_ms);
@@ -512,9 +546,41 @@ std::vector<std::string> validate_config(const Config& cfg) {
             errors.push_back("CPROXY_TLS_PORT must differ from CPROXY_LISTEN_PORT");
         if (cfg.tls_cert_path.empty() || cfg.tls_key_path.empty())
             errors.push_back("CPROXY_TLS_PORT needs CPROXY_TLS_CERT and CPROXY_TLS_KEY");
-        // The TLS listener exists only for the MCP path; without one it would serve nothing but /health.
-        if (!cfg.mcp_enabled())
-            errors.push_back("CPROXY_TLS_PORT needs CPROXY_MCP_PATH (it serves only that path)");
+        // The TLS listener exists for the MCP path and the public paths; with neither it would serve
+        // nothing but /health.
+        if (!cfg.mcp_enabled() && !cfg.public_enabled() && !cfg.tls_api_signed_in)
+            errors.push_back(
+                "CPROXY_TLS_PORT needs CPROXY_MCP_PATH, CPROXY_PUBLIC_PATHS or CPROXY_TLS_API "
+                "(it serves only those)");
+    }
+    if (!cfg.tls_api_unknown_mode.empty())
+        errors.push_back("CPROXY_TLS_API must be USER or NONE, not " + cfg.tls_api_unknown_mode);
+    if (cfg.tls_api_signed_in) {
+        if (!cfg.tls_enabled()) errors.push_back("CPROXY_TLS_API needs CPROXY_TLS_PORT");
+        // Without a secret no token can verify, so the listener would refuse everyone: say so now.
+        if (!cfg.jwt_enabled()) errors.push_back("CPROXY_TLS_API needs CPROXY_JWT_SECRET");
+    }
+    if (cfg.public_enabled()) {
+        for (const std::string& p : cfg.public_paths) {
+            // Outside the route prefix the forwarding route never sees it; the prefix itself would
+            // publish every read at once, which is never what a list of paths means.
+            if (!p.starts_with(cfg.route_prefix) || p.size() <= cfg.route_prefix.size())
+                errors.push_back("CPROXY_PUBLIC_PATHS entry must be a path under CPROXY_ROUTE_PREFIX: " + p);
+            if (p.find("..") != std::string::npos || p.find('?') != std::string::npos ||
+                p.find('%') != std::string::npos)
+                errors.push_back("CPROXY_PUBLIC_PATHS entry must be a plain path: " + p);
+            if (cfg.is_mcp_path(p))
+                errors.push_back("CPROXY_PUBLIC_PATHS must not list the MCP path (it has its own key)");
+        }
+        // Served over TLS only: on the plain listener these paths are already reachable by whoever
+        // the firewall lets in, and are deliberately left exactly as they were.
+        if (!cfg.tls_enabled()) errors.push_back("CPROXY_PUBLIC_PATHS needs CPROXY_TLS_PORT");
+        if (cfg.public_rate_per_minute <= 0)
+            errors.push_back("CPROXY_PUBLIC_RATE_PER_MINUTE must be positive");
+        if (cfg.public_burst <= 0) errors.push_back("CPROXY_PUBLIC_BURST must be positive");
+        if (cfg.public_cache_seconds < 0) errors.push_back("CPROXY_PUBLIC_CACHE_SECONDS must be >= 0");
+        if (cfg.public_cache_max_bytes < 0)
+            errors.push_back("CPROXY_PUBLIC_CACHE_MAX_BYTES must be >= 0");
     }
     if (cfg.jwt_leeway_seconds < 0)
         errors.push_back("CPROXY_JWT_LEEWAY_SECONDS must be >= 0");

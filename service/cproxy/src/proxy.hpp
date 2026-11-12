@@ -50,8 +50,18 @@ namespace cproxy {
  * 401 with `WWW-Authenticate`, each key is rate-limited (429 + `Retry-After`), and the key is not
  * forwarded upstream. It is served on the plain listener only when `cfg.mcp_allow_plain` is set.
  *
- * `tls_server`, when non-null (and the MCP path is configured), gets ONLY `GET /health` and the MCP
- * path, sharing this call's state. The caller constructs it (an httplib::SSLServer in production).
+ * `tls_server`, when non-null (and the MCP path or public paths are configured), gets ONLY
+ * `GET /health`, the MCP path and the public paths, sharing this call's state. The caller constructs
+ * it (an httplib::SSLServer in production).
+ *
+ * The public paths (`cfg.public_paths`, 0.28.0) are GETs the TLS listener serves to anyone: each
+ * peer address is rate-limited (429 + `Retry-After`), and an anonymous 200 is replayed from a short
+ * in-memory cache (`X-Cache: HIT|MISS`). Every other guard still runs, so a gated path listed there
+ * still needs its token. On the plain listener these paths behave exactly as before.
+ *
+ * With `cfg.tls_api_signed_in` (CPROXY_TLS_API=USER, 0.29.0) the TLS listener also forwards every
+ * other route under the prefix, any routed verb, to a caller whose Bearer token verifies and names a
+ * live account; anyone else gets 401 + `WWW-Authenticate: Bearer realm="fishfind"`.
  */
 void install_routes(httplib::Server& server, const Config& cfg,
                     CloudRangeStore* shared_ranges = nullptr,

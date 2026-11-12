@@ -122,6 +122,7 @@ int main() {
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
         "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"tls\":\"{}\","
+        "\"public\":\"{}\",\"tls_api\":\"{}\","
         "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.waterapi_enabled() ? std::format("{} -> {}", cfg.waterapi_prefix, cfg.waterapi_upstream)
@@ -156,6 +157,13 @@ int main() {
                           cfg.mcp_burst)
             : std::string("off"),
         tls_server ? std::format("{}:{}", cfg.listen_addr, cfg.tls_port) : std::string("off"),
+        // How many paths, never which: the list is long, and the count is what changes on a deploy.
+        cfg.public_enabled()
+            ? std::format("{} paths (tls only, {}/min burst {} per address, cache {}s)",
+                          cfg.public_paths.size(), cfg.public_rate_per_minute, cfg.public_burst,
+                          cfg.public_cache_seconds)
+            : std::string("off"),
+        cfg.tls_api_signed_in ? "every route, signed-in callers only" : "off",
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
     // Without a secret no token can be verified, and since 0.13.0 there is no other credential, so

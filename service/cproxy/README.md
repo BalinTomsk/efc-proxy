@@ -108,7 +108,11 @@ probing is visible.
 | `CPROXY_MCP_RATE_PER_MINUTE` / `CPROXY_MCP_BURST` | `60` / `20` | per-key token bucket; over it `429` + `Retry-After` |
 | `CPROXY_MCP_MAX_PAYLOAD_BYTES` | `65536` | MCP request bodies above this are rejected `413` |
 | `CPROXY_MCP_ALLOW_PLAIN` | `false` | also serve the MCP path on the plain-HTTP listener (local testing) |
-| `CPROXY_TLS_PORT` / `CPROXY_TLS_CERT` / `CPROXY_TLS_KEY` | `0` (off) | HTTPS listener serving only `/health` and the MCP path |
+| `CPROXY_TLS_PORT` / `CPROXY_TLS_CERT` / `CPROXY_TLS_KEY` | `0` (off) | HTTPS listener serving only `/health`, the MCP path and the public paths |
+| `CPROXY_PUBLIC_PATHS` | (empty = none; `NONE` also off) | CSV of GET paths the HTTPS listener serves to anyone (see "Public app surface" below); an entry ending in `/` is a prefix |
+| `CPROXY_TLS_API` | (empty = off; `NONE` also off) | `USER` = the HTTPS listener also forwards every API route to a signed-in caller (see "Signed-in app access" below) |
+| `CPROXY_PUBLIC_RATE_PER_MINUTE` / `CPROXY_PUBLIC_BURST` | `120` / `40` | per-address token bucket on those paths; over it `429` + `Retry-After` |
+| `CPROXY_PUBLIC_CACHE_SECONDS` / `CPROXY_PUBLIC_CACHE_MAX_BYTES` | `60` / `16777216` | how long an anonymous `200` is replayed (`0` = no cache), and the cache's total size |
 
 See `.env.example`. No config file — everything is env, so one image runs anywhere.
 
@@ -391,10 +395,42 @@ the day-key gate:
 claude mcp add --transport http fishfind https://<mcp-host>/api/v1/mcp --header "Authorization: Bearer <key>"
 ```
 
+## Public app surface (0.28.0)
+
+The plain listener is firewalled to an allowlist, so a phone cannot reach it. `CPROXY_PUBLIC_PATHS` lists
+the reads the HTTPS listener also serves, to anyone. It is how the Android app reaches the API.
+
+- **GET only, listed paths only.** An entry ending in `/` is a prefix; any other entry is one exact path.
+  Matching is case-sensitive and both the decoded path and the raw request target must match, so an
+  encoded spelling of an unlisted path is not found. Anything else on that listener is a `404`.
+- **Every other guard still runs.** The datacenter block, the traversal guard and the credential gate
+  are unchanged, so a gated path that happens to be listed still answers `500` without its token.
+- **Rate-limited per peer address** (`429` + `Retry-After`). The limiter tracks at most 50,000 addresses;
+  when full, buckets that have refilled are dropped first and a new address is refused rather than
+  pushing out one that is still being held back.
+- **Short cache.** An anonymous `200` (no `Authorization`, cookie, `Origin`, range or conditional
+  header) is replayed for `CPROXY_PUBLIC_CACHE_SECONDS`, keyed by upstream, the final target and
+  `Accept-Encoding`; responses say `X-Cache: HIT` or `MISS`. The upstream can opt out with
+  `Cache-Control: no-store` or `private`. A held answer is still served while the upstream is down.
+- **The plain listener is unchanged**: no cache, no per-address limit, the same routes as before.
+
+## Signed-in app access (0.29.0)
+
+`CPROXY_TLS_API=USER` makes the HTTPS listener forward every route under the route prefix, any routed
+verb, to a caller whose `Authorization: Bearer` token verifies (signature, expiry, today's day-key) and
+whose `user` claim names a live account in the mirror. It is the same API, with the same guards, as the
+plain listener; the token is the one the portal mints, which the Android app obtains from the site after
+a Google sign-in. Anyone else gets `401` with `WWW-Authenticate: Bearer realm="fishfind"`, so the app
+knows to sign in again. Public paths, when also set, stay anonymous. A signed-in answer is never
+cached; the per-address rate limit applies. A brand-new account is refused for the minute or two until
+the account mirror has it.
+
 ## Tests
 
-`ctest` runs eleven suites (`clock_offset_test` and, since 0.20.0, `mcp_key_store_test` — key hashing,
-revocation, live reload and the per-key rate limiter — join the ones described here): `config_test` (config parsing — defaults, overrides, method allow-list,
+`ctest` runs thirteen suites (`clock_offset_test`, `service_status_test`, `mcp_key_store_test` — key hashing,
+revocation, live reload and the per-key rate limiter — and, since 0.28.0, `response_cache_test` — expiry,
+the byte budget, and the address-bounded rate limiter — join the ones described here; `proxy_test` also
+covers the signed-in HTTPS API of 0.29.0): `config_test` (config parsing — defaults, overrides, method allow-list,
 malformed-value fallback), `secret_codec_test`, `proxy_test`, `breaker_test`, `day_key_store_test`
 (the yesterday/today/tomorrow window, both directions of the year boundary, the leap-day-366 clamp,
 and the fail-loud-on-a-bad-database cases), `cloud_range_store_test`, `account_mirror_store_test`,

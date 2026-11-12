@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cproxy VERSION 0.27.0 LANGUAGES CXX)
+project(cproxy VERSION 0.29.0 LANGUAGES CXX)
 
 # C++23 as requested; no compiler extensions so the code stays portable.
 set(CMAKE_CXX_STANDARD 23)
@@ -74,6 +74,7 @@ add_library(cproxy_core STATIC
   src/proxy.cpp
   src/rabbit_event_consumer.cpp
   src/rate_limiter.cpp
+  src/response_cache.cpp
   src/secret_codec.cpp
   src/service_status.cpp
   src/user_mcp_key_store.cpp
@@ -138,6 +139,10 @@ add_test(NAME clock_offset_test COMMAND clock_offset_test)
 add_executable(service_status_test tests/service_status_test.cpp)
 target_link_libraries(service_status_test PRIVATE cproxy_core)
 add_test(NAME service_status_test COMMAND service_status_test)
+
+add_executable(response_cache_test tests/response_cache_test.cpp)
+target_link_libraries(response_cache_test PRIVATE cproxy_core)
+add_test(NAME response_cache_test COMMAND response_cache_test)
 
 add_executable(mcp_key_store_test tests/mcp_key_store_test.cpp)
 target_link_libraries(mcp_key_store_test PRIVATE cproxy_core)
