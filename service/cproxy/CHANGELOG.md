@@ -9,6 +9,43 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-11-11: **0.29.0 (DEPLOYED 2026-11-11, digest `70725d40…f7be`; rollback 0.28.0 `3d355d6e…decdf`, droplet `/opt/cproxy/compose.yml.bak-0.28.0`) — signed-in app access on the TLS listener.** `CPROXY_TLS_API=USER` makes the
+  HTTPS listener forward every route under the route prefix (GET/POST/PUT/DELETE/PATCH, then the usual allow-list)
+  to a caller whose Bearer token verifies AND whose `user` claim names a live account; anyone else is answered `401`
+  + `WWW-Authenticate: Bearer realm="fishfind"` (`sign_in_required`), not the gate's opaque 500, so the app signs in
+  again. That one check is the day-key check, so gated reads and writes need nothing more. Public paths stay
+  anonymous beside it; a signed-in answer is never cached; the per-address limiter covers both. The TLS listener
+  takes the plain one's body limit when this is on (MCP keeps its own 64 KiB check). `validate_config`: needs
+  `CPROXY_TLS_PORT` and `CPROXY_JWT_SECRET`; an unknown word is an error; TLS no longer needs MCP or public paths
+  when this is on. Metrics: `cproxy_app_requests_total{outcome=accepted|unauthorized}`. For the Android app,
+  whose token comes from the portal's new `Account/MobileSession.ashx` (Google ID token -> the same web account).
+  Tests: `config_test` +1, `proxy_test` +3 (whole API for a signed-in user/admin with guards; six kinds of refused
+  token and an unauthenticated write never reach the upstream; public paths beside it). 13/13 ctest. Verified live:
+  startup `"tls_api":"every route, signed-in callers only"`, no ERROR lines, 0 restarts; over HTTPS the public paths
+  stay 200 anonymous, `/fish/search` and `/news/default` answer 401 `sign_in_required` (also with junk tokens), MCP
+  still 401 for its own key, `/metrics` 404; plain port unchanged. A signed-in call was NOT tried live (no current
+  portal token on the workstation); the unit tests cover it.
+
+- 2026-11-11: **0.28.0 (DEPLOYED 2026-11-11, digest `3d355d6e…decdf`; rollback 0.27.0 `6d1502f3…4eda`) — public app surface on the TLS listener.** `CPROXY_PUBLIC_PATHS` (CSV;
+  an entry ending in `/` is a prefix) lists GETs the HTTPS listener now serves to anyone, so the Android app can
+  reach the reads it needs from a phone (the plain port stays allowlisted). Each peer address has a token bucket
+  (`CPROXY_PUBLIC_RATE_PER_MINUTE` 120, `CPROXY_PUBLIC_BURST` 40; `RateLimiter` gains a key bound, 50,000, that
+  refuses a new address rather than evicting one still mid-budget). An anonymous `200` is replayed from a new
+  `ResponseCache` (`CPROXY_PUBLIC_CACHE_SECONDS` 60, `CPROXY_PUBLIC_CACHE_MAX_BYTES` 16 MiB, 2 MiB per entry,
+  LRU) keyed by upstream + final target + `Accept-Encoding`, with `X-Cache: HIT|MISS`; requests with a
+  credential, cookie, `Origin`, range or conditional header bypass it, and `no-store`/`private`/`Set-Cookie`/an
+  unknown `Vary` keep an answer out. The cache sits before the breaker, so held answers survive an upstream
+  outage. Every existing guard still runs, so a gated path listed there still needs its token. The plain
+  listener is unchanged. `validate_config` refuses paths outside the route prefix, the prefix itself, `..`, `?`,
+  `%`, the MCP path, and public paths without `CPROXY_TLS_PORT`; TLS no longer needs `CPROXY_MCP_PATH` when
+  public paths are set. Metrics: `cproxy_public_requests_total{outcome=cache_hit|cache_miss|rate_limited}`.
+  Tests: new `response_cache_test`; `config_test` +4; `proxy_test` +7 (TLS-only surface, encoded and
+  traversal spellings, cache keying and bypasses, ttl, outage, per-address limit, gated path still gated,
+  MCP beside it). 13/13 ctest in the Docker build stage. Verified live over HTTPS: news list MISS then HIT
+  (guest cap applied), news search, river search, region regulations, station map; `/fish/search`,
+  `/news/default`, `/metrics` 404; MCP still 401 without its key; plain port unchanged (no `X-Cache`); startup
+  `"public":"8 paths (tls only, 120/min burst 40 per address, cache 60s)"`, no ERROR lines, 0 restarts.
+
 - 2026-10-30: **0.27.0 (not deployed) — `X-Fish-User` on the MCP path.** For a self-service MCP key, cproxy now also
   sends docapi the owning account's id (`users_sync.id`) as `X-Fish-User`, so docapi 1.29.0's catch-log writes can
   record their author. A hand-made key (`mcp-keys.py`) has no account, so no header, and cannot write. An inbound

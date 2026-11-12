@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -25,6 +26,7 @@
 #include "log.hpp"
 #include "mcp_key_store.hpp"
 #include "rate_limiter.hpp"
+#include "response_cache.hpp"
 #include "user_mcp_key_store.hpp"
 #include "user_prime_store.hpp"
 #include "service_status.hpp"
@@ -47,6 +49,13 @@ struct Metrics {
     long long mcp_accepted = 0;
     long long mcp_unauthorized = 0;
     long long mcp_rate_limited = 0;
+    // Public app surface (0.28.0): answered from the cache, sent upstream, refused for the rate.
+    long long public_cache_hits = 0;
+    long long public_cache_misses = 0;
+    long long public_rate_limited = 0;
+    // Signed-in app access (0.29.0): requests let through, refused for want of a signed-in token.
+    long long app_accepted = 0;
+    long long app_unauthorized = 0;
 
     void observe_mcp(long long Metrics::*counter) {
         std::lock_guard<std::mutex> lock(mu);
@@ -75,6 +84,12 @@ struct Metrics {
         ++retries;
     }
 };
+
+// The public rate limiter is keyed by peer address, which a caller can vary, so it is bounded: at
+// this many tracked addresses new ones are refused until old buckets refill (see RateLimiter).
+constexpr std::size_t kPublicLimiterMaxKeys = 50'000;
+// One cached answer is at most this large; the US station map (~1 MB) is the size to keep in mind.
+constexpr std::size_t kPublicCacheMaxEntryBytes = 2 * 1024 * 1024;
 
 /**
  * Per-server runtime state. Deliberately NOT global: the tests stand several proxies up in one
@@ -123,6 +138,10 @@ struct ProxyState {
     // piece of shared state here that changes after startup. Once built it is never replaced.
     std::optional<McpKeyStore> mcp_keys;
     std::optional<RateLimiter> mcp_limiter;
+    // The public app surface (0.28.0): one budget per peer address, and the cache of anonymous
+    // answers. Both exist only while CPROXY_PUBLIC_PATHS is set; the cache also needs a ttl.
+    std::optional<RateLimiter> public_limiter;
+    std::optional<ResponseCache> public_cache;
     // Self-service keys from the portal's Profile page (0.21.0), read out of the account mirror. Asked
     // after mcp_key_store(), so a hand-made key never depends on the mirror. Built with the limiter and
     // never replaced; it opens the mirror per lookup and guards its own error string.
@@ -191,6 +210,18 @@ struct ProxyState {
                 "\"accounts\":{},\"admins\":{},\"error\":\"{}\"}}",
                 degraded ? (cfg.jwt_require_user ? "ERROR" : "WARN") : "INFO",
                 user_prime_store->size(), user_prime_store->admin_count(), load_error));
+        }
+        // One per-address budget for everything the TLS listener forwards outside MCP: the anonymous
+        // public paths and the signed-in API alike.
+        if (cfg.public_enabled() || cfg.tls_api_signed_in) {
+            public_limiter.emplace(cfg.public_rate_per_minute, cfg.public_burst, kPublicLimiterMaxKeys);
+        }
+        if (cfg.public_enabled()) {
+            if (cfg.public_cache_seconds > 0 && cfg.public_cache_max_bytes > 0) {
+                public_cache.emplace(cfg.public_cache_seconds,
+                                     static_cast<std::size_t>(cfg.public_cache_max_bytes),
+                                     kPublicCacheMaxEntryBytes);
+            }
         }
         if (cfg.mcp_enabled()) {
             mcp_limiter.emplace(cfg.mcp_rate_per_minute, cfg.mcp_burst);
@@ -634,8 +665,67 @@ Upstream select_upstream(const Config& cfg, ProxyState& state, const httplib::Re
  * Forwards one request to its upstream (docapi, or waterapi for the water prefix) and copies the
  * response back. Every guard below applies to both upstreams identically.
  */
+/** Lower-cased copy, for header values compared or keyed without regard to case. */
+std::string lowered(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+/**
+ * True when a request on the public surface may be answered from, and may fill, the cache: a plain
+ * anonymous GET. Anything that makes the answer depend on the caller keeps it out -- a credential
+ * (the role changes what docapi returns), a cookie, an Origin (CORS headers differ per origin), a
+ * Range, or a conditional request (those are answered by the upstream, which owns the validators).
+ */
+bool public_request_is_cacheable(const httplib::Request& req) {
+    if (req.method != "GET") return false;
+    for (const char* h : {"Authorization", "Cookie", "Origin", "Range", "If-None-Match",
+                          "If-Modified-Since", "If-Match", "If-Unmodified-Since", "If-Range"}) {
+        if (req.has_header(h)) return false;
+    }
+    return true;
+}
+
+/**
+ * True when an upstream 200 may be kept. The upstream can always opt out (no-store / private / a
+ * cookie), and an answer that varies on anything but the encoding -- which is part of the cache key
+ * -- or the CORS request headers -- which a cacheable request never carries -- is not kept either.
+ */
+bool upstream_answer_is_cacheable(const httplib::Response& answer) {
+    if (answer.status != 200 || answer.has_header("Set-Cookie")) return false;
+    const std::string cache_control = lowered(answer.get_header_value("Cache-Control"));
+    if (cache_control.find("no-store") != std::string::npos ||
+        cache_control.find("private") != std::string::npos) {
+        return false;
+    }
+    const auto count = answer.get_header_value_count("Vary");
+    for (std::size_t i = 0; i < count; ++i) {
+        std::istringstream names(lowered(answer.get_header_value("Vary", i)));
+        std::string name;
+        while (std::getline(names, name, ',')) {
+            const auto begin = name.find_first_not_of(" \t");
+            if (begin == std::string::npos) continue;
+            name = name.substr(begin, name.find_last_not_of(" \t") - begin + 1);
+            if (name != "accept-encoding" && name != "origin" &&
+                name != "access-control-request-method" && name != "access-control-request-headers") {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * How the TLS listener reached proxy_to_docapi for a non-MCP route: an anonymous public path
+ * (0.28.0), or a route that needs a signed-in caller (0.29.0). The plain listener is always Plain.
+ */
+enum class Surface { Plain, Public, SignedIn };
+
 void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Request& req,
-                     httplib::Response& res, bool via_tls) {
+                     httplib::Response& res, bool via_tls, Surface surface = Surface::Plain) {
+    const bool public_surface = surface == Surface::Public;
+    const bool signed_in_surface = surface == Surface::SignedIn;
     const std::string rid = request_id(req);
     res.set_header("X-Request-Id", rid);
 
@@ -656,6 +746,22 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         log_request(std::format("{} {} -> 500 (datacenter ip)", req.method, req.path),
                     req.remote_addr, rid);
         return;
+    }
+
+    // The public app surface (0.28.0): one budget per peer address, spent before anything else can
+    // be made to cost -- a cache hit included, so a caller cannot use the cache to probe for free.
+    // Keyed by req.remote_addr for the same reason the block above is: it is the real TCP peer.
+    if ((public_surface || signed_in_surface) && state.public_limiter) {
+        int retry_after = 0;
+        if (!state.public_limiter->allow(req.remote_addr, std::chrono::steady_clock::now(), retry_after)) {
+            state.metrics.observe_mcp(&Metrics::public_rate_limited);
+            res.set_header("Retry-After", std::to_string(retry_after));
+            write_error(res, 429, "rate_limited", "Too many requests");
+            log_request(std::format("{} {} -> 429 (public rate limited, retry {}s)", req.method, req.path,
+                                    retry_after),
+                        req.remote_addr, rid);
+            return;
+        }
     }
 
     if (!cfg.method_allowed(req.method)) {
@@ -768,6 +874,25 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         // guest: the key was verified, and an inbound X-Fish-Role is dropped (is_unforwardable).
         role = key->admin ? "admin" : "user";
         mcp_user_id = key->user_id;
+    } else if (signed_in_surface) {
+        // 0.29.0: the whole API, but only for a signed-in caller -- a token that verifies AND names a
+        // live account. This one check also covers the day-key gate (it IS that check), so a gated
+        // path or a write needs nothing more. Refused with 401 + WWW-Authenticate rather than the
+        // gate's opaque 500: the app acts on a 401 by signing in again, and what a prober learns --
+        // "this listener wants a token" -- is already public in the app.
+        const CredentialCheck credential = check_gate_credential(cfg, state, req, state.clock.now());
+        if (!credential.ok || credential.role == "guest") {
+            state.metrics.observe_mcp(&Metrics::app_unauthorized);
+            res.set_header("WWW-Authenticate", "Bearer realm=\"fishfind\"");
+            write_error(res, 401, "sign_in_required", "Sign in to use the FishFind API");
+            log_request(std::format("{} {} -> 401 ({})", req.method, req.path,
+                                    credential.ok ? std::string("token names no live account")
+                                                  : credential.reason),
+                        req.remote_addr, rid);
+            return;
+        }
+        state.metrics.observe_mcp(&Metrics::app_accepted);
+        role = credential.role;
     } else if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const CredentialCheck credential =
             check_gate_credential(cfg, state, req, state.clock.now());
@@ -793,6 +918,32 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
 
     const Upstream upstream = select_upstream(cfg, state, req);
     service_activity().record(std::format("{} {} -> {}", req.method, route_family(req.path), upstream.name));
+
+    // The public cache (0.28.0). Looked up only now, after every guard and with the FINAL target (a
+    // guest's news list has just been capped), so a hit is an answer this exact request would have
+    // been given anyway. Only a guest is ever served from it or stored in it: a verified role changes
+    // what docapi returns. It sits BEFORE the breaker on purpose -- during an upstream outage the
+    // answers already held keep the app working until they expire.
+    const bool cacheable = public_surface && state.public_cache && !mcp && role == "guest" &&
+                           public_request_is_cacheable(req);
+    std::string cache_key;
+    if (cacheable) {
+        // The encoding is part of the key: waterapi compresses when asked, and a brotli body must
+        // never be replayed to a caller that did not ask for one.
+        cache_key = std::format("{}\n{}\n{}", upstream.name, target,
+                                lowered(req.get_header_value("Accept-Encoding")));
+        if (const auto hit = state.public_cache->find(cache_key, std::chrono::steady_clock::now())) {
+            state.metrics.observe_mcp(&Metrics::public_cache_hits);
+            res.status = hit->status;
+            for (const auto& [k, v] : hit->headers) res.set_header(k.c_str(), v.c_str());
+            res.set_header("X-Cache", "HIT");
+            res.set_content(hit->body, hit->content_type.c_str());
+            log_request(std::format("{} {} -> {} (cache hit)", req.method, req.path, hit->status),
+                        req.remote_addr, rid);
+            return;
+        }
+        state.metrics.observe_mcp(&Metrics::public_cache_misses);
+    }
 
     // Fail fast while the breaker is open: an outage would otherwise make every request pay the
     // full connect timeout and hold a worker thread for it.
@@ -886,6 +1037,21 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     for (const auto& [k, v] : answer->headers) {
         if (!is_unforwardable(k)) res.set_header(k.c_str(), v.c_str());
     }
+    if (cacheable) {
+        res.set_header("X-Cache", "MISS");
+        if (upstream_answer_is_cacheable(*answer)) {
+            CachedResponse keep;
+            keep.status = answer->status;
+            keep.content_type = content_type;
+            for (const auto& [k, v] : answer->headers) {
+                // Date and Age describe the upstream exchange, not the replay.
+                if (is_unforwardable(k) || iequals(k, "Date") || iequals(k, "Age")) continue;
+                keep.headers.emplace_back(k, v);
+            }
+            keep.body = answer->body;
+            state.public_cache->store(cache_key, std::move(keep), std::chrono::steady_clock::now());
+        }
+    }
     res.set_content(answer->body, content_type.c_str());
     log_request(std::format("{} {} -> {} ({}ms){}", req.method, req.path, answer->status, took,
                             mcp_key_id.empty() ? std::string{} : " mcp=" + mcp_key_id),
@@ -935,6 +1101,20 @@ std::string render_metrics(const ProxyState& state, bool waterapi_enabled, bool 
                            state.metrics.mcp_unauthorized);
         out += std::format("cproxy_mcp_requests_total{{outcome=\"rate_limited\"}} {}\n",
                            state.metrics.mcp_rate_limited);
+        out += "# HELP cproxy_public_requests_total Public-surface requests, by outcome.\n";
+        out += "# TYPE cproxy_public_requests_total counter\n";
+        out += std::format("cproxy_public_requests_total{{outcome=\"cache_hit\"}} {}\n",
+                           state.metrics.public_cache_hits);
+        out += std::format("cproxy_public_requests_total{{outcome=\"cache_miss\"}} {}\n",
+                           state.metrics.public_cache_misses);
+        out += std::format("cproxy_public_requests_total{{outcome=\"rate_limited\"}} {}\n",
+                           state.metrics.public_rate_limited);
+        out += "# HELP cproxy_app_requests_total Signed-in app requests on the TLS listener, by outcome.\n";
+        out += "# TYPE cproxy_app_requests_total counter\n";
+        out += std::format("cproxy_app_requests_total{{outcome=\"accepted\"}} {}\n",
+                           state.metrics.app_accepted);
+        out += std::format("cproxy_app_requests_total{{outcome=\"unauthorized\"}} {}\n",
+                           state.metrics.app_unauthorized);
     }
     out += "# HELP cproxy_breaker_state Upstream circuit breaker: 0 closed, 1 open, 2 half-open.\n";
     out += "# TYPE cproxy_breaker_state gauge\n";
@@ -1055,20 +1235,55 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
     };
     server.set_post_routing_handler(count_response);
 
-    // The TLS listener (0.20.0): /health and the MCP path, nothing else -- not /metrics, not
-    // /health/ready, not the rest of /api/. It shares this state (breakers, counters, key store, rate
-    // limits) with the plain listener, so a key's budget is one budget whichever port it arrives on.
-    if (tls_server != nullptr && cfg.mcp_enabled()) {
-        tls_server->set_payload_max_length(static_cast<size_t>(cfg.mcp_max_payload_bytes));
+    // The TLS listener (0.20.0): /health, the MCP path and (0.28.0) the public paths, nothing else --
+    // not /metrics, not /health/ready, not the rest of /api/. It shares this state (breakers,
+    // counters, key store, rate limits) with the plain listener, so a key's budget is one budget
+    // whichever port it arrives on.
+    if (tls_server != nullptr && (cfg.mcp_enabled() || cfg.public_enabled() || cfg.tls_api_signed_in)) {
+        // With the signed-in API on, writes (a catch photo is a few MB of base64) come through here
+        // too, so the listener takes the plain one's limit; MCP keeps its own 64 KiB check inside.
+        tls_server->set_payload_max_length(static_cast<size_t>(
+            cfg.tls_api_signed_in ? std::max(cfg.max_payload_bytes, cfg.mcp_max_payload_bytes)
+                                  : cfg.mcp_max_payload_bytes));
         tls_server->Get("/health", health);
-        const std::string mcp_pattern = regex_escape(cfg.mcp_path) + "/?";
-        const auto forward_tls = [&cfg, state](const httplib::Request& req, httplib::Response& res) {
-            proxy_to_docapi(cfg, *state, req, res, true);
-        };
-        tls_server->Get(mcp_pattern, forward_tls);
-        tls_server->Post(mcp_pattern, forward_tls);
-        tls_server->Delete(mcp_pattern, forward_tls);
-        tls_server->Options(mcp_pattern, forward_tls);
+        if (cfg.mcp_enabled()) {
+            const std::string mcp_pattern = regex_escape(cfg.mcp_path) + "/?";
+            const auto forward_tls = [&cfg, state](const httplib::Request& req, httplib::Response& res) {
+                proxy_to_docapi(cfg, *state, req, res, true);
+            };
+            // Registered before the public route below: httplib takes the first pattern that matches.
+            tls_server->Get(mcp_pattern, forward_tls);
+            tls_server->Post(mcp_pattern, forward_tls);
+            tls_server->Delete(mcp_pattern, forward_tls);
+            tls_server->Options(mcp_pattern, forward_tls);
+        }
+        if (cfg.public_enabled() || cfg.tls_api_signed_in) {
+            // One handler for the rest of the route prefix. A GET on a public path (0.28.0) is served to
+            // anyone -- decided on the decoded path AND the raw target, both must be listed. Anything
+            // else needs a signed-in caller when CPROXY_TLS_API=USER (0.29.0), and is otherwise the
+            // server's own 404, the same answer as any path this listener lacks.
+            const auto forward_api = [&cfg, state](const httplib::Request& req, httplib::Response& res) {
+                const std::string raw_path = req.target.substr(0, req.target.find('?'));
+                const bool is_public = req.method == "GET" && cfg.is_public_path(req.path) &&
+                                       (raw_path.empty() || cfg.is_public_path(raw_path));
+                if (is_public) {
+                    proxy_to_docapi(cfg, *state, req, res, true, Surface::Public);
+                } else if (cfg.tls_api_signed_in) {
+                    proxy_to_docapi(cfg, *state, req, res, true, Surface::SignedIn);
+                } else {
+                    res.status = 404;
+                }
+            };
+            // Registered after the MCP routes: httplib takes the first pattern that matches.
+            tls_server->Get(pattern, forward_api);
+            if (cfg.tls_api_signed_in) {
+                // The same verbs the plain listener routes; CPROXY_ALLOWED_METHODS still applies.
+                tls_server->Post(pattern, forward_api);
+                tls_server->Put(pattern, forward_api);
+                tls_server->Delete(pattern, forward_api);
+                tls_server->Patch(pattern, forward_api);
+            }
+        }
         tls_server->set_error_handler(on_error);
         tls_server->set_post_routing_handler(count_response);
     }

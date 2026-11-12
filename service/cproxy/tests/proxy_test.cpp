@@ -1,15 +1,18 @@
 // Integration tests: real HTTP through install_routes() against an in-process fake upstream.
 // Framework-free like config_test; registered with CTest (also executed inside the Docker build).
 #include "check.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <format>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1991,6 +1994,483 @@ void the_tls_listener_serves_only_health_and_the_mcp_path() {
     std::remove(key.c_str());
 }
 
+// ---- Public app surface (0.28.0) -----------------------------------------------------------------
+
+/** An httplib::SSLServer on an ephemeral port with a throwaway certificate, as `tls_server`. */
+struct TlsListener {
+    std::string cert;
+    std::string key;
+    std::unique_ptr<httplib::SSLServer> server;
+    std::thread th;
+    int port = 0;
+
+    explicit TlsListener(const char* name) {
+        const auto dir = std::filesystem::temp_directory_path();
+        cert = (dir / (std::string(name) + "_cert.pem")).string();
+        key = (dir / (std::string(name) + "_key.pem")).string();
+        write_self_signed(cert, key);
+        server = std::make_unique<httplib::SSLServer>(cert.c_str(), key.c_str());
+        CHECK(server->is_valid());
+    }
+    /** Call after install_routes. */
+    void start() {
+        port = server->bind_to_any_port("127.0.0.1");
+        CHECK(port > 0);
+        th = std::thread([this] { server->listen_after_bind(); });
+        server->wait_until_ready();
+    }
+    ~TlsListener() {
+        server->stop();
+        if (th.joinable()) th.join();
+        std::remove(cert.c_str());
+        std::remove(key.c_str());
+    }
+};
+
+/**
+ * Fake docapi that numbers its answers, so a test can tell an answer that came from the upstream
+ * from one that was replayed. `/nostore/` answers opt out of caching, `/vary/` ones vary on a header.
+ */
+void install_counting_upstream(httplib::Server& s, std::atomic<int>& calls) {
+    s.Get(R"(/.*)", [&calls](const httplib::Request& req, httplib::Response& res) {
+        const int n = ++calls;
+        res.set_header("X-Got-Role", req.get_header_value("X-Fish-Role"));
+        res.set_header("X-Got-Proto", req.get_header_value("X-Forwarded-Proto"));
+        res.set_header("ETag", "\"v1\"");
+        if (req.path.find("/nostore/") != std::string::npos) res.set_header("Cache-Control", "no-store");
+        if (req.path.find("/vary/") != std::string::npos) res.set_header("Vary", "Accept-Language");
+        res.set_content("call" + std::to_string(n) + ":" + req.target, "application/json");
+    });
+}
+
+Config public_config(int upstream_port) {
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(upstream_port);
+    cfg.public_paths = {"/api/v1/news/list", "/api/v1/river/"};
+    return cfg;
+}
+
+void the_public_paths_are_served_over_tls_and_nothing_else_is() {
+    std::atomic<int> calls{0};
+    TestServer up;
+    install_counting_upstream(up.server, calls);
+    up.start();
+    Config cfg = public_config(up.port);
+    TlsListener tls("proxy_public_only");
+    TestServer proxy;
+    install_routes(proxy.server, cfg, nullptr, tls.server.get());
+    proxy.start();
+    tls.start();
+
+    httplib::SSLClient cli("127.0.0.1", tls.port);
+    cli.enable_server_certificate_verification(false);
+    CHECK(cli.Get("/health")->status == 200);
+
+    // An exact path and a prefix, forwarded as a guest over https.
+    auto list = cli.Get("/api/v1/news/list?country=CA");
+    CHECK(list && list->status == 200);
+    CHECK(list->body.find(":/api/v1/news/list?country=CA") != std::string::npos);
+    CHECK(list->get_header_value("X-Got-Role") == "guest");
+    CHECK(list->get_header_value("X-Got-Proto") == "https");
+    CHECK(!list->get_header_value("X-Request-Id").empty());
+    CHECK(cli.Get("/api/v1/news/list/")->status == 200);
+    CHECK(cli.Get("/api/v1/river/search?q=trout")->status == 200);
+
+    // Everything not listed is this listener's ordinary 404, and never reaches the upstream.
+    const int before = calls.load();
+    CHECK(cli.Get("/api/v1/fish/search?q=trout")->status == 404);
+    CHECK(cli.Get("/api/v1/news/listing")->status == 404);
+    CHECK(cli.Get("/api/v1/news/default")->status == 404);
+    CHECK(cli.Get("/api/v1/river")->status == 404);
+    CHECK(cli.Get("/API/v1/news/list")->status == 404);
+    // An encoded spelling of a listed path decodes to it, but the raw target must match as well.
+    CHECK(cli.Get("/api/v1/news/%6cist")->status == 404);
+    CHECK(cli.Get("/metrics")->status == 404);
+    CHECK(cli.Get("/health/ready")->status == 404);
+    // GET only: no write verb has a route here at all.
+    CHECK(cli.Post("/api/v1/river/fish/x", "{}", "application/json")->status == 404);
+    CHECK(cli.Patch("/api/v1/river/fish/x", "{}", "application/json")->status == 404);
+    CHECK(cli.Delete("/api/v1/river/fish/x")->status == 404);
+    // A listed prefix cannot be used to climb out of itself.
+    CHECK(cli.Get("/api/v1/river/../fish/search")->status == 400);
+    CHECK(cli.Get("/api/v1/river/%2e%2e/fish/search")->status == 400);
+    CHECK(calls.load() == before);
+
+    // The plain listener is exactly as it was: every read, no cache header, no public rules.
+    httplib::Client plain("127.0.0.1", proxy.port);
+    auto fish = plain.Get("/api/v1/fish/search?q=trout");
+    CHECK(fish && fish->status == 200);
+    CHECK(!fish->has_header("X-Cache"));
+    CHECK(!plain.Get("/api/v1/news/list")->has_header("X-Cache"));
+}
+
+void an_anonymous_answer_is_replayed_from_the_cache() {
+    std::atomic<int> calls{0};
+    TestServer up;
+    install_counting_upstream(up.server, calls);
+    up.start();
+    Config cfg = public_config(up.port);
+    TlsListener tls("proxy_public_cache");
+    TestServer proxy;
+    install_routes(proxy.server, cfg, nullptr, tls.server.get());
+    proxy.start();
+    tls.start();
+    httplib::SSLClient cli("127.0.0.1", tls.port);
+    cli.enable_server_certificate_verification(false);
+
+    auto first = cli.Get("/api/v1/river/search?q=trout");
+    CHECK(first && first->status == 200);
+    CHECK(first->get_header_value("X-Cache") == "MISS");
+    auto second = cli.Get("/api/v1/river/search?q=trout");
+    CHECK(second && second->status == 200);
+    CHECK(second->get_header_value("X-Cache") == "HIT");
+    CHECK(second->body == first->body);
+    CHECK(second->get_header_value("Content-Type") == first->get_header_value("Content-Type"));
+    CHECK(second->get_header_value("ETag") == "\"v1\"");
+    // Each answer carries its OWN correlation id, never the stored exchange's.
+    CHECK(second->get_header_value("X-Request-Id") != first->get_header_value("X-Request-Id"));
+    CHECK(second->get_header_value_count("X-Request-Id") == 1);
+    CHECK(calls.load() == 1);
+
+    // Another query is another answer.
+    CHECK(cli.Get("/api/v1/river/search?q=pike")->get_header_value("X-Cache") == "MISS");
+    CHECK(calls.load() == 2);
+
+    // A guest's news list is capped before the lookup, so two ways of asking for it are one entry.
+    CHECK(cli.Get("/api/v1/news/list?limit=500")->get_header_value("X-Cache") == "MISS");
+    CHECK(cli.Get("/api/v1/news/list?limit=7&offset=900")->get_header_value("X-Cache") == "HIT");
+
+    // The encoding is part of the key: a caller that asks for another one gets its own exchange.
+    auto encoded = cli.Get("/api/v1/river/search?q=trout", {{"Accept-Encoding", "br"}});
+    CHECK(encoded && encoded->get_header_value("X-Cache") == "MISS");
+
+    // Anything that makes the answer depend on the caller goes straight to the upstream, every
+    // time, and is never stored: a credential (even one that does not verify), a conditional
+    // request, an Origin, a cookie.
+    for (const httplib::Headers& h :
+         {httplib::Headers{{"Authorization", "Bearer nope"}}, httplib::Headers{{"If-None-Match", "\"v1\""}},
+          httplib::Headers{{"Origin", "https://example.test"}}, httplib::Headers{{"Cookie", "a=b"}}}) {
+        const int before = calls.load();
+        auto r = cli.Get("/api/v1/river/search?q=trout", h);
+        CHECK(r && r->status == 200);
+        CHECK(!r->has_header("X-Cache"));
+        CHECK(calls.load() == before + 1);
+    }
+    // ...and none of those replaced what an anonymous caller is served.
+    CHECK(cli.Get("/api/v1/river/search?q=trout")->body == first->body);
+
+    // The upstream can opt an answer out, and one that varies on something outside the key is not kept.
+    CHECK(cli.Get("/api/v1/river/nostore/x")->get_header_value("X-Cache") == "MISS");
+    CHECK(cli.Get("/api/v1/river/nostore/x")->get_header_value("X-Cache") == "MISS");
+    CHECK(cli.Get("/api/v1/river/vary/x")->get_header_value("X-Cache") == "MISS");
+    CHECK(cli.Get("/api/v1/river/vary/x")->get_header_value("X-Cache") == "MISS");
+
+    httplib::Client plain("127.0.0.1", proxy.port);
+    auto metrics = plain.Get("/metrics");
+    CHECK(metrics && metrics->body.find("cproxy_public_requests_total{outcome=\"cache_hit\"} 3") !=
+                         std::string::npos);
+    CHECK(metrics->body.find("cproxy_public_requests_total{outcome=\"rate_limited\"} 0") != std::string::npos);
+}
+
+void the_cache_can_be_turned_off_and_expires() {
+    std::atomic<int> calls{0};
+    TestServer up;
+    install_counting_upstream(up.server, calls);
+    up.start();
+    {
+        Config cfg = public_config(up.port);
+        cfg.public_cache_seconds = 0;
+        TlsListener tls("proxy_public_nocache");
+        TestServer proxy;
+        install_routes(proxy.server, cfg, nullptr, tls.server.get());
+        proxy.start();
+        tls.start();
+        httplib::SSLClient cli("127.0.0.1", tls.port);
+        cli.enable_server_certificate_verification(false);
+        CHECK(!cli.Get("/api/v1/river/a")->has_header("X-Cache"));
+        CHECK(!cli.Get("/api/v1/river/a")->has_header("X-Cache"));
+        CHECK(calls.load() == 2);
+    }
+    {
+        Config cfg = public_config(up.port);
+        cfg.public_cache_seconds = 1;
+        TlsListener tls("proxy_public_ttl");
+        TestServer proxy;
+        install_routes(proxy.server, cfg, nullptr, tls.server.get());
+        proxy.start();
+        tls.start();
+        httplib::SSLClient cli("127.0.0.1", tls.port);
+        cli.enable_server_certificate_verification(false);
+        CHECK(cli.Get("/api/v1/river/b")->get_header_value("X-Cache") == "MISS");
+        CHECK(cli.Get("/api/v1/river/b")->get_header_value("X-Cache") == "HIT");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        CHECK(cli.Get("/api/v1/river/b")->get_header_value("X-Cache") == "MISS");
+    }
+}
+
+void a_held_answer_is_still_served_while_the_upstream_is_down() {
+    std::atomic<int> calls{0};
+    auto up = std::make_unique<TestServer>();
+    install_counting_upstream(up->server, calls);
+    up->start();
+    Config cfg = public_config(up->port);
+    cfg.connect_timeout_ms = 300;
+    TlsListener tls("proxy_public_outage");
+    TestServer proxy;
+    install_routes(proxy.server, cfg, nullptr, tls.server.get());
+    proxy.start();
+    tls.start();
+    httplib::SSLClient cli("127.0.0.1", tls.port);
+    cli.enable_server_certificate_verification(false);
+
+    auto primed = cli.Get("/api/v1/river/held");
+    CHECK(primed && primed->get_header_value("X-Cache") == "MISS");
+    up.reset();  // the upstream goes away
+
+    auto held = cli.Get("/api/v1/river/held");
+    CHECK(held && held->status == 200);
+    CHECK(held->get_header_value("X-Cache") == "HIT");
+    CHECK(held->body == primed->body);
+    // What is not held fails the ordinary way, and a failure is never stored.
+    CHECK(cli.Get("/api/v1/river/other")->status == 502);
+    CHECK(cli.Get("/api/v1/river/other")->status == 502);
+}
+
+void each_address_is_rate_limited_on_the_public_surface() {
+    std::atomic<int> calls{0};
+    TestServer up;
+    install_counting_upstream(up.server, calls);
+    up.start();
+    Config cfg = public_config(up.port);
+    cfg.public_rate_per_minute = 1;
+    cfg.public_burst = 2;
+    TlsListener tls("proxy_public_rate");
+    TestServer proxy;
+    install_routes(proxy.server, cfg, nullptr, tls.server.get());
+    proxy.start();
+    tls.start();
+    httplib::SSLClient cli("127.0.0.1", tls.port);
+    cli.enable_server_certificate_verification(false);
+
+    CHECK(cli.Get("/api/v1/river/a")->status == 200);
+    // A cache hit spends the budget too.
+    CHECK(cli.Get("/api/v1/river/a")->get_header_value("X-Cache") == "HIT");
+    auto limited = cli.Get("/api/v1/river/a");
+    CHECK(limited && limited->status == 429);
+    CHECK(std::stoi(limited->get_header_value("Retry-After")) >= 1);
+    CHECK(limited->body.find("rate_limited") != std::string::npos);
+    // A path that is not public costs nothing and says nothing about the limit.
+    CHECK(cli.Get("/api/v1/fish/search")->status == 404);
+    CHECK(calls.load() == 1);
+
+    // The plain listener has no such budget: the portal's own traffic is never throttled by this.
+    httplib::Client plain("127.0.0.1", proxy.port);
+    for (int i = 0; i < 5; ++i) CHECK(plain.Get("/api/v1/river/a")->status == 200);
+    auto metrics = plain.Get("/metrics");
+    CHECK(metrics && metrics->body.find("cproxy_public_requests_total{outcome=\"rate_limited\"} 1") !=
+                         std::string::npos);
+}
+
+void a_gated_path_listed_as_public_still_needs_its_token() {
+    std::atomic<int> calls{0};
+    TestServer up;
+    install_counting_upstream(up.server, calls);
+    up.start();
+    const std::string db = "proxy_public_day_keys.sqlite";
+    write_uniform_day_key_db(db, "TEST-DAY-KEY");
+    Config cfg = public_config(up.port);
+    cfg.public_paths = {"/api/v1/news/"};  // sweeps in /news/default, which the gate covers
+    cfg.daykey_db_path = db;
+    cfg.jwt_secret = kTestJwtSecret;
+    cfg.jwt_audience = "example.test";
+    cfg.jwt_audience_configured = true;
+    TlsListener tls("proxy_public_gated");
+    TestServer proxy;
+    install_routes(proxy.server, cfg, nullptr, tls.server.get());
+    proxy.start();
+    tls.start();
+    httplib::SSLClient cli("127.0.0.1", tls.port);
+    cli.enable_server_certificate_verification(false);
+
+    // Listing it made it REACHABLE here, not open: no token is still the opaque 500, every time.
+    CHECK(cli.Get("/api/v1/news/default")->status == 500);
+    CHECK(cli.Get("/api/v1/news/default")->status == 500);
+    CHECK(calls.load() == 0);
+    // With today's token it is served -- from the upstream, and never from or into the cache.
+    const httplib::Headers auth = {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}};
+    auto ok = cli.Get("/api/v1/news/default", auth);
+    CHECK(ok && ok->status == 200);
+    CHECK(!ok->has_header("X-Cache"));
+    CHECK(cli.Get("/api/v1/news/default", auth)->status == 200);
+    CHECK(calls.load() == 2);
+    CHECK(cli.Get("/api/v1/news/default")->status == 500);
+    // The open sibling is cached as usual.
+    CHECK(cli.Get("/api/v1/news/list")->get_header_value("X-Cache") == "MISS");
+    CHECK(cli.Get("/api/v1/news/list")->get_header_value("X-Cache") == "HIT");
+    std::remove(db.c_str());
+}
+
+void the_mcp_path_and_the_public_paths_share_one_tls_listener() {
+    TestServer up;
+    install_fake_mcp_upstream(up.server);
+    up.start();
+    const std::string keys = write_mcp_key_db("proxy_public_mcp.sqlite");
+    Config cfg = mcp_config(up.port, keys);
+    cfg.mcp_allow_plain = false;
+    cfg.public_paths = {"/api/v1/river/"};
+    TlsListener tls("proxy_public_mcp");
+    TestServer proxy;
+    install_routes(proxy.server, cfg, nullptr, tls.server.get());
+    proxy.start();
+    tls.start();
+    httplib::SSLClient cli("127.0.0.1", tls.port);
+    cli.enable_server_certificate_verification(false);
+
+    // MCP still wants its key, GET included, and is not answered from the public cache.
+    CHECK(cli.Post("/api/v1/mcp", mcp_auth(), "{}", "application/json")->status == 200);
+    CHECK(cli.Post("/api/v1/mcp", "{}", "application/json")->status == 401);
+    CHECK(cli.Get("/api/v1/mcp")->status == 401);
+    auto mcp_get = cli.Get("/api/v1/mcp", mcp_auth());
+    CHECK(mcp_get && mcp_get->status == 200);
+    CHECK(!mcp_get->has_header("X-Cache"));
+    // And the public path beside it is open.
+    CHECK(cli.Get("/api/v1/river/x")->status == 200);
+    CHECK(cli.Get("/api/v1/fish/x")->status == 404);
+    std::remove(keys.c_str());
+}
+
+// ---- Signed-in app access (0.29.0) ----------------------------------------------------------------
+
+/** The fake upstream for these: echoes method, target, role and body, for every verb. */
+void install_app_upstream(httplib::Server& s, std::atomic<int>& calls) {
+    const auto handler = [&calls](const httplib::Request& req, httplib::Response& res) {
+        ++calls;
+        res.set_header("X-Got-Role", req.get_header_value("X-Fish-Role"));
+        res.set_header("X-Got-Proto", req.get_header_value("X-Forwarded-Proto"));
+        res.set_content(req.method + " " + req.target + " " + req.body, "application/json");
+    };
+    s.Get(R"(/.*)", handler);
+    s.Post(R"(/.*)", handler);
+    s.Patch(R"(/.*)", handler);
+}
+
+struct SignedInFixture {
+    std::atomic<int> calls{0};
+    TestServer upstream;
+    TestServer proxy;
+    std::unique_ptr<TlsListener> tls;
+    std::string db;
+    std::string mirror;
+    Config cfg;
+
+    explicit SignedInFixture(const std::string& name, std::vector<std::string> public_paths = {})
+        : db(name + ".daykeys.sqlite"), mirror(name + ".mirror.sqlite") {
+        install_app_upstream(upstream.server, calls);
+        upstream.start();
+        write_uniform_day_key_db(db, "TEST-DAY-KEY");
+        write_admin_mirror(mirror);
+        cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(upstream.port);
+        cfg.daykey_db_path = db;
+        cfg.account_mirror_db_path = mirror;
+        cfg.jwt_secret = kTestJwtSecret;
+        cfg.jwt_audience = "example.test";
+        cfg.jwt_audience_configured = true;
+        cfg.jwt_require_user = true;  // production setting
+        cfg.allowed_methods = {"GET", "POST", "PATCH"};
+        cfg.tls_api_signed_in = true;
+        cfg.public_paths = std::move(public_paths);
+        tls = std::make_unique<TlsListener>(name.c_str());
+        install_routes(proxy.server, cfg, nullptr, tls->server.get());
+        proxy.start();
+        tls->start();
+    }
+    std::unique_ptr<httplib::SSLClient> client() const {
+        auto cli = std::make_unique<httplib::SSLClient>("127.0.0.1", tls->port);
+        cli->enable_server_certificate_verification(false);
+        return cli;
+    }
+    ~SignedInFixture() {
+        tls.reset();
+        std::remove(db.c_str());
+        std::remove(mirror.c_str());
+    }
+};
+
+void a_signed_in_caller_gets_the_whole_api_over_tls() {
+    SignedInFixture fx("proxy_app_whole");
+    auto client = fx.client();
+    auto& cli = *client;
+    const httplib::Headers user = {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))}};
+
+    // Any route, not a list: reads, a gated read, and a write all reach the upstream as that user.
+    auto read = cli.Get("/api/v1/fish/search?q=trout", user);
+    CHECK(read && read->status == 200);
+    CHECK(read->body == "GET /api/v1/fish/search?q=trout ");
+    CHECK(read->get_header_value("X-Got-Role") == "user");
+    CHECK(read->get_header_value("X-Got-Proto") == "https");
+    CHECK(!read->has_header("X-Cache"));  // a signed-in answer is never cached
+    CHECK(cli.Get("/api/v1/news/default", user)->status == 200);
+    auto write = cli.Post("/api/v1/river/fish/x", user, "[]", "application/json");
+    CHECK(write && write->status == 200);
+    CHECK(write->body == "POST /api/v1/river/fish/x []");
+    CHECK(cli.Patch("/api/v1/river/description/x", user, "{}", "application/json")->status == 200);
+    // An admin account is an admin here too -- the mirror decides, as on the plain listener.
+    auto admin = cli.Get("/api/v1/fish/search", {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))}});
+    CHECK(admin && admin->get_header_value("X-Got-Role") == "admin");
+    // Every guard still runs: a method the allow-list refuses, and traversal.
+    CHECK(cli.Delete("/api/v1/fish/search", user)->status == 405);
+    CHECK(cli.Get("/api/v1/../secret", user)->status == 400);
+    // Outside the route prefix there is still nothing.
+    CHECK(cli.Get("/metrics", user)->status == 404);
+}
+
+void anyone_else_is_told_to_sign_in() {
+    SignedInFixture fx("proxy_app_refused");
+    auto client = fx.client();
+    auto& cli = *client;
+    const int before = fx.calls.load();
+    const auto refused = [&](const httplib::Headers& h) {
+        auto r = cli.Get("/api/v1/fish/search?q=trout", h);
+        CHECK(r && r->status == 401);
+        CHECK(r->get_header_value("WWW-Authenticate") == "Bearer realm=\"fishfind\"");
+        CHECK(r->body.find("sign_in_required") != std::string::npos);
+    };
+    refused({});                                                                    // no token
+    refused({{"Authorization", "Bearer not.a.token"}});                             // junk
+    refused({{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}});               // anonymous token
+    refused({{"Authorization", bearer(mint_token("TEST-DAY-KEY", "99999999"))}});   // unknown account
+    refused({{"Authorization", bearer(mint_token("OLD-DAY-KEY", kPlainProduct))}}); // not today's key
+    refused({{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct, "wrong-secret"))}});
+    // A write without a signed-in token never reaches the upstream either.
+    CHECK(cli.Post("/api/v1/river/fish/x", "[]", "application/json")->status == 401);
+    CHECK(fx.calls.load() == before);
+
+    httplib::Client plain("127.0.0.1", fx.proxy.port);
+    auto metrics = plain.Get("/metrics");
+    CHECK(metrics && metrics->body.find("cproxy_app_requests_total{outcome=\"unauthorized\"} 7") !=
+                         std::string::npos);
+    // The plain listener is unchanged: an open read is still open there.
+    CHECK(plain.Get("/api/v1/fish/search")->status == 200);
+}
+
+void public_paths_stay_anonymous_beside_the_signed_in_api() {
+    SignedInFixture fx("proxy_app_public", {"/api/v1/news/list"});
+    auto client = fx.client();
+    auto& cli = *client;
+    // The listed path needs nothing and is cached...
+    auto open = cli.Get("/api/v1/news/list");
+    CHECK(open && open->status == 200);
+    CHECK(open->get_header_value("X-Cache") == "MISS");
+    CHECK(open->get_header_value("X-Got-Role") == "guest");
+    // ...a signed-in caller on it is served as that user, uncached...
+    auto mine = cli.Get("/api/v1/news/list", {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))}});
+    CHECK(mine && mine->get_header_value("X-Got-Role") == "user");
+    CHECK(!mine->has_header("X-Cache"));
+    // ...and everything else still wants a signed-in token, a write to a public path included.
+    CHECK(cli.Get("/api/v1/news/search")->status == 401);
+    CHECK(cli.Post("/api/v1/news/list", "{}", "application/json")->status == 401);
+}
+
 }  // namespace
 
 
@@ -2048,6 +2528,16 @@ int main() {
     each_mcp_key_is_rate_limited();
     an_oversized_mcp_body_is_refused();
     the_tls_listener_serves_only_health_and_the_mcp_path();
+    the_public_paths_are_served_over_tls_and_nothing_else_is();
+    an_anonymous_answer_is_replayed_from_the_cache();
+    the_cache_can_be_turned_off_and_expires();
+    a_held_answer_is_still_served_while_the_upstream_is_down();
+    each_address_is_rate_limited_on_the_public_surface();
+    a_gated_path_listed_as_public_still_needs_its_token();
+    the_mcp_path_and_the_public_paths_share_one_tls_listener();
+    a_signed_in_caller_gets_the_whole_api_over_tls();
+    anyone_else_is_told_to_sign_in();
+    public_paths_stay_anonymous_beside_the_signed_in_api();
     std::cout << "proxy_test: all assertions passed\n";
     return 0;
 }

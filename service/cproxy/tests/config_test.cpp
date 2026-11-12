@@ -747,7 +747,133 @@ void a_bad_mcp_or_tls_config_is_a_startup_error() {
     CHECK(!problems(same_port).empty());
 }
 
+// ---- Public app surface (0.28.0) -----------------------------------------------------------------
+
+void the_public_surface_is_off_by_default() {
+    Config c = load_config(make_env({}));
+    CHECK(!c.public_enabled());
+    CHECK(!c.is_public_path("/api/v1/news/list"));
+    CHECK(c.public_rate_per_minute == 120);
+    CHECK(c.public_burst == 40);
+    CHECK(c.public_cache_seconds == 60);
+    CHECK(c.public_cache_max_bytes == 16 * 1024 * 1024);
+    CHECK(validate_config(c).empty());
+    CHECK(!load_config(make_env({{"CPROXY_PUBLIC_PATHS", "NONE"}})).public_enabled());
+    CHECK(!load_config(make_env({{"CPROXY_PUBLIC_PATHS", " , "}})).public_enabled());
+}
+
+void public_paths_are_exact_unless_they_end_in_a_slash() {
+    Config c = load_config(make_env({{"CPROXY_PUBLIC_PATHS", " /api/v1/news/list , api/v1/river/ "}}));
+    CHECK(c.public_paths.size() == 2);
+    // An exact entry: itself, with or without a trailing slash, and nothing else.
+    CHECK(c.is_public_path("/api/v1/news/list"));
+    CHECK(c.is_public_path("/api/v1/news/list/"));
+    CHECK(!c.is_public_path("/api/v1/news/listing"));
+    CHECK(!c.is_public_path("/api/v1/news/list/more"));
+    CHECK(!c.is_public_path("/api/v1/news"));
+    CHECK(!c.is_public_path("/api/v1/news/default"));
+    // A prefix entry (a missing leading slash is added): everything under it, not the bare name.
+    CHECK(c.is_public_path("/api/v1/river/search"));
+    CHECK(c.is_public_path("/api/v1/river/a/b"));
+    CHECK(!c.is_public_path("/api/v1/river"));
+    CHECK(!c.is_public_path("/api/v1/rivers/x"));
+    // Case-sensitive, unlike the gate lists: this list WIDENS access, so the strict reading is safe.
+    CHECK(!c.is_public_path("/API/v1/news/list"));
+    CHECK(!c.is_public_path("/api/v1/River/search"));
+}
+
+void public_settings_work_through_the_real_environment() {
+    put_real_env("CPROXY_PUBLIC_PATHS", "/api/v1/news/list,/api/v1/river/");
+    put_real_env("CPROXY_PUBLIC_RATE_PER_MINUTE", "30");
+    put_real_env("CPROXY_PUBLIC_BURST", "5");
+    put_real_env("CPROXY_PUBLIC_CACHE_SECONDS", "0");
+    put_real_env("CPROXY_TLS_PORT", "8443");
+    put_real_env("CPROXY_TLS_CERT", "/etc/cproxy/tls/fullchain.pem");
+    put_real_env("CPROXY_TLS_KEY", "/etc/cproxy/tls/privkey.pem");
+    Config c = load_config(system_env);
+    CHECK(c.public_enabled());
+    CHECK(c.is_public_path("/api/v1/river/x"));
+    CHECK(c.public_rate_per_minute == 30);
+    CHECK(c.public_burst == 5);
+    CHECK(c.public_cache_seconds == 0);  // 0 is a real value here: "no cache"
+    // TLS with public paths and no MCP path is a valid setup.
+    CHECK(validate_config(c).empty());
+    // Empty reads as unset, which here means "no public surface" -- the safe direction.
+    put_real_env("CPROXY_PUBLIC_PATHS", "");
+    put_real_env("CPROXY_TLS_PORT", "");
+    CHECK(!load_config(system_env).public_enabled());
+    // And the word works through the real environment too.
+    put_real_env("CPROXY_PUBLIC_PATHS", "none");
+    CHECK(!load_config(system_env).public_enabled());
+    for (const char* name : {"CPROXY_PUBLIC_PATHS", "CPROXY_PUBLIC_RATE_PER_MINUTE", "CPROXY_PUBLIC_BURST",
+                             "CPROXY_PUBLIC_CACHE_SECONDS", "CPROXY_TLS_PORT", "CPROXY_TLS_CERT",
+                             "CPROXY_TLS_KEY"}) {
+        put_real_env(name, nullptr);
+    }
+}
+
+void a_bad_public_config_is_a_startup_error() {
+    const std::map<std::string, std::string> good = {{"CPROXY_PUBLIC_PATHS", "/api/v1/news/list"},
+                                                     {"CPROXY_TLS_PORT", "8443"},
+                                                     {"CPROXY_TLS_CERT", "/c.pem"},
+                                                     {"CPROXY_TLS_KEY", "/k.pem"}};
+    auto problems = [&](std::map<std::string, std::string> changes) {
+        auto m = good;
+        for (auto& [k, v] : changes) m[k] = v;
+        return validate_config(load_config(make_env(std::move(m))));
+    };
+    CHECK(problems({}).empty());
+    // Outside the route prefix, or the prefix itself (which would publish every read at once).
+    CHECK(!problems({{"CPROXY_PUBLIC_PATHS", "/metrics"}}).empty());
+    CHECK(!problems({{"CPROXY_PUBLIC_PATHS", "/api/"}}).empty());
+    // Not a plain path.
+    CHECK(!problems({{"CPROXY_PUBLIC_PATHS", "/api/v1/river/../news/"}}).empty());
+    CHECK(!problems({{"CPROXY_PUBLIC_PATHS", "/api/v1/news/list?limit=5"}}).empty());
+    CHECK(!problems({{"CPROXY_PUBLIC_PATHS", "/api/v1/news/%6cist"}}).empty());
+    // The MCP path has its own credential and is never public.
+    CHECK(!problems({{"CPROXY_PUBLIC_PATHS", "/api/v1/mcp"}, {"CPROXY_MCP_PATH", "/api/v1/mcp"}}).empty());
+    CHECK(!problems({{"CPROXY_PUBLIC_RATE_PER_MINUTE", "0"}}).empty());
+    CHECK(!problems({{"CPROXY_PUBLIC_BURST", "-1"}}).empty());
+    CHECK(!problems({{"CPROXY_PUBLIC_CACHE_SECONDS", "-1"}}).empty());
+    // The public surface is served over TLS only.
+    auto no_tls = good;
+    no_tls.erase("CPROXY_TLS_PORT");
+    CHECK(!validate_config(load_config(make_env(std::move(no_tls)))).empty());
+}
+
+// ---- Signed-in app access (0.29.0) ----------------------------------------------------------------
+
+void the_signed_in_api_is_off_unless_it_says_user() {
+    CHECK(!load_config(make_env({})).tls_api_signed_in);
+    CHECK(load_config(make_env({{"CPROXY_TLS_API", " user "}})).tls_api_signed_in);
+    CHECK(!load_config(make_env({{"CPROXY_TLS_API", "NONE"}})).tls_api_signed_in);
+    const std::map<std::string, std::string> good = {{"CPROXY_TLS_API", "USER"},
+                                                     {"CPROXY_TLS_PORT", "8443"},
+                                                     {"CPROXY_TLS_CERT", "/c.pem"},
+                                                     {"CPROXY_TLS_KEY", "/k.pem"},
+                                                     {"CPROXY_JWT_SECRET", "s"}};
+    auto problems = [&](std::map<std::string, std::string> changes, const char* drop = nullptr) {
+        auto m = good;
+        for (auto& [k, v] : changes) m[k] = v;
+        if (drop != nullptr) m.erase(drop);
+        return validate_config(load_config(make_env(std::move(m))));
+    };
+    // TLS with only the signed-in API (no MCP path, no public paths) is a valid setup.
+    CHECK(problems({}).empty());
+    CHECK(!problems({}, "CPROXY_TLS_PORT").empty());
+    CHECK(!problems({}, "CPROXY_JWT_SECRET").empty());
+    // An unknown word is a startup error, not a silent "off".
+    CHECK(!problems({{"CPROXY_TLS_API", "ALL"}}).empty());
+    // Through the real environment, where an empty variable reads as unset (= off).
+    put_real_env("CPROXY_TLS_API", "USER");
+    CHECK(load_config(system_env).tls_api_signed_in);
+    put_real_env("CPROXY_TLS_API", "");
+    CHECK(!load_config(system_env).tls_api_signed_in);
+    put_real_env("CPROXY_TLS_API", nullptr);
+}
+
 }  // namespace
+
 
 int main() {
     the_jwt_audience_is_configured_only_by_the_environment();
@@ -784,6 +910,11 @@ int main() {
     the_mcp_path_is_normalized_and_matched_exactly();
     mcp_and_tls_settings_work_through_the_real_environment();
     a_bad_mcp_or_tls_config_is_a_startup_error();
+    the_public_surface_is_off_by_default();
+    public_paths_are_exact_unless_they_end_in_a_slash();
+    public_settings_work_through_the_real_environment();
+    a_bad_public_config_is_a_startup_error();
+    the_signed_in_api_is_off_unless_it_says_user();
     std::cout << "config_test: all assertions passed\n";
     return 0;
 }

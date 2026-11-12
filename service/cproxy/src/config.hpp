@@ -55,8 +55,14 @@ namespace cproxy {
  * | CPROXY_MCP_BURST            | 20                            | MCP requests a key may make back to back  |
  * | CPROXY_MCP_MAX_PAYLOAD_BYTES| 65536                         | MCP request bodies above this are rejected 413 |
  * | CPROXY_MCP_ALLOW_PLAIN      | false                         | true = also serve the MCP path on the plain-HTTP listener |
- * | CPROXY_TLS_PORT             | (0 = off)                     | HTTPS listener serving ONLY /health and the MCP path |
+ * | CPROXY_TLS_PORT             | (0 = off)                     | HTTPS listener: /health, the MCP path and the public paths |
  * | CPROXY_TLS_CERT / _KEY      | (empty)                       | PEM certificate chain / private key for that listener |
+ * | CPROXY_PUBLIC_PATHS         | (empty = no public surface)   | CSV of GET paths the TLS listener serves to anyone; a trailing / makes a prefix |
+ * | CPROXY_PUBLIC_RATE_PER_MINUTE | 120                         | sustained public requests per peer address per minute |
+ * | CPROXY_PUBLIC_BURST         | 40                            | public requests an address may make back to back |
+ * | CPROXY_PUBLIC_CACHE_SECONDS | 60                            | how long an anonymous 200 is replayed (0 = no cache) |
+ * | CPROXY_PUBLIC_CACHE_MAX_BYTES | 16777216                    | total size of that cache |
+ * | CPROXY_TLS_API              | (empty = off)                 | USER = the TLS listener also forwards every API route to a signed-in caller |
  */
 struct Config {
     std::string listen_addr = "0.0.0.0";
@@ -156,6 +162,39 @@ struct Config {
 
     /** True when CPROXY_TLS_PORT is set. */
     bool tls_enabled() const { return tls_port != 0; }
+
+    // --- Public app surface (0.28.0) -----------------------------------------------------------
+    // The plain listener is firewalled to an allowlist, so a phone cannot reach it. These are the
+    // paths the TLS listener ALSO serves, to anyone: GET only, each peer address rate-limited, and an
+    // anonymous 200 replayed from a short cache. Everything else about a request is unchanged -- the
+    // datacenter block, the traversal guard and the credential gate all still run, so listing a gated
+    // path here does not open it. Empty (the default) means there is no public surface.
+    //
+    // An entry ending in "/" is a prefix ("/api/v1/river/" covers everything under it); any other
+    // entry is one exact path. Matching is case-SENSITIVE and done on both the decoded path and the
+    // raw request target, and both must match: this list widens access, so the strict reading is the
+    // safe one (the opposite of the gate lists, which fold case because they narrow it).
+    std::vector<std::string> public_paths;
+    int public_rate_per_minute = 120;
+    int public_burst = 40;
+    int public_cache_seconds = 60;  // 0 = no cache
+    int public_cache_max_bytes = 16 * 1024 * 1024;
+
+    // --- Signed-in app access (0.29.0) ---------------------------------------------------------
+    // CPROXY_TLS_API=USER: the TLS listener forwards EVERY route under the route prefix -- the same
+    // API the plain listener serves -- to a caller whose Bearer token verifies (signature, expiry,
+    // today's day-key) AND names a live account in the mirror. The Android app gets that token from
+    // the site's Account/MobileSession.ashx after a Google sign-in. Anyone else is answered 401 with
+    // WWW-Authenticate, so the app knows to sign in again. Every other guard still runs, exactly as
+    // on the plain listener. Off by default; the plain listener is never affected.
+    bool tls_api_signed_in = false;
+    std::string tls_api_unknown_mode;  // set by load_config when CPROXY_TLS_API is neither USER nor NONE
+
+    /** True when CPROXY_PUBLIC_PATHS lists at least one path. */
+    bool public_enabled() const { return !public_paths.empty(); }
+
+    /** True when `path` is one of the public paths (see the matching rules above). */
+    bool is_public_path(const std::string& path) const;
 
     std::string api_key;                    // empty => no auth required
     std::set<std::string> allowed_methods;  // empty => all methods allowed (stored upper-case)
