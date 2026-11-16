@@ -578,6 +578,65 @@ takes its own credential instead. Deploy prerequisites are in `docs/do-update.md
 - **Verified 2026-09-30**: 11/11 ctest in the build stage; end to end in the Rancher VM against the docapi
   1.20.0 image (see CHANGELOG 0.20.0).
 
+### Public app surface (0.28.0 — DEPLOYED 2026-11-11, digest `3d355d6e…decdf`; list REMOVED from prod 2026-11-13)
+
+**2026-11-13: `CPROXY_PUBLIC_PATHS` deleted from `/opt/cproxy/compose.yml`** (backup `compose.yml.bak-0.29.0-public`) once
+the app signed in; startup `"public":"off"`, anonymous HTTPS calls 401, the signed-in app's news list 200. The code below
+stays in the binary and is off while the variable is unset.
+
+For the Android app (`envfish-droid`, TODO P0-06): phones cannot reach the allowlisted port 80, so the
+TLS listener (443, `mcp.fishfind.info`) also serves `CPROXY_PUBLIC_PATHS` to anyone. The list lives in
+`deploy/compose.yml` (paths are not secret): news list/search/lake/fish, `/river/`, `/region/regulation/`,
+`/water/station/`, `/newssearch/`. **Not** `/fish` (species data is admin-only, user decision), not the
+gated news home page, not documents, not `/newsidx`.
+
+- **Reachable is not open.** `proxy_to_docapi(..., public_surface=true)` runs every guard as before, so a
+  gated path that a prefix happens to sweep in still answers the opaque 500 without a token
+  (`a_gated_path_listed_as_public_still_needs_its_token`).
+- **Matching is the opposite of the gate lists, on purpose:** case-SENSITIVE, and both `req.path` and the
+  raw target must match. The gate lists fold case because they narrow access; this list widens it.
+- **Per-address limiter, bounded at 50,000 keys** (`RateLimiter` third ctor arg). Addresses are chosen by
+  the caller, unlike MCP key ids, so the map must not grow without limit. At the bound it drops refilled
+  buckets, then refuses the newcomer (never evicts a caller still mid-budget). A cache hit spends a token.
+- **Cache (`ResponseCache`)**: only a guest's plain GET (no Authorization/Cookie/Origin/Range/conditional
+  headers), only a 200 without no-store/private/Set-Cookie and with no Vary beyond Accept-Encoding/CORS.
+  Key = upstream name + FINAL target (after the guest news-list cap) + Accept-Encoding. Looked up after
+  every guard but BEFORE the breaker, so held answers keep the app alive during an upstream outage.
+  `X-Request-Id` is per request, never replayed; `Date`/`Age` are not stored.
+- **Plain listener untouched**: no cache, no per-address limit (portal traffic is never throttled by this).
+- Rollback without a redeploy: delete the `CPROXY_PUBLIC_PATHS` line from `/opt/cproxy/compose.yml`, `up -d`.
+  Full rollback: `/opt/cproxy/compose.yml.bak-0.27.0` (digest `6d1502f3…4eda`), then `up -d`.
+- **Guests always get the first 100 news rows**, whatever `limit`/`offset` they send (the 0.17.1 cap runs
+  before the cache key is built). The app cannot page older news until it has a signed-in token (P0-07).
+- **Verified live 2026-11-11** over `https://mcp.fishfind.info`: public reads 200 (news list MISS → HIT),
+  unlisted paths 404, MCP 401 without a key, plain port unchanged; the Android app (envfish-droid branch
+  `p0-06-api-host`) loads the live news list on the emulator.
+- **Note (2026-11-11):** commits `36a6948` and `182ae88` on `main` (pushed) were made outside the session
+  that wrote this: the first is the 0.27.0 work that had been live but uncommitted; the second carries
+  only `response_cache.*` + the bounded `rate_limiter.*` from this change, with the 0.27.0 commit message
+  copied. Harmless on its own (response_cache is not in CMake there), but the branch
+  `cproxy-0.28.0-public-app-surface` is what completes it.
+
+### Signed-in app access (0.29.0 — DEPLOYED 2026-11-11, digest `70725d40…f7be`; rollback `compose.yml.bak-0.28.0`)
+
+User decision 2026-11-11: the app uses the EXISTING API with a web-account token, not MCP and not an
+anonymous surface. `CPROXY_TLS_API=USER` (in `deploy/compose.yml`): the TLS listener forwards every
+`/api/` route to a caller whose token verifies and names a live account (`role != guest`); otherwise
+`401` + `WWW-Authenticate: Bearer realm="fishfind"`. The token is `FishApiJwt.Issue` output, minted by
+the portal's `Account/MobileSession.ashx` (fishfind-frontend branch `mobile-signin`, worktree
+`C:\envoinx\fishfind\ff-mobile-signin`) from a Google ID token whose `aud` is the site's own
+`OAuth:ClientId`, via `OAuthUserMapper.ResolveAccount("Google", sub, …)` — the same account as a website
+Google sign-in.
+
+- `proxy_to_docapi(..., Surface::SignedIn)`: the signed-in check REPLACES the gate branch (it is the same
+  `check_gate_credential`), so do not add a second check for gated paths.
+- **New accounts:** the users-sync mirror lags by the dispatcher interval (~2 min), so a just-created
+  account's first calls get 401; the app retries. Not a bug.
+- Deploy order: MobileSession.ashx (FTP, user) → 0.29.0 → app release → remove `CPROXY_PUBLIC_PATHS`.
+- Hostname: `api.fishfind.info` (user decision) needs a DNS A record at Winhost and the certificate
+  expanded to both names (manual DNS challenge, like the existing renewal). Until then the app uses
+  `mcp.fishfind.info`, the same listener.
+
 ### Catch-all via pre_routing_handler
 
 Routing is done in `Server::set_pre_routing_handler`, invoked for **every** method+path — the single
