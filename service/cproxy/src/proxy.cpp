@@ -481,6 +481,14 @@ struct CredentialCheck {
     bool ok = false;
     std::string reason;
     std::string role = "guest";
+    // 0.30.0: the live account behind the token's `user` claim (users_sync.id), empty for a guest. Sent
+    // to docapi as X-Fish-User; never logged.
+    std::string user_id;
+
+    // A constructor rather than aggregate init, so the many two-field refusals stay `{false, "why"}`
+    // without -Wmissing-field-initializers for the members added since.
+    CredentialCheck(bool ok_, std::string reason_, std::string role_ = "guest", std::string user_id_ = {})
+        : ok(ok_), reason(std::move(reason_)), role(std::move(role_)), user_id(std::move(user_id_)) {}
 };
 
 /**
@@ -639,7 +647,9 @@ CredentialCheck check_gate_credential(const Config& cfg, ProxyState& state,
             return {false, "jwt user claim does not match a live account"};
         }
     }
-    return {true, {}, role_for_claims(state, verified.claims, now)};
+    std::string role = role_for_claims(state, verified.claims, now);
+    std::string user_id = role == "guest" ? std::string() : state.user_prime_store->user_id(verified.claims.user, now);
+    return {true, {}, std::move(role), std::move(user_id)};
 }
 
 /** Where one request goes: the upstream's name (for messages), its origin, and its breaker. */
@@ -827,6 +837,9 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     const bool mcp = cfg.is_mcp_path(req.path) || cfg.is_mcp_path(target_path);
     std::string mcp_key_id;
     std::string mcp_user_id;
+    // 0.30.0: the account behind a verified web-account token (the app's sign-in), for docapi's
+    // per-user routes (the catch log). Empty for a guest and on the MCP path, which has its own.
+    std::string user_id;
     if (mcp) {
         if (!via_tls && !cfg.mcp_allow_plain) {
             write_error(res, 404, "not_found", "No route");
@@ -893,6 +906,7 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         }
         state.metrics.observe_mcp(&Metrics::app_accepted);
         role = credential.role;
+        user_id = credential.user_id;
     } else if (cfg.daykey_required(req.method, req.path) || cfg.daykey_gated_path(target_path)) {
         const CredentialCheck credential =
             check_gate_credential(cfg, state, req, state.clock.now());
@@ -903,10 +917,14 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
             return;
         }
         role = credential.role;
+        user_id = credential.user_id;
     } else if (!req.get_header_value("Authorization").empty()) {
         const CredentialCheck credential =
             check_gate_credential(cfg, state, req, state.clock.now());
-        if (credential.ok) role = credential.role;
+        if (credential.ok) {
+            role = credential.role;
+            user_id = credential.user_id;
+        }
     }
 
     // A guest -- no token, a token that does not verify, or one whose `user` product is not a live
@@ -987,6 +1005,9 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // 0.27.0: the account that owns the MCP key, for docapi's write tools. Only on the MCP path and only
     // for a self-service key; an inbound copy was dropped by is_unforwardable.
     if (!mcp_user_id.empty()) out.set_header("X-Fish-User", mcp_user_id.c_str());
+    // 0.30.0: the same header for a signed-in account's token. One source per request: the MCP path
+    // never runs a token check, so at most one of the two is set.
+    else if (!user_id.empty()) out.set_header("X-Fish-User", user_id.c_str());
 
     // A 304 has no body (RFC 9110 §15.4.5), but the pinned httplib (v0.15.3) only knows that about
     // 204: for a 304 sent without Content-Length -- which is how Kestrel sends one -- it reads

@@ -259,6 +259,35 @@ void a_missing_mirror_has_no_admins() {
 
 }  // namespace
 
+// --- Account id (0.30.0) ------------------------------------------------------------------------
+// The gateway tells docapi whose token it is; the id comes from the same live-account row.
+
+void a_live_product_names_its_account_and_nothing_else_does() {
+    const std::string path = "user_prime_store_test_ids.sqlite";
+    write_mirror(path, {{"0190aaaa-0000-7000-8000-000000000001", 1000003, 104729, kSep8},
+                        {"suspended", 1000033, 104743, kSep8, /*suspended=*/1}});
+    UserPrimeStore store(path, 60);
+
+    const auto now = at(2026, 9, 8);
+    CHECK(store.user_id("104729314187", now) == "0190aaaa-0000-7000-8000-000000000001");
+    CHECK(store.user_id("104746456519", now).empty());  // suspended
+    CHECK(store.user_id("999", now).empty());           // unknown
+    CHECK(store.user_id("104729314187 OR 1=1", now).empty());
+    std::remove(path.c_str());
+}
+
+void a_product_two_accounts_share_names_nobody() {
+    // A's account prime is B's day prime and vice versa: the same product, two accounts.
+    const std::string path = "user_prime_store_test_shared.sqlite";
+    write_mirror(path, {{"a", 1000003, 1000033, kSep8}, {"b", 1000033, 1000003, kSep8}});
+    UserPrimeStore store(path, 60);
+
+    const auto now = at(2026, 9, 8);
+    CHECK(store.is_valid("1000036000099", now));
+    CHECK(store.user_id("1000036000099", now).empty());
+    std::remove(path.c_str());
+}
+
 int main() {
     the_product_of_the_two_primes_identifies_the_account();
     a_product_past_2_to_the_63_still_matches();
@@ -273,6 +302,8 @@ int main() {
     only_exactly_255_is_superadmin();
     a_suspended_or_deleted_admin_is_not_an_admin();
     a_missing_mirror_has_no_admins();
+    a_live_product_names_its_account_and_nothing_else_does();
+    a_product_two_accounts_share_names_nobody();
     std::cout << "user_prime_store_test: all checks passed\n";
     return 0;
 }

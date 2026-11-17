@@ -2347,6 +2347,8 @@ void install_app_upstream(httplib::Server& s, std::atomic<int>& calls) {
         ++calls;
         res.set_header("X-Got-Role", req.get_header_value("X-Fish-Role"));
         res.set_header("X-Got-Proto", req.get_header_value("X-Forwarded-Proto"));
+        res.set_header("X-Got-User", req.get_header_value("X-Fish-User"));
+        res.set_header("X-Got-User-Count", std::to_string(req.get_header_value_count("X-Fish-User")));
         res.set_content(req.method + " " + req.target + " " + req.body, "application/json");
     };
     s.Get(R"(/.*)", handler);
@@ -2422,6 +2424,36 @@ void a_signed_in_caller_gets_the_whole_api_over_tls() {
     CHECK(cli.Get("/api/v1/../secret", user)->status == 400);
     // Outside the route prefix there is still nothing.
     CHECK(cli.Get("/metrics", user)->status == 404);
+}
+
+void the_signed_in_account_crosses_as_x_fish_user() {
+    // 0.30.0: docapi's per-user routes (the app's catch log) are told whose token it is, from the
+    // mirror -- exactly once, and an inbound copy never rides along.
+    SignedInFixture fx("proxy_app_user");
+    auto client = fx.client();
+    auto& cli = *client;
+    httplib::Headers user = {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))}};
+    user.emplace("X-Fish-User", "admin");
+    auto read = cli.Get("/api/v1/catch/mine", user);
+    CHECK(read && read->status == 200);
+    CHECK(read->get_header_value("X-Got-User") == "plain");
+    CHECK(read->get_header_value("X-Got-User-Count") == "1");
+    auto write = cli.Post("/api/v1/catch", user, "{}", "application/json");
+    CHECK(write && write->get_header_value("X-Got-User") == "plain");
+    auto admin = cli.Get("/api/v1/catch/mine", {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))}});
+    CHECK(admin && admin->get_header_value("X-Got-User") == "admin");
+
+    // No token on the plain listener: a guest, and no account crosses, even a spoofed one.
+    httplib::Client plain("127.0.0.1", fx.proxy.port);
+    auto guest = plain.Get("/api/v1/fish/search", {{"X-Fish-User", "admin"}});
+    CHECK(guest && guest->status == 200);
+    CHECK(guest->get_header_value("X-Got-User-Count") == "0");
+    // A token on the plain listener names its account there too.
+    auto token = plain.Get("/api/v1/fish/search", {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))}});
+    CHECK(token && token->get_header_value("X-Got-User") == "plain");
+    // An anonymous (no user claim) token is a guest: nothing crosses.
+    auto anon = plain.Get("/api/v1/fish/search", {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}});
+    CHECK(anon && anon->get_header_value("X-Got-User-Count") == "0");
 }
 
 void anyone_else_is_told_to_sign_in() {
@@ -2536,6 +2568,7 @@ int main() {
     a_gated_path_listed_as_public_still_needs_its_token();
     the_mcp_path_and_the_public_paths_share_one_tls_listener();
     a_signed_in_caller_gets_the_whole_api_over_tls();
+    the_signed_in_account_crosses_as_x_fish_user();
     anyone_else_is_told_to_sign_in();
     public_paths_stay_anonymous_beside_the_signed_in_api();
     std::cout << "proxy_test: all assertions passed\n";
