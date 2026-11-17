@@ -9,6 +9,15 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-11-17: **0.30.0 (DEPLOYED 2026-11-17, digest `73cb0c75…c2cb`; rollback 0.29.0 `70725d40…f7be`, droplet `/opt/cproxy/compose.yml.bak-pre-0.30.0`) — the signed-in account crosses to docapi as `X-Fish-User`.** For the
+  Android app's catch log (docapi 1.36.0 `/api/v1/catch/*`), docapi must know whose token it is. `UserPrimeStore` now
+  also selects `users_sync.id` and `user_id(product)` returns the live account behind a `user` claim (empty for an
+  unknown, suspended, deleted or expired account, and for a product two accounts would share). Every token check that
+  passes with a non-guest role (the signed-in TLS surface, the day-key gate, an optional token on an open path) sends
+  that id as `X-Fish-User`, the header the MCP path has carried since 0.27.0 for a key's owner; an inbound copy is still
+  dropped, so it crosses exactly once. The id is never logged. No config change. Tests: 13/13 ctest in the Docker build
+  stage (+2 `user_prime_store_test` cases, +1 `proxy_test` case: own account once, spoof dropped, guest gets none).
+  Live: restarts 0, user-prime store 24 accounts / 6 admins, first 263 requests 262 x 200 + 1 x 404 (a scanner on /).
 - 2026-11-13: **Config only, no new image: `CPROXY_PUBLIC_PATHS` removed from production** (user request, once the
   Android app signed in). The HTTPS listener now serves nothing anonymously: every `/api` route there needs a signed-in
   token (0.29.0 `CPROXY_TLS_API=USER`), else `401 sign_in_required`. Startup reads `"public":"off"`. Verified live: an

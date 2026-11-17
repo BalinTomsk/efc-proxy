@@ -21,14 +21,13 @@ namespace cproxy {
  * Both factors are primes issued exactly once globally (`UK_Users_prime`, `UK_Users_Prime`), so the
  * product identifies one account on one day and reveals neither factor to whoever sees the token.
  *
- * **This class answers yes/no questions, not a who question, and that is deliberate.** `is_valid`
- * and `is_admin` return bools and the query does not even select `users_sync.id`, so the most cproxy
- * can ever conclude is "this product belongs to SOME live account" (and, since 0.12.0, "...which is a
- * superAdmin") — never "this is user X". The gateway therefore does NOT identify the caller and
- * attributes nothing: this is an authorization check, not authentication. Making it identify the
- * caller would mean returning the user id here AND deciding what cproxy does with it (log it? forward
- * it to docapi as a header?) — a real design change, not a tweak, and one that would put an account
- * identifier into logs that currently hold none.
+ * **Who the caller is (0.30.0).** Until 0.29.0 this class answered yes/no questions only and never
+ * selected `users_sync.id`. The app's catch log (envfish-droid) needs docapi to know whose catches to
+ * list and under which account to store a new one, so `user_id` now returns the account behind a live
+ * product, and the gateway forwards it to docapi as `X-Fish-User`, the header the MCP path has carried
+ * for a self-service key since 0.27.0 (an inbound copy is still dropped). The id is **never logged**:
+ * the request log stays free of account identifiers. A product that two accounts would share (see
+ * `load`) names nobody, so a collision can never attribute one account's write to another.
  *
  * ### Admin comes from the mirror, never from the token (0.12.0)
  * `is_admin` is true when the account behind the product has `users_sync.access == 255`, the
@@ -87,6 +86,10 @@ public:
      *  snapshot, same filters: a suspended, deleted, or expired admin is not an admin here. */
     bool is_admin(const std::string& product, std::chrono::system_clock::time_point now);
 
+    /** The account (`users_sync.id`) behind a valid `product`, or empty: unknown, not live, or a product
+     *  two accounts share. Same snapshot and filters as `is_valid`. */
+    std::string user_id(const std::string& product, std::chrono::system_clock::time_point now);
+
     /** Rebuilds the snapshot now, ignoring the TTL. Startup calls this so a mirror that is missing,
      *  empty, or still dormant shows up in the log rather than only as a wall of unexplained 500s. */
     void refresh(std::chrono::system_clock::time_point now);
@@ -112,7 +115,11 @@ private:
     std::chrono::seconds cache_ttl_;
 
     mutable std::mutex mu_;
-    std::unordered_map<std::string, bool> products_;  // product -> is superAdmin
+    struct Account {
+        bool admin = false;
+        std::string id;  // empty when two accounts share the product
+    };
+    std::unordered_map<std::string, Account> products_;  // product -> superAdmin flag + account id
     std::string last_error_;
     std::chrono::system_clock::time_point loaded_at_{};
     bool loaded_ = false;

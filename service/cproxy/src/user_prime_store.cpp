@@ -71,7 +71,7 @@ std::size_t UserPrimeStore::size() const {
 std::size_t UserPrimeStore::admin_count() const {
     std::lock_guard<std::mutex> lock(mu_);
     return static_cast<std::size_t>(std::count_if(
-        products_.begin(), products_.end(), [](const auto& entry) { return entry.second; }));
+        products_.begin(), products_.end(), [](const auto& entry) { return entry.second.admin; }));
 }
 
 std::string UserPrimeStore::last_error() const {
@@ -95,7 +95,16 @@ bool UserPrimeStore::is_admin(const std::string& product,
     refresh_if_stale(now);
     std::lock_guard<std::mutex> lock(mu_);
     const auto it = products_.find(product);
-    return it != products_.end() && it->second;
+    return it != products_.end() && it->second.admin;
+}
+
+std::string UserPrimeStore::user_id(const std::string& product,
+                                    std::chrono::system_clock::time_point now) {
+    if (!all_digits(product)) return {};
+    refresh_if_stale(now);
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = products_.find(product);
+    return it == products_.end() ? std::string() : it->second.id;
 }
 
 void UserPrimeStore::refresh_if_stale(std::chrono::system_clock::time_point now) {
@@ -117,7 +126,7 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
     const int tomorrow = day_of_year(now + one_day);
     const std::string today_date = utc_date(now);
 
-    std::unordered_map<std::string, bool> products;
+    std::unordered_map<std::string, Account> products;
     std::string error;
 
     SqliteDb handle;
@@ -134,9 +143,9 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
         // carries it and must not exclude the account.
         // `s.access` rides along so the admin bit comes from the same row, under the same
         // suspended/deleted/expired filters, as the validity answer — an account that stops being
-        // live stops being an admin in the same snapshot. Still no `s.id`: see the class comment.
+        // live stops being an admin in the same snapshot. `s.id` (0.30.0) is the account docapi is told.
         static const char* const sql =
-            "SELECT s.prime, p.prime, s.access "
+            "SELECT s.prime, p.prime, s.access, s.id "
             "FROM user_prime_sync p "
             "JOIN users_sync s ON s.id = p.user_id "
             "WHERE p.day_year IN (?, ?, ?) "
@@ -155,15 +164,21 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
             int rc;
             while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
                 const bool admin = sqlite3_column_int(stmt, 2) == kSuperAdminAccess;
+                const auto* id_text = sqlite3_column_text(stmt, 3);
+                std::string id = id_text == nullptr ? std::string() : reinterpret_cast<const char*>(id_text);
                 auto [it, inserted] = products.emplace(
                     product_decimal(sqlite3_column_int64(stmt, 0), sqlite3_column_int64(stmt, 1)),
-                    admin);
+                    Account{admin, id});
                 // Two rows yielding the same product would need two accounts whose primes swap
                 // roles (A's account prime is B's day prime and vice versa) — impossible while the
                 // day sequence stays below the account sequence's 1000003 floor, but not forever.
                 // If it ever happens, the product is an admin only if EVERY row behind it is: a
                 // collision must never lend one account another's privilege.
-                if (!inserted) it->second = it->second && admin;
+                // Likewise a shared product names nobody (0.30.0), unless every row is the same account.
+                if (!inserted) {
+                    it->second.admin = it->second.admin && admin;
+                    if (it->second.id != id) it->second.id.clear();
+                }
             }
             sqlite3_finalize(stmt);
             if (rc != SQLITE_DONE) {
