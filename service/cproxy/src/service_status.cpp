@@ -43,6 +43,7 @@ std::string host_name() {
 }  // namespace
 
 void ServiceActivity::record(std::string action) {
+    requests_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mu_);
     last_ = Last{std::chrono::system_clock::now(), std::move(action)};
 }
@@ -71,7 +72,8 @@ std::string route_family(const std::string& path) {
 std::string service_status_body(const std::string& event, const std::string& machine,
                                 std::chrono::system_clock::time_point process_start,
                                 std::chrono::system_clock::time_point sent,
-                                const std::optional<ServiceActivity::Last>& last) {
+                                const std::optional<ServiceActivity::Last>& last,
+                                std::optional<long long> requests) {
     nlohmann::json body = {
         {"type", kMessageType},
         {"event", event},
@@ -82,6 +84,7 @@ std::string service_status_body(const std::string& event, const std::string& mac
         {"sentUtc", iso_utc(sent)},
         {"lastActionUtc", last ? nlohmann::json(iso_utc(last->at)) : nlohmann::json(nullptr)},
         {"lastAction", last ? nlohmann::json(last->action) : nlohmann::json(nullptr)},
+        {"requests", requests ? nlohmann::json(*requests) : nlohmann::json(nullptr)},
     };
     return body.dump();
 }
@@ -137,7 +140,7 @@ void ServiceStatusReporter::publish(const std::string& event) {
             {"properties", {{"delivery_mode", 1}, {"content_type", "application/json"}}},
             {"routing_key", kQueue},
             {"payload", service_status_body(event, machine_, kProcessStart, std::chrono::system_clock::now(),
-                                            service_activity().last())},
+                                            service_activity().last(), service_activity().requests())},
             {"payload_encoding", "string"},
         };
         auto res = client.Post("/api/exchanges/%2F/amq.default/publish", envelope.dump(), "application/json");
