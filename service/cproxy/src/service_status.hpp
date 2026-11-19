@@ -24,12 +24,16 @@ public:
         std::string action;
     };
 
+    /** Records the latest action and counts it as one request (the page's per hour / day / month columns). */
     void record(std::string action);
     std::optional<Last> last() const;
+    /** Requests recorded since the process started; sent as "requests" with every status message. */
+    long long requests() const { return requests_.load(std::memory_order_relaxed); }
 
 private:
     mutable std::mutex mu_;
     std::optional<Last> last_;
+    std::atomic<long long> requests_{0};
 };
 
 /** Process-wide activity, shared by the proxy routes and the reporter. */
@@ -42,7 +46,8 @@ std::string route_family(const std::string& path);
 std::string service_status_body(const std::string& event, const std::string& machine,
                                 std::chrono::system_clock::time_point process_start,
                                 std::chrono::system_clock::time_point sent,
-                                const std::optional<ServiceActivity::Last>& last);
+                                const std::optional<ServiceActivity::Last>& last,
+                                std::optional<long long> requests = std::nullopt);
 
 /**
  * Publishes cproxy's status to fishfind.servicestatus.events through the RabbitMQ management API (the same

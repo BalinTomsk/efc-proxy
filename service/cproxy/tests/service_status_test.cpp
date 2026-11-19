@@ -38,7 +38,7 @@ void body_follows_the_contract() {
     const sys_seconds sent = start + minutes{65};
     const ServiceActivity::Last last{start + minutes{64}, "GET /api/v1/river -> docapi"};
 
-    const auto body = nlohmann::json::parse(service_status_body("heartbeat", "cproxy-droplet", start, sent, last));
+    const auto body = nlohmann::json::parse(service_status_body("heartbeat", "cproxy-droplet", start, sent, last, 42LL));
 
     CHECK(body["type"] == "fishfind.service-status.v1");
     CHECK(body["event"] == "heartbeat");
@@ -49,6 +49,7 @@ void body_follows_the_contract() {
     CHECK(body["sentUtc"] == "2026-10-16T13:05:00Z");
     CHECK(body["lastActionUtc"] == "2026-10-16T13:04:00Z");
     CHECK(body["lastAction"] == "GET /api/v1/river -> docapi");
+    CHECK(body["requests"] == 42);
 }
 
 void body_without_activity_sends_nulls() {
@@ -56,6 +57,7 @@ void body_without_activity_sends_nulls() {
     const auto body = nlohmann::json::parse(service_status_body("start", "h", now, now, std::nullopt));
     CHECK(body["lastAction"].is_null());
     CHECK(body["lastActionUtc"].is_null());
+    CHECK(body["requests"].is_null());
 }
 
 void reporting_needs_https_broker_and_credentials() {
