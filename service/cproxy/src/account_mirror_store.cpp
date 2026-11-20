@@ -195,14 +195,14 @@ void upsert_user_sync(sqlite3* db, const nlohmann::json& user, const nlohmann::j
     static const char* const sql =
         "INSERT INTO users_sync "
         "(id, users_id, user_name, email, last_visit, access, suspended, auth_type, deleted, deleted_utc, "
-        "prime, prime_expired, updated_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "prime, prime_expired, updated_utc, user_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "users_id=excluded.users_id, user_name=excluded.user_name, email=excluded.email, "
         "last_visit=excluded.last_visit, access=excluded.access, suspended=excluded.suspended, "
         "auth_type=excluded.auth_type, deleted=excluded.deleted, deleted_utc=excluded.deleted_utc, "
         "prime=excluded.prime, prime_expired=excluded.prime_expired, "
-        "updated_utc=excluded.updated_utc";
+        "updated_utc=excluded.updated_utc, user_type=excluded.user_type";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         throw std::runtime_error(std::format("prepare users_sync upsert: {}", sqlite3_errmsg(db)));
     }
@@ -233,6 +233,10 @@ void upsert_user_sync(sqlite3* db, const nlohmann::json& user, const nlohmann::j
         bind_text(stmt, 12, prime_expired);
     }
     bind_text(stmt, 13, str_or_empty(event, "occurredUtc"));
+    // 0.32.0: dbo.Users.userType, a bitmask (1 registered, 2 paid, 4 scientist, 8 editor, 16 ai_agent, 32 admin),
+    // forwarded to docapi as X-Fish-User-Type. 0 on events from a dispatcher older than the field (or a JSON null from
+    // an outbox row written before the column) -- "unknown", never a type.
+    sqlite3_bind_int(stmt, 14, int_or_zero(user, "userType"));
     const int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
@@ -438,7 +442,8 @@ void AccountMirrorStore::ensure_schema() {
         "  deleted_utc TEXT NULL,"
         "  prime INTEGER NOT NULL DEFAULT 0,"
         "  prime_expired TEXT NULL,"
-        "  updated_utc TEXT NOT NULL"
+        "  updated_utc TEXT NOT NULL,"
+        "  user_type INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS ix_users_sync_email ON users_sync(email);"
         // dbo.Users_Prime -- one row per (account, day of year), 365 per allocated account. Shaped
@@ -495,6 +500,7 @@ void AccountMirrorStore::ensure_schema() {
     // dbo.Users.prime is a bigint -- SQLite INTEGER is 64-bit, so it holds the full range.
     add_column_if_missing(handle.db, "users_sync", "prime", "INTEGER NOT NULL DEFAULT 0");
     add_column_if_missing(handle.db, "users_sync", "prime_expired", "TEXT NULL");
+    add_column_if_missing(handle.db, "users_sync", "user_type", "INTEGER NOT NULL DEFAULT 0");
 }
 
 bool AccountMirrorStore::apply_event(const nlohmann::json& event) {

@@ -90,6 +90,12 @@ public:
      *  two accounts share. Same snapshot and filters as `is_valid`. */
     std::string user_id(const std::string& product, std::chrono::system_clock::time_point now);
 
+    /** 0.32.0: the account-type bitmask (`users_sync.user_type` = `dbo.Users.userType`: 1 registered, 2 paid,
+     *  4 scientist, 8 editor, 16 ai_agent, 32 admin) of a live account id, as `user_id` returns it or an MCP key names
+     *  it; 0 when the id is not live in the snapshot or its type has not arrived yet. Sent to docapi as
+     *  `X-Fish-User-Type`; it grants nothing here -- admin stays `access == 255` (`is_admin`). */
+    int user_type(const std::string& account_id, std::chrono::system_clock::time_point now);
+
     /** Rebuilds the snapshot now, ignoring the TTL. Startup calls this so a mirror that is missing,
      *  empty, or still dormant shows up in the log rather than only as a wall of unexplained 500s. */
     void refresh(std::chrono::system_clock::time_point now);
@@ -120,6 +126,7 @@ private:
         std::string id;  // empty when two accounts share the product
     };
     std::unordered_map<std::string, Account> products_;  // product -> superAdmin flag + account id
+    std::unordered_map<std::string, int> types_;  // live account id -> user_type bitmask (0.32.0)
     std::string last_error_;
     std::chrono::system_clock::time_point loaded_at_{};
     bool loaded_ = false;

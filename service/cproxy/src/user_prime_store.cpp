@@ -43,6 +43,18 @@ std::string utc_date(std::chrono::system_clock::time_point tp) {
     return std::format("{:%F}", std::chrono::floor<std::chrono::days>(tp));
 }
 
+/** True when the mirror's users_sync has the 0.32.0 user_type column. */
+bool has_user_type_column(sqlite3* db) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('users_sync') WHERE name = 'user_type'", -1,
+                           &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    const bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 }  // namespace
 
 UserPrimeStore::UserPrimeStore(std::string db_path, int cache_seconds)
@@ -98,6 +110,14 @@ bool UserPrimeStore::is_admin(const std::string& product,
     return it != products_.end() && it->second.admin;
 }
 
+int UserPrimeStore::user_type(const std::string& account_id, std::chrono::system_clock::time_point now) {
+    if (account_id.empty()) return 0;
+    refresh_if_stale(now);
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = types_.find(account_id);
+    return it == types_.end() ? 0 : it->second;
+}
+
 std::string UserPrimeStore::user_id(const std::string& product,
                                     std::chrono::system_clock::time_point now) {
     if (!all_digits(product)) return {};
@@ -127,6 +147,7 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
     const std::string today_date = utc_date(now);
 
     std::unordered_map<std::string, Account> products;
+    std::unordered_map<std::string, int> types;
     std::string error;
 
     SqliteDb handle;
@@ -144,15 +165,19 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
         // `s.access` rides along so the admin bit comes from the same row, under the same
         // suspended/deleted/expired filters, as the validity answer — an account that stops being
         // live stops being an admin in the same snapshot. `s.id` (0.30.0) is the account docapi is told.
-        static const char* const sql =
-            "SELECT s.prime, p.prime, s.access, s.id "
+        // `s.user_type` (0.32.0) is read only when the column exists: it is added by the RabbitMQ consumer's
+        // ensure_schema, which may run after this first load, and a mirror without it must keep authorising
+        // exactly as before -- a missing type is "unknown", never a reason to fail closed on every account.
+        const std::string sql = std::string(
+            "SELECT s.prime, p.prime, s.access, s.id, ") +
+            (has_user_type_column(handle.db) ? "s.user_type " : "0 ") +
             "FROM user_prime_sync p "
             "JOIN users_sync s ON s.id = p.user_id "
             "WHERE p.day_year IN (?, ?, ?) "
             "  AND p.prime > 0 AND s.prime > 0 "
             "  AND s.deleted = 0 AND s.suspended = 0 "
             "  AND (s.prime_expired IS NULL OR s.prime_expired = '' OR s.prime_expired >= ?)";
-        if (sqlite3_prepare_v2(handle.db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(handle.db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
             error = std::format("failed to query account mirror '{}': {}", db_path_,
                                 sqlite3_errmsg(handle.db));
         } else {
@@ -166,6 +191,7 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
                 const bool admin = sqlite3_column_int(stmt, 2) == kSuperAdminAccess;
                 const auto* id_text = sqlite3_column_text(stmt, 3);
                 std::string id = id_text == nullptr ? std::string() : reinterpret_cast<const char*>(id_text);
+                if (const int type = sqlite3_column_int(stmt, 4); !id.empty() && type > 0) types[id] = type;
                 auto [it, inserted] = products.emplace(
                     product_decimal(sqlite3_column_int64(stmt, 0), sqlite3_column_int64(stmt, 1)),
                     Account{admin, id});
@@ -184,6 +210,7 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
             if (rc != SQLITE_DONE) {
                 error = std::format("account mirror '{}' query did not complete cleanly", db_path_);
                 products.clear();
+                types.clear();
             }
         }
     }
@@ -193,6 +220,7 @@ void UserPrimeStore::load(std::chrono::system_clock::time_point now) {
     // previous snapshot, would let a mirror that has become unreadable keep authorising requests
     // indefinitely with nothing but a log line to say so.
     products_ = std::move(products);
+    types_ = std::move(types);
     last_error_ = error;
     loaded_at_ = now;
     loaded_day_ = today;

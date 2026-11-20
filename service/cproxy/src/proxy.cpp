@@ -305,6 +305,7 @@ bool iequals(const std::string& a, const std::string& b) {
  * (possibly spoofed) value would otherwise ride along next to ours. X-Fish-Role is the same case with
  * higher stakes: docapi trusts it outright, so a caller-supplied copy would be a self-service admin.
  * X-Fish-User (0.27.0) likewise: docapi records MCP writes under it, so a copy would be an impersonation.
+ * X-Fish-User-Type (0.32.0) too: it names the account type cproxy looked up, never one a caller chose.
  */
 bool is_unforwardable(const std::string& key) {
     static const char* const drop[] = {
@@ -312,7 +313,7 @@ bool is_unforwardable(const std::string& key) {
         "te", "trailer", "transfer-encoding", "upgrade", "host",
         "content-length", "content-type",
         "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-request-id",
-        "x-fish-role", "x-fish-user"};
+        "x-fish-role", "x-fish-user", "x-fish-user-type"};
     for (const char* d : drop) {
         if (iequals(key, d)) return true;
     }
@@ -1008,6 +1009,14 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
     // 0.30.0: the same header for a signed-in account's token. One source per request: the MCP path
     // never runs a token check, so at most one of the two is set.
     else if (!user_id.empty()) out.set_header("X-Fish-User", user_id.c_str());
+    // 0.32.0: that account's type bitmask (dbo.Users.userType, decimal) from the mirror, for whichever id was sent
+    // above. Absent for a guest and for an account whose type has not reached the mirror yet; an inbound copy was dropped.
+    if (const std::string& account = !mcp_user_id.empty() ? mcp_user_id : user_id;
+        !account.empty() && state.user_prime_store.has_value()) {
+        if (const int type = state.user_prime_store->user_type(account, state.clock.now()); type > 0) {
+            out.set_header("X-Fish-User-Type", std::to_string(type).c_str());
+        }
+    }
 
     // A 304 has no body (RFC 9110 §15.4.5), but the pinned httplib (v0.15.3) only knows that about
     // 204: for a 304 sent without Content-Length -- which is how Kestrel sends one -- it reads
