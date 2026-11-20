@@ -9,7 +9,7 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
-- 2026-11-19: **Unreleased — `requests` in every status message:** the number of proxied requests since the process started, so the admin status page (`stats/Default.aspx`) can show requests per hour / day / month. A running total, not a per-heartbeat delta, so a lost or superseded heartbeat loses no count; adminservice 0.2.0 turns it into 5-minute buckets (`dbo.ServiceRequestCount`). An older adminservice ignores the field.
+- 2026-11-20: **0.31.0 — `requests` in every status message:** the number of proxied requests since the process started, so the admin status page (`stats/Default.aspx`) can show requests per hour / day / month. A running total, not a per-heartbeat delta, so a lost or superseded heartbeat loses no count; adminservice 0.2.0 turns it into 5-minute buckets (`dbo.ServiceRequestCount`). An older adminservice ignores the field.
 
 - 2026-11-17: **0.30.0 (DEPLOYED 2026-11-17, digest `73cb0c75…c2cb`; rollback 0.29.0 `70725d40…f7be`, droplet `/opt/cproxy/compose.yml.bak-pre-0.30.0`) — the signed-in account crosses to docapi as `X-Fish-User`.** For the
   Android app's catch log (docapi 1.36.0 `/api/v1/catch/*`), docapi must know whose token it is. `UserPrimeStore` now
