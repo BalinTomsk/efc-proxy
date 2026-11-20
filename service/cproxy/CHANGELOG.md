@@ -9,6 +9,16 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-11-21: **0.32.0 (DEPLOYED 2026-11-21, digest `e39ae4f7…537e`; rollback 0.31.0 `bc2bd2e9…efa5`, droplet `/opt/cproxy/compose.yml.bak-pre-0.32.0`) — the account type crosses to docapi as `X-Fish-User-Type`.** `dbo.Users.userType` (envfish-db),
+  a bitmask (`1` registered, `2` paid, `4` scientist, `8` editor, `16` ai_agent, `32` admin, any combination), now rides
+  the users-sync event as `userType`, lands in the mirror's new `users_sync.user_type INTEGER` column (added in place by
+  `ensure_schema`), and is forwarded in decimal for whichever account
+  `X-Fish-User` names (signed-in token or self-service MCP key). Absent for a guest and for an account whose type has not
+  arrived yet; an inbound copy is dropped. It grants nothing in cproxy: admin is still `access == 255`, which the database
+  now keeps identical to the admin bit. A mirror without the column keeps authorising as before (the type reads
+  as unknown). Needs the frontend dispatcher that sends `userType`; an older one leaves the type empty. No config change.
+  Tests: 13/13 ctest in the Docker build stage (+1 `user_prime_store_test`, +1 `proxy_test`, mirror migration extended).
+
 - 2026-11-20: **0.31.0 — `requests` in every status message:** the number of proxied requests since the process started, so the admin status page (`stats/Default.aspx`) can show requests per hour / day / month. A running total, not a per-heartbeat delta, so a lost or superseded heartbeat loses no count; adminservice 0.2.0 turns it into 5-minute buckets (`dbo.ServiceRequestCount`). An older adminservice ignores the field.
 
 - 2026-11-17: **0.30.0 (DEPLOYED 2026-11-17, digest `73cb0c75…c2cb`; rollback 0.29.0 `70725d40…f7be`, droplet `/opt/cproxy/compose.yml.bak-pre-0.30.0`) — the signed-in account crosses to docapi as `X-Fish-User`.** For the

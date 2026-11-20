@@ -367,6 +367,15 @@ blocks a request: `/news/list` stays open, and a token that does not verify is j
 only ever be given the first 100 rows; a user or admin is forwarded untouched. The account
 mirror is opened whenever a JWT secret is configured.
 
+### Account type — `X-Fish-User-Type` (0.32.0)
+
+When a request names an account in `X-Fish-User` (a signed-in token, or a self-service MCP key), it also carries
+that account's type **bitmask** from the mirror, in decimal (`dbo.Users.userType`, delivered by the users-sync stream
+as `userType`): `1` registered, `2` paid, `4` scientist, `8` editor, `16` ai_agent, `32` admin, combined (e.g. `6` =
+paid + scientist; an admin is always at least `46`). Absent for a guest, and for an account whose type has not reached
+the mirror yet. Any copy a caller sends is dropped. It grants nothing here; admin is still `access == 255`, which the
+database keeps identical to the admin bit.
+
 ## MCP path (0.20.0)
 
 docapi 1.20.0 serves a read-only Model Context Protocol endpoint (`POST /api/v1/mcp`) for Claude Code and

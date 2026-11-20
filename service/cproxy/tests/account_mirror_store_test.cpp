@@ -236,7 +236,7 @@ void migrates_prime_columns_onto_an_existing_mirror() {
                   {"email", "legacy@example.test"}, {"lastVisit", "2026-09-05T11:00:00Z"},
                   {"access", 0}, {"suspended", false}, {"authType", "Local"},
                   {"deleted", false}, {"deletedUtc", nullptr},
-                  {"prime", 1000039}, {"primeExpired", "2027-09-05"}}}
+                  {"prime", 1000039}, {"primeExpired", "2027-09-05"}, {"userType", 12}}}
     };
     CHECK(store.apply_event(event));
 
@@ -248,6 +248,12 @@ void migrates_prime_columns_onto_an_existing_mirror() {
     CHECK(sqlite3_step(stmt) == SQLITE_ROW);
     CHECK(sqlite3_column_int64(stmt, 0) == 1000039);
     CHECK(std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))) == "2027-09-05");
+    sqlite3_finalize(stmt);
+    // 0.32.0: user_type is migrated onto the old mirror too, and the event's userType lands in it.
+    CHECK(sqlite3_prepare_v2(db, "SELECT user_type FROM users_sync WHERE id = 'legacy-user-1'",
+                             -1, &stmt, nullptr) == SQLITE_OK);
+    CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    CHECK(sqlite3_column_int(stmt, 0) == 12);  // scientist + editor
     sqlite3_finalize(stmt);
     sqlite3_close(db);
 

@@ -288,8 +288,36 @@ void a_product_two_accounts_share_names_nobody() {
     std::remove(path.c_str());
 }
 
+// --- Account type (0.32.0) -----------------------------------------------------------------------
+// The type of a live account rides to docapi as X-Fish-User-Type; a mirror without the column still works.
+
+void a_live_account_has_its_type_and_an_old_mirror_has_none() {
+    const std::string path = "user_prime_store_test_types.sqlite";
+    write_mirror(path, {{"0190aaaa-0000-7000-8000-000000000001", 1000003, 104729, kSep8},
+                        {"suspended", 1000033, 104743, kSep8, /*suspended=*/1}});
+    const auto now = at(2026, 9, 8);
+    {
+        UserPrimeStore old_mirror(path, 60);  // no user_type column yet: still valid, type unknown
+        CHECK(old_mirror.is_valid("104729314187", now));
+        CHECK(old_mirror.user_type("0190aaaa-0000-7000-8000-000000000001", now) == 0);
+    }
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
+    exec(db, "ALTER TABLE users_sync ADD COLUMN user_type INTEGER NOT NULL DEFAULT 0");
+    exec(db, "UPDATE users_sync SET user_type = 6");  // paid + scientist
+    sqlite3_close(db);
+
+    UserPrimeStore store(path, 60);
+    CHECK(store.user_type("0190aaaa-0000-7000-8000-000000000001", now) == 6);
+    CHECK(store.user_type("suspended", now) == 0);  // not live
+    CHECK(store.user_type("unknown", now) == 0);
+    CHECK(store.user_type("", now) == 0);
+    std::remove(path.c_str());
+}
+
 int main() {
     the_product_of_the_two_primes_identifies_the_account();
+    a_live_account_has_its_type_and_an_old_mirror_has_none();
     a_product_past_2_to_the_63_still_matches();
     suspended_deleted_unallocated_and_expired_accounts_do_not_match();
     the_day_window_spans_yesterday_today_and_tomorrow();

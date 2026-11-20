@@ -453,12 +453,13 @@ void write_admin_mirror(const std::string& path) {
          " last_visit TEXT NOT NULL DEFAULT '', access INTEGER NOT NULL DEFAULT 0,"
          " suspended INTEGER NOT NULL DEFAULT 0, auth_type TEXT NOT NULL DEFAULT '',"
          " deleted INTEGER NOT NULL DEFAULT 0, deleted_utc TEXT NULL,"
-         " prime INTEGER NOT NULL DEFAULT 0, prime_expired TEXT NULL, updated_utc TEXT NOT NULL)");
+         " prime INTEGER NOT NULL DEFAULT 0, prime_expired TEXT NULL, updated_utc TEXT NOT NULL,"
+         " user_type INTEGER NOT NULL DEFAULT 0)");
     exec("CREATE TABLE user_prime_sync (user_id TEXT NOT NULL, day_year INTEGER NOT NULL,"
          " prime INTEGER NOT NULL DEFAULT 0, updated_utc TEXT NOT NULL,"
          " PRIMARY KEY (user_id, day_year))");
-    exec("INSERT INTO users_sync (id, prime, access, updated_utc) VALUES"
-         " ('admin', 1000003, 255, 'x'), ('plain', 1000033, 0, 'x')");
+    exec("INSERT INTO users_sync (id, prime, access, updated_utc, user_type) VALUES"
+         " ('admin', 1000003, 255, 'x', 47), ('plain', 1000033, 0, 'x', 5)");
     exec("BEGIN");
     for (int day = 1; day <= 365; ++day) {
         exec("INSERT INTO user_prime_sync VALUES ('admin', " + std::to_string(day) + ", 104729, 'x')");
@@ -2349,6 +2350,8 @@ void install_app_upstream(httplib::Server& s, std::atomic<int>& calls) {
         res.set_header("X-Got-Proto", req.get_header_value("X-Forwarded-Proto"));
         res.set_header("X-Got-User", req.get_header_value("X-Fish-User"));
         res.set_header("X-Got-User-Count", std::to_string(req.get_header_value_count("X-Fish-User")));
+        res.set_header("X-Got-Type", req.get_header_value("X-Fish-User-Type"));
+        res.set_header("X-Got-Type-Count", std::to_string(req.get_header_value_count("X-Fish-User-Type")));
         res.set_content(req.method + " " + req.target + " " + req.body, "application/json");
     };
     s.Get(R"(/.*)", handler);
@@ -2454,6 +2457,26 @@ void the_signed_in_account_crosses_as_x_fish_user() {
     // An anonymous (no user claim) token is a guest: nothing crosses.
     auto anon = plain.Get("/api/v1/fish/search", {{"Authorization", bearer(mint_token("TEST-DAY-KEY"))}});
     CHECK(anon && anon->get_header_value("X-Got-User-Count") == "0");
+}
+
+void the_signed_in_account_type_crosses_as_x_fish_user_type() {
+    // 0.32.0: the account's type (dbo.Users.userType) from the mirror, once; a spoofed copy never crosses.
+    SignedInFixture fx("proxy_app_type");
+    auto client = fx.client();
+    auto& cli = *client;
+    httplib::Headers user = {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kPlainProduct))}};
+    user.emplace("X-Fish-User-Type", "47");
+    auto read = cli.Get("/api/v1/catch/mine", user);
+    CHECK(read && read->status == 200);
+    CHECK(read->get_header_value("X-Got-Type") == "5");  // registered + scientist
+    CHECK(read->get_header_value("X-Got-Type-Count") == "1");
+    auto admin = cli.Get("/api/v1/catch/mine", {{"Authorization", bearer(mint_token("TEST-DAY-KEY", kAdminProduct))}});
+    CHECK(admin && admin->get_header_value("X-Got-Type") == "47");
+
+    httplib::Client plain("127.0.0.1", fx.proxy.port);
+    auto guest = plain.Get("/api/v1/fish/search", {{"X-Fish-User-Type", "8"}});
+    CHECK(guest && guest->status == 200);
+    CHECK(guest->get_header_value("X-Got-Type-Count") == "0");
 }
 
 void anyone_else_is_told_to_sign_in() {
@@ -2569,6 +2592,7 @@ int main() {
     the_mcp_path_and_the_public_paths_share_one_tls_listener();
     a_signed_in_caller_gets_the_whole_api_over_tls();
     the_signed_in_account_crosses_as_x_fish_user();
+    the_signed_in_account_type_crosses_as_x_fish_user_type();
     anyone_else_is_told_to_sign_in();
     public_paths_stay_anonymous_beside_the_signed_in_api();
     std::cout << "proxy_test: all assertions passed\n";
