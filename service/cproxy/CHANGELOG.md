@@ -9,7 +9,7 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
-- 2026-11-21: **0.32.0 — the account type crosses to docapi as `X-Fish-User-Type`.** `dbo.Users.userType` (envfish-db),
+- 2026-11-21: **0.32.0 (DEPLOYED 2026-11-21, digest `e39ae4f7…537e`; rollback 0.31.0 `bc2bd2e9…efa5`, droplet `/opt/cproxy/compose.yml.bak-pre-0.32.0`) — the account type crosses to docapi as `X-Fish-User-Type`.** `dbo.Users.userType` (envfish-db),
   a bitmask (`1` registered, `2` paid, `4` scientist, `8` editor, `16` ai_agent, `32` admin, any combination), now rides
   the users-sync event as `userType`, lands in the mirror's new `users_sync.user_type INTEGER` column (added in place by
   `ensure_schema`), and is forwarded in decimal for whichever account

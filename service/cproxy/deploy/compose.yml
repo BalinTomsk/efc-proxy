@@ -3,12 +3,12 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:d647c70e185e14d768f1b92e5d8b0bb7641ad018d545539663442ba23da8b77c  # 0.25.0 pinned by digest (rollback: 0.24.0 = sha256:9afcaec910bf9c290397356f32d5310c6277761df888dbac4afed5f0c6fe4f8f)
+    image: ghcr.io/balintomsk/cproxy@sha256:e39ae4f71a00d85e146070e68f09f1d5f107d3a579437d5149e8d523cbb8537e  # 0.32.0 pinned by digest (rollback: previous 0.31.0 = sha256:bc2bd2e9175b99da830ac61c56c2da8196bf2b54cdf7158e531fab37cd4eefa5)
     container_name: cproxy
     restart: unless-stopped
     ports:
       - "80:8080"                                        # public edge; inbound restricted by cproxy-firewall.service (DOCKER-USER allowlist)
-      - "443:8443"                                       # MCP over HTTPS (0.20.0): /health + CPROXY_MCP_PATH only; opened to everyone by PUBLIC_TCP_PORTS in cproxy-firewall.service
+      - "443:8443"                                       # HTTPS: /health, CPROXY_MCP_PATH (0.20.0) and, for a signed-in caller, every /api route (0.29.0); opened to everyone by PUBLIC_TCP_PORTS in cproxy-firewall.service
     environment:
       # CPROXY_DOCAPI_UPSTREAM is deliberately NOT set here. This repo is public, so the docapi VPC
       # address cannot live in a tracked file — and this file is deployed VERBATIM to
@@ -43,6 +43,19 @@ services:
       CPROXY_TLS_PORT: "8443"
       CPROXY_TLS_CERT: /etc/cproxy/tls/fullchain.pem
       CPROXY_TLS_KEY: /etc/cproxy/tls/privkey.pem
+      # Public app surface (0.28.0): the reads the Android app needs, served to anyone on the TLS
+      # listener above (phones cannot reach the allowlisted port 80). GET only, each peer address
+      # rate-limited (120/min, burst 40), and an anonymous 200 replayed from a 60 s in-memory cache so
+      # a crowd of phones costs docapi one call per path per minute. Every other guard still runs, so
+      # a gated path listed here would still need its token. An entry ending in "/" is a prefix;
+      # matching is case-sensitive. Fish species (/fish) is deliberately absent: fish data is admin-only.
+      # The plain port is unchanged. Rollback without a redeploy: delete this line, compose up -d.
+      # Signed-in app access (0.29.0): the TLS listener also forwards EVERY /api/ route -- the same API
+      # the plain port serves -- to a caller whose Bearer token verifies and names a live account (the
+      # app gets it from the site's Account/MobileSession.ashx after a Google sign-in). Anyone else gets
+      # 401 + WWW-Authenticate. Same per-address rate limit as the public paths; nothing is cached for a
+      # signed-in caller. Rollback without a redeploy: delete this line, compose up -d.
+      CPROXY_TLS_API: USER
       # Raised from the compiled-in 1 MiB default (2026-09-15, at the user's request). AddNews.aspx's
       # photo-upload PATCH sends a base64-encoded image (+~33% over the raw file) as the request body;
       # a real phone photo up to ~5MB was hitting the old 1 MiB cap as a plain 413 before reaching
