@@ -578,7 +578,25 @@ takes its own credential instead. Deploy prerequisites are in `docs/do-update.md
 - **Verified 2026-09-30**: 11/11 ctest in the build stage; end to end in the Rancher VM against the docapi
   1.20.0 image (see CHANGELOG 0.20.0).
 
-### Public app surface (0.28.0 — DEPLOYED 2026-11-11, digest `3d355d6e…decdf`; list REMOVED from prod 2026-11-13)
+### The Android app moved to mproxy (0.33.0 — built 2026-11-22, NOT deployed)
+
+The two sections below are history. 0.33.0 deletes the app surface from the code: `CPROXY_TLS_API`, `CPROXY_PUBLIC_*`,
+`Surface::Public/SignedIn`, the public limiter and `ResponseCache`. The TLS listener is `/health` + MCP only again, and
+`CPROXY_TLS_PORT` needs `CPROXY_MCP_PATH`. A leftover retired variable logs a WARN. The app now calls **mproxy**
+(`C:\envoinx\fishfind\efc-mobilr-proxy\service\mproxy`), same droplet, HTTPS **8443**, docapi only, signed-in only.
+
+- **mproxy reads this container's files** under `/mnt/volume_cnode/cproxy/`: `cloudranges/auth.sqlite` (the account
+  mirror), `cloudranges/cloudranges.sqlite`, `daykeys/daykeys.sqlite`, `master.key`, `tls/`. It never writes them and runs
+  no RabbitMQ consumer, so cproxy stays the only reader of the users-sync queue and the only writer of the mirror.
+  **Moving or renaming any of those paths breaks mproxy too.**
+- The certbot deploy hook must restart `mproxy` as well as `cproxy`; the firewall unit opens `443,8443`.
+- **Deploy order: mproxy → app release → cproxy 0.33.0.** mproxy's `docs/do-update.md` is the single source of truth
+  for the order and the mproxy steps. Deploying 0.33.0 first would 404 every installed app build.
+- Shared modules (`breaker`, `clock_offset`, `cloud_range_store`, `day_key_store`, `dotenv`, `jwt_verifier`, `log`,
+  `rate_limiter`, `secret_codec`, `service_status`, `user_prime_store`) are copied into mproxy under namespace `mproxy`.
+  A fix to one of them belongs in both repos.
+
+### Public app surface (0.28.0 — DEPLOYED 2026-11-11, digest `3d355d6e…decdf`; list REMOVED from prod 2026-11-13; code REMOVED 0.33.0)
 
 **2026-11-13: `CPROXY_PUBLIC_PATHS` deleted from `/opt/cproxy/compose.yml`** (backup `compose.yml.bak-0.29.0-public`) once
 the app signed in; startup `"public":"off"`, anonymous HTTPS calls 401, the signed-in app's news list 200. The code below
@@ -617,7 +635,7 @@ gated news home page, not documents, not `/newsidx`.
   copied. Harmless on its own (response_cache is not in CMake there), but the branch
   `cproxy-0.28.0-public-app-surface` is what completes it.
 
-### Signed-in app access (0.29.0 — DEPLOYED 2026-11-11, digest `70725d40…f7be`; rollback `compose.yml.bak-0.28.0`)
+### Signed-in app access (0.29.0 — DEPLOYED 2026-11-11, digest `70725d40…f7be`; code REMOVED 0.33.0, moved to mproxy)
 
 User decision 2026-11-11: the app uses the EXISTING API with a web-account token, not MCP and not an
 anonymous surface. `CPROXY_TLS_API=USER` (in `deploy/compose.yml`): the TLS listener forwards every

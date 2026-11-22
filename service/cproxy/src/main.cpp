@@ -89,7 +89,7 @@ int main() {
     // Declared before install_routes so it outlives the handlers that capture a pointer to it.
     cproxy::CloudRangeStore cloud_ranges;
 
-    // The HTTPS listener for the MCP path (0.20.0). A certificate that will not load disables THIS
+    // The HTTPS listener for the MCP path (0.20.0; the app's surface on it moved to mproxy in 0.33.0). A certificate that will not load disables THIS
     // listener only, loudly; the plain edge the portal depends on must never go down with it.
     std::unique_ptr<httplib::SSLServer> tls_server;
     if (cfg.tls_enabled()) {
@@ -122,7 +122,6 @@ int main() {
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
         "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"tls\":\"{}\","
-        "\"public\":\"{}\",\"tls_api\":\"{}\","
         "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.waterapi_enabled() ? std::format("{} -> {}", cfg.waterapi_prefix, cfg.waterapi_upstream)
@@ -157,13 +156,6 @@ int main() {
                           cfg.mcp_burst)
             : std::string("off"),
         tls_server ? std::format("{}:{}", cfg.listen_addr, cfg.tls_port) : std::string("off"),
-        // How many paths, never which: the list is long, and the count is what changes on a deploy.
-        cfg.public_enabled()
-            ? std::format("{} paths (tls only, {}/min burst {} per address, cache {}s)",
-                          cfg.public_paths.size(), cfg.public_rate_per_minute, cfg.public_burst,
-                          cfg.public_cache_seconds)
-            : std::string("off"),
-        cfg.tls_api_signed_in ? "every route, signed-in callers only" : "off",
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
     // Without a secret no token can be verified, and since 0.13.0 there is no other credential, so
@@ -188,6 +180,18 @@ int main() {
         cproxy::log_raw(
             "{\"service\":\"cproxy\",\"level\":\"WARN\",\"msg\":\"CPROXY_JWT_REQUIRED is set but "
             "ignored: X-Day-Guid was removed in 0.13.0 and a bearer JWT is the only credential\"}");
+    }
+
+    // 0.33.0 moved the Android app to its own edge (mproxy, efc-mobilr-proxy). A leftover switch from the
+    // old app surface is ignored; say so, so nobody reads it as still in force.
+    for (const char* retired : {"CPROXY_TLS_API", "CPROXY_PUBLIC_PATHS", "CPROXY_PUBLIC_RATE_PER_MINUTE",
+                                "CPROXY_PUBLIC_BURST", "CPROXY_PUBLIC_CACHE_SECONDS", "CPROXY_PUBLIC_CACHE_MAX_BYTES"}) {
+        if (env(retired).has_value()) {
+            cproxy::log_raw(std::format(
+                "{{\"service\":\"cproxy\",\"level\":\"WARN\",\"msg\":\"{} is set but ignored: the app "
+                "surface moved to mproxy in 0.33.0\"}}",
+                retired));
+        }
     }
 
     std::thread tls_thread;

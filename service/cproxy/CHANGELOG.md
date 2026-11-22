@@ -9,6 +9,20 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-11-22: **0.33.0 (built, not deployed) — the Android app moves to its own edge, mproxy.** The app surface is
+  deleted from cproxy: the signed-in HTTPS API (`CPROXY_TLS_API=USER`, 0.29.0), the anonymous public paths
+  (`CPROXY_PUBLIC_PATHS` and `CPROXY_PUBLIC_RATE_PER_MINUTE` / `_BURST` / `_CACHE_SECONDS` / `_CACHE_MAX_BYTES`, 0.28.0)
+  and their response cache (`response_cache.*`). The HTTPS listener serves only `/health` and the MCP path again, and
+  `CPROXY_TLS_PORT` needs `CPROXY_MCP_PATH`. A leftover retired variable is ignored with a startup WARN. The app now
+  calls **mproxy** (repository `efc-mobilr-proxy`, `service/mproxy`): same host, HTTPS on its own port, docapi only,
+  signed-in callers only, reading this service's account mirror and cloud ranges read-only (it runs no RabbitMQ
+  consumer, so this service stays the only reader of the users-sync queue). `deploy/compose.yml` drops
+  `CPROXY_TLS_API`; `deploy/cproxy-firewall.service` opens mproxy's port beside 443. Plain listener, MCP, the day-key gate,
+  `X-Fish-*` headers: unchanged. **Deploy only after mproxy is live and the app release that uses it is out**; until
+  then an old app build would get 404. Tests: 12/12 ctest in the Docker build stage (`response_cache_test` removed;
+  `proxy_test` drops the public/signed-in cases and adds `the_tls_listener_no_longer_serves_the_app`; `config_test`
+  replaces the public/TLS-API cases with `the_retired_app_switches_are_no_longer_read`).
+
 - 2026-11-21: **0.32.0 (DEPLOYED 2026-11-21, digest `e39ae4f7…537e`; rollback 0.31.0 `bc2bd2e9…efa5`, droplet `/opt/cproxy/compose.yml.bak-pre-0.32.0`) — the account type crosses to docapi as `X-Fish-User-Type`.** `dbo.Users.userType` (envfish-db),
   a bitmask (`1` registered, `2` paid, `4` scientist, `8` editor, `16` ai_agent, `32` admin, any combination), now rides
   the users-sync event as `userType`, lands in the mirror's new `users_sync.user_type INTEGER` column (added in place by
