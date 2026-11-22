@@ -578,7 +578,7 @@ takes its own credential instead. Deploy prerequisites are in `docs/do-update.md
 - **Verified 2026-09-30**: 11/11 ctest in the build stage; end to end in the Rancher VM against the docapi
   1.20.0 image (see CHANGELOG 0.20.0).
 
-### The Android app moved to mproxy (0.33.0 — built 2026-11-22, NOT deployed)
+### The Android app moved to mproxy (0.33.0 — DEPLOYED 2026-11-22, digest `54d918dd…4e17`; mproxy 0.1.0 live since the same day)
 
 The two sections below are history. 0.33.0 deletes the app surface from the code: `CPROXY_TLS_API`, `CPROXY_PUBLIC_*`,
 `Surface::Public/SignedIn`, the public limiter and `ResponseCache`. The TLS listener is `/health` + MCP only again, and
