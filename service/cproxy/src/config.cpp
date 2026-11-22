@@ -253,6 +253,7 @@ Config load_config(const EnvLookup& env) {
         cfg.mcp_path = to_upper(mcp) == "NONE" ? std::string{} : normalize_gate_path(mcp);
         if (cfg.mcp_path == "/") cfg.mcp_path.clear();
     }
+    cfg.mcp_upstream = get_str(env, "CPROXY_MCP_UPSTREAM", cfg.mcp_upstream);
     cfg.mcp_keys_db_path = get_str(env, "CPROXY_MCP_KEYS_DB", cfg.mcp_keys_db_path);
     cfg.mcp_keys_reload_seconds =
         get_int(env, "CPROXY_MCP_KEYS_RELOAD_SECONDS", cfg.mcp_keys_reload_seconds);
@@ -499,6 +500,9 @@ std::vector<std::string> validate_config(const Config& cfg) {
             errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_NEWSIDX_PREFIX");
         if (cfg.routes_to_newssearch(cfg.mcp_path))
             errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_NEWSSEARCH_PREFIX");
+        if (cfg.mcp_upstream_enabled() && cfg.mcp_upstream.rfind("http://", 0) != 0 &&
+            cfg.mcp_upstream.rfind("https://", 0) != 0)
+            errors.push_back("CPROXY_MCP_UPSTREAM must start with http:// or https://");
         if (cfg.mcp_rate_per_minute <= 0) errors.push_back("CPROXY_MCP_RATE_PER_MINUTE must be positive");
         if (cfg.mcp_burst <= 0) errors.push_back("CPROXY_MCP_BURST must be positive");
         if (cfg.mcp_max_payload_bytes <= 0)

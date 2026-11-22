@@ -89,6 +89,9 @@ struct ProxyState {
     CircuitBreaker news_breaker;
     // The news_search route's own breaker (0.25.0): news_search is on csnode, beside waterapi.
     CircuitBreaker search_breaker;
+    // The MCP route's own breaker (0.34.0): mcp-env is a separate container, and its outage must not
+    // fail-fast docapi traffic (nor a docapi outage fail-fast mcp-env, which then answers tool errors itself).
+    CircuitBreaker mcp_breaker;
     Metrics metrics;
     // Loaded best-effort: a missing/malformed day-key database must not take down the ungated GET
     // surface, so a load failure here just leaves this empty — every gated request then fails closed
@@ -150,7 +153,8 @@ struct ProxyState {
         : breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
           water_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
           news_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
-          search_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
+          search_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
+          mcp_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
         if (shared_ranges != nullptr) cloud_ranges = shared_ranges;
         if (!cfg.daykey_db_path.empty()) {
             try {
@@ -633,7 +637,8 @@ struct Upstream {
  * form both upstreams route on), after the dot-dot rejection, so a request cannot be re-pointed at
  * the other upstream once chosen.
  */
-Upstream select_upstream(const Config& cfg, ProxyState& state, const httplib::Request& req) {
+Upstream select_upstream(const Config& cfg, ProxyState& state, const httplib::Request& req, bool mcp) {
+    if (mcp && cfg.mcp_upstream_enabled()) return {"mcp-env", cfg.mcp_upstream, state.mcp_breaker};
     if (cfg.routes_to_waterapi(req.path)) return {"waterapi", cfg.waterapi_upstream, state.water_breaker};
     if (cfg.routes_to_newsidx(req.path)) return {"news_idx", cfg.newsidx_upstream, state.news_breaker};
     if (cfg.routes_to_newssearch(req.path)) return {"news_search", cfg.newssearch_upstream, state.search_breaker};
@@ -808,7 +813,7 @@ void proxy_to_docapi(const Config& cfg, ProxyState& state, const httplib::Reques
         target = cap_guest_news_list(target);
     }
 
-    const Upstream upstream = select_upstream(cfg, state, req);
+    const Upstream upstream = select_upstream(cfg, state, req, mcp);
     service_activity().record(std::format("{} {} -> {}", req.method, route_family(req.path), upstream.name));
 
     // Fail fast while the breaker is open: an outage would otherwise make every request pay the
@@ -1032,9 +1037,13 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
             cfg.newssearch_enabled()
                 ? std::format(",\"news_search\":\"{}\"", to_string(state->search_breaker.state(now)))
                 : std::string{};
+        const std::string mcp =
+            cfg.mcp_upstream_enabled()
+                ? std::format(",\"mcp_env\":\"{}\"", to_string(state->mcp_breaker.state(now)))
+                : std::string{};
         res.set_content(
-            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"{}{}{}}}",
-                        ready ? "UP" : "DOWN", to_string(s), water, news, search),
+            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"{}{}{}{}}}",
+                        ready ? "UP" : "DOWN", to_string(s), water, news, search, mcp),
             "application/json");
     });
 

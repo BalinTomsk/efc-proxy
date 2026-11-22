@@ -3,12 +3,12 @@
 # Only private VPC addresses appear here; the public edge is restricted by cproxy-firewall.service.
 services:
   cproxy:
-    image: ghcr.io/balintomsk/cproxy@sha256:e39ae4f71a00d85e146070e68f09f1d5f107d3a579437d5149e8d523cbb8537e  # 0.32.0 pinned by digest (rollback: previous 0.31.0 = sha256:bc2bd2e9175b99da830ac61c56c2da8196bf2b54cdf7158e531fab37cd4eefa5)
+    image: ghcr.io/balintomsk/cproxy@sha256:698ddb1f1ef05b63b8c2d1c23273a460b3389121f26f0f799938dcf0542ce0ae  # 0.34.0 pinned by digest (rollback: previous 0.33.0 = sha256:54d918dd2a1294d16548a0f8340bc4fc622ab5516c8e2e26d965a78383934e17)
     container_name: cproxy
     restart: unless-stopped
     ports:
       - "80:8080"                                        # public edge; inbound restricted by cproxy-firewall.service (DOCKER-USER allowlist)
-      - "443:8443"                                       # HTTPS: /health, CPROXY_MCP_PATH (0.20.0) and, for a signed-in caller, every /api route (0.29.0); opened to everyone by PUBLIC_TCP_PORTS in cproxy-firewall.service
+      - "443:8443"                                       # HTTPS: /health and CPROXY_MCP_PATH only (0.33.0: the Android app moved to mproxy on 8443); opened to everyone by PUBLIC_TCP_PORTS in cproxy-firewall.service
     environment:
       # CPROXY_DOCAPI_UPSTREAM is deliberately NOT set here. This repo is public, so the docapi VPC
       # address cannot live in a tracked file — and this file is deployed VERBATIM to
@@ -35,6 +35,11 @@ services:
       # It is served ONLY on the TLS listener below; the plain port answers it 404 (the key must not
       # cross the internet in clear text). Rollback without a redeploy: delete these lines, compose up.
       CPROXY_MCP_PATH: /api/v1/mcp
+      # 0.34.0: the MCP server is its own service now, mcp-env (C++23), in a container beside this one on the private
+      # Docker network fishfind-mcp (no published port). cproxy still checks the key, rate-limits, serves it on TLS only
+      # and stamps X-Fish-Role / X-Fish-User; only the destination changed (docapi 1.43.0 has no MCP endpoint).
+      # Rollback to docapi's MCP: delete this line AND roll docapi back to 1.42.0.
+      CPROXY_MCP_UPSTREAM: http://mcp-env:8080
       CPROXY_MCP_KEYS_DB: /etc/cproxy/mcpkeys/mcpkeys.sqlite
       # TLS is terminated IN cproxy, not by a proxy in front -- anything in front would replace the
       # real peer address that the datacenter block and every log line depend on. The certificate is
@@ -43,19 +48,9 @@ services:
       CPROXY_TLS_PORT: "8443"
       CPROXY_TLS_CERT: /etc/cproxy/tls/fullchain.pem
       CPROXY_TLS_KEY: /etc/cproxy/tls/privkey.pem
-      # Public app surface (0.28.0): the reads the Android app needs, served to anyone on the TLS
-      # listener above (phones cannot reach the allowlisted port 80). GET only, each peer address
-      # rate-limited (120/min, burst 40), and an anonymous 200 replayed from a 60 s in-memory cache so
-      # a crowd of phones costs docapi one call per path per minute. Every other guard still runs, so
-      # a gated path listed here would still need its token. An entry ending in "/" is a prefix;
-      # matching is case-sensitive. Fish species (/fish) is deliberately absent: fish data is admin-only.
-      # The plain port is unchanged. Rollback without a redeploy: delete this line, compose up -d.
-      # Signed-in app access (0.29.0): the TLS listener also forwards EVERY /api/ route -- the same API
-      # the plain port serves -- to a caller whose Bearer token verifies and names a live account (the
-      # app gets it from the site's Account/MobileSession.ashx after a Google sign-in). Anyone else gets
-      # 401 + WWW-Authenticate. Same per-address rate limit as the public paths; nothing is cached for a
-      # signed-in caller. Rollback without a redeploy: delete this line, compose up -d.
-      CPROXY_TLS_API: USER
+      # The Android app's surface (0.28.0 public paths, 0.29.0 CPROXY_TLS_API=USER) moved to its own edge in
+      # 0.33.0: mproxy (efc-mobilr-proxy), same droplet, port 8443, /opt/mproxy/compose.yml. It reads this
+      # container's account mirror and cloud ranges. Do not add CPROXY_TLS_API back: 0.33.0 ignores it (WARN).
       # Raised from the compiled-in 1 MiB default (2026-09-15, at the user's request). AddNews.aspx's
       # photo-upload PATCH sends a base64-encoded image (+~33% over the raw file) as the request body;
       # a real phone photo up to ~5MB was hitting the old 1 MiB cap as a plain 413 before reaching
@@ -159,9 +154,13 @@ services:
       # replacement (a new or revoked key) would never be seen inside the container.
       - /mnt/volume_cnode/cproxy/mcpkeys:/etc/cproxy/mcpkeys:ro
       - /mnt/volume_cnode/cproxy/tls:/etc/cproxy/tls:ro     # fullchain.pem + privkey.pem, uid 10001, 0400
+    # default = the compose project's own network (unchanged); fishfind-mcp = the private network shared with mcp-env.
+    networks: [default, fishfind-mcp]
     read_only: true                                      # binary writes only to the two rw bind mounts
     cap_drop: [ALL]                                      # binds unprivileged 8080/8443 in-container; needs no capabilities
     security_opt:
       - no-new-privileges:true
 
-
+networks:
+  fishfind-mcp:
+    external: true   # created once on the droplet: docker network create fishfind-mcp (mcp-env joins it too)
