@@ -8,9 +8,10 @@ Requires=docker.service
 
 [Service]
 Type=oneshot
-# Host ports open to every address (0.20.0): 443 is the MCP TLS listener, which checks its own keys.
+# Host ports open to every address: 443 is cproxy's MCP TLS listener (0.20.0), which checks its own keys;
+# 8443 is mproxy, the Android app's HTTPS edge (efc-mobilr-proxy), which requires a signed-in token.
 # Port 80 is NOT here -- it stays restricted to the allow file.
-Environment=PUBLIC_TCP_PORTS=443
+Environment=PUBLIC_TCP_PORTS=443,8443
 ExecStart=/usr/local/sbin/cproxy-firewall.sh
 RemainAfterExit=yes
 
