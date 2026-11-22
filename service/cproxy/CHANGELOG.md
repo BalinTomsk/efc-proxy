@@ -9,7 +9,7 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
-- 2026-11-22: **0.33.0 (built, not deployed) — the Android app moves to its own edge, mproxy.** The app surface is
+- 2026-11-22: **0.33.0 (DEPLOYED 2026-11-22, digest `54d918dd…4e17`; rollback 0.32.0 `e39ae4f7…537e`, droplet `/opt/cproxy/compose.yml.bak-0.32.0`) — the Android app moves to its own edge, mproxy.** The app surface is
   deleted from cproxy: the signed-in HTTPS API (`CPROXY_TLS_API=USER`, 0.29.0), the anonymous public paths
   (`CPROXY_PUBLIC_PATHS` and `CPROXY_PUBLIC_RATE_PER_MINUTE` / `_BURST` / `_CACHE_SECONDS` / `_CACHE_MAX_BYTES`, 0.28.0)
   and their response cache (`response_cache.*`). The HTTPS listener serves only `/health` and the MCP path again, and
