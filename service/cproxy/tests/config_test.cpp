@@ -634,6 +634,17 @@ void a_bad_newsidx_config_is_a_startup_error() {
                      {"CPROXY_MCP_PATH", "/api/v1/newsidx/mcp"}}).empty());
 }
 
+void mcp_upstream_is_read_and_validated() {
+    const Config off = load_config(make_env({{"CPROXY_MCP_PATH", "/api/v1/mcp"}}));
+    CHECK(!off.mcp_upstream_enabled());
+    Config c = load_config(make_env({{"CPROXY_MCP_PATH", "/api/v1/mcp"}, {"CPROXY_MCP_UPSTREAM", "http://mcp-env:8080"}}));
+    CHECK(c.mcp_upstream_enabled());
+    CHECK(c.mcp_upstream == "http://mcp-env:8080");
+    CHECK(validate_config(c).empty());
+    c = load_config(make_env({{"CPROXY_MCP_PATH", "/api/v1/mcp"}, {"CPROXY_MCP_UPSTREAM", "mcp-env:8080"}}));
+    CHECK(!validate_config(c).empty());
+}
+
 void newssearch_route_is_read_matched_and_validated() {
     Config off = load_config(make_env({}));
     CHECK(!off.newssearch_enabled());
@@ -776,6 +787,7 @@ int main() {
     newsidx_route_is_off_until_an_upstream_is_set_and_matches_its_prefix();
     a_bad_newsidx_config_is_a_startup_error();
     newssearch_route_is_read_matched_and_validated();
+    mcp_upstream_is_read_and_validated();
     defaults_apply_when_env_is_empty();
     overrides_are_read_and_methods_restricted();
     malformed_int_falls_back_and_all_keyword_means_unrestricted();

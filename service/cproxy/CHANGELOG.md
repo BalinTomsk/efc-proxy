@@ -9,6 +9,15 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-11-22: **0.34.0 (DEPLOYED 2026-11-22, digest `698ddb1f…e0ae`; rollback 0.33.0 `54d918dd…4e17`, droplet `/opt/cproxy/compose.yml.bak-0.33.0`) — the MCP path goes to mcp-env.** The MCP server moved out of docapi
+  (1.20.0–1.42.0) into its own C++23 service, mcp-env, run beside cproxy on the same droplet. New
+  `CPROXY_MCP_UPSTREAM` (e.g. `http://mcp-env:8080`): when set, the MCP path is forwarded there with its own circuit
+  breaker (`mcp_env` in `/health/ready`, never affecting readiness) instead of to docapi; empty keeps the old
+  behaviour. The key check, rate limit, TLS-only rule, payload limit and the X-Fish-Role / X-Fish-User stamping are
+  unchanged. `compose.yml`: `CPROXY_MCP_UPSTREAM: http://mcp-env:8080` and `networks: [default, fishfind-mcp]`
+  (external network, created once on the droplet). Startup line gains `"mcp_upstream"`. Tests: config +1, proxy +1
+  (MCP reaches mcp-env, key still checked, other paths still docapi); 12/12 suites pass in the Docker build. Deploy
+  after mcp-env 0.1.0 and before docapi 1.43.0 (mcp-env's `docs/do-update.md`).
 - 2026-11-22: **0.33.0 (DEPLOYED 2026-11-22, digest `54d918dd…4e17`; rollback 0.32.0 `e39ae4f7…537e`, droplet `/opt/cproxy/compose.yml.bak-0.32.0`) — the Android app moves to its own edge, mproxy.** The app surface is
   deleted from cproxy: the signed-in HTTPS API (`CPROXY_TLS_API=USER`, 0.29.0), the anonymous public paths
   (`CPROXY_PUBLIC_PATHS` and `CPROXY_PUBLIC_RATE_PER_MINUTE` / `_BURST` / `_CACHE_SECONDS` / `_CACHE_MAX_BYTES`, 0.28.0)

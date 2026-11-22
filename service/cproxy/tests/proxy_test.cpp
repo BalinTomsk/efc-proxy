@@ -1748,6 +1748,42 @@ void the_mcp_path_takes_its_own_key_instead_of_the_day_key() {
     std::remove(keys.c_str());
 }
 
+/** 0.34.0: with CPROXY_MCP_UPSTREAM set, the MCP path goes to mcp-env and everything else still to docapi. */
+void the_mcp_path_goes_to_mcp_env_when_configured() {
+    TestServer docapi;
+    docapi.server.Get(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_content("docapi:" + req.path, "text/plain");
+    });
+    docapi.server.Post(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("docapi got the mcp call", "text/plain");
+    });
+    docapi.start();
+    TestServer mcp_env;
+    install_fake_mcp_upstream(mcp_env.server);
+    mcp_env.start();
+    const std::string keys = write_mcp_key_db("proxy_mcp_env.sqlite");
+    Config cfg = mcp_config(docapi.port, keys);
+    cfg.mcp_upstream = "http://127.0.0.1:" + std::to_string(mcp_env.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+    httplib::Client cli("127.0.0.1", proxy.port);
+    const std::string rpc = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+
+    auto ok = cli.Post("/api/v1/mcp", mcp_auth(), rpc, "application/json");
+    CHECK(ok && ok->status == 200);
+    CHECK(ok->body == "upstream:POST /api/v1/mcp " + rpc);
+    CHECK(ok->get_header_value("X-Got-Role") == "admin");
+    CHECK(ok->get_header_value("X-Got-Auth").empty());
+    // The key is still checked by cproxy before mcp-env is ever asked.
+    auto none = cli.Post("/api/v1/mcp", rpc, "application/json");
+    CHECK(none && none->status == 401);
+    // Every other route is unaffected.
+    auto river = cli.Get("/api/v1/river/search?name=x");
+    CHECK(river && river->body == "docapi:/api/v1/river/search");
+    std::remove(keys.c_str());
+}
+
 void the_mcp_path_is_tls_only_unless_plain_is_allowed() {
     TestServer up;
     install_fake_mcp_upstream(up.server);
@@ -2127,6 +2163,7 @@ int main() {
     a_newssearch_outage_never_trips_docapi();
     a_not_modified_answer_is_relayed_at_once();
     the_mcp_path_takes_its_own_key_instead_of_the_day_key();
+    the_mcp_path_goes_to_mcp_env_when_configured();
     the_mcp_path_is_tls_only_unless_plain_is_allowed();
     without_a_key_store_every_mcp_request_is_refused();
     a_key_file_that_appears_after_startup_is_picked_up();

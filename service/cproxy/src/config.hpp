@@ -48,7 +48,8 @@ namespace cproxy {
  * | CPROXY_CLOUDRANGE_REFRESH_HOURS | 336 (fortnightly)         | interval between provider-feed refreshes  |
  * | CPROXY_CLOUDRANGE_PROVIDERS | (all known)                   | CSV of provider feeds ("NONE" disables the refresh) |
  * | CPROXY_CLOUDRANGE_EXEMPT_IPS| (empty)                       | CSV never blocked (admin/frontend always exempt) |
- * | CPROXY_MCP_PATH             | (empty = no MCP route)        | exact path of docapi's MCP endpoint, e.g. /api/v1/mcp |
+ * | CPROXY_MCP_PATH             | (empty = no MCP route)        | exact path of the MCP endpoint, e.g. /api/v1/mcp |
+ * | CPROXY_MCP_UPSTREAM         | (empty = docapi)              | origin of the MCP server (mcp-env, 0.34.0), e.g. http://mcp-env:8080 |
  * | CPROXY_MCP_KEYS_DB          | (empty)                       | SQLite of hashed MCP client keys; empty = every MCP request 401s |
  * | CPROXY_MCP_KEYS_RELOAD_SECONDS | 60                         | how often the key file's mtime is checked (0 = every request) |
  * | CPROXY_MCP_RATE_PER_MINUTE  | 60                            | sustained MCP requests per key per minute |
@@ -142,6 +143,14 @@ struct Config {
     // must not cross the internet in clear text, so by default the MCP path is served ONLY on the TLS
     // listener and the plain one answers it 404. The tests (and a local run) flip this on.
     bool mcp_allow_plain = false;
+    // 0.34.0: the MCP server moved out of docapi into its own service, mcp-env (C++23, same droplet as cproxy,
+    // reached over a private Docker network). Set = the MCP path is forwarded there, with its own breaker; the key
+    // check, rate limit, TLS-only rule and X-Fish-Role / X-Fish-User stamping above are unchanged. Empty = the old
+    // behaviour, the MCP path goes to docapi (which has no MCP endpoint from docapi 1.43.0 on).
+    std::string mcp_upstream;
+
+    /** True when CPROXY_MCP_UPSTREAM is set, i.e. MCP requests go to mcp-env rather than docapi. */
+    bool mcp_upstream_enabled() const { return !mcp_upstream.empty(); }
 
     /** True when CPROXY_MCP_PATH is set, i.e. the MCP route exists. */
     bool mcp_enabled() const { return !mcp_path.empty(); }

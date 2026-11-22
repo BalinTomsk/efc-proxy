@@ -102,7 +102,8 @@ probing is visible.
 | `CPROXY_UPSTREAM_RETRY` | `1` | retry idempotent requests once on a transport failure (`0` disables) |
 | `CPROXY_LOG_DIR` | `logs` (image: `/var/log/cproxy`) | rolling-log directory; `NONE` = console-only (an empty value reads as unset) |
 | `CPROXY_LOG_MAX_HISTORY` | `7` | days of rolled log files to keep |
-| `CPROXY_MCP_PATH` | (empty = no MCP route) | exact path of docapi's MCP endpoint, e.g. `/api/v1/mcp` (see "MCP path" below) |
+| `CPROXY_MCP_PATH` | (empty = no MCP route) | exact path of the MCP endpoint, e.g. `/api/v1/mcp` (see "MCP path" below) |
+| `CPROXY_MCP_UPSTREAM` | (empty = docapi) | 0.34.0: origin of the MCP server, e.g. `http://mcp-env:8080` (the mcp-env container on a shared private Docker network); its own circuit breaker |
 | `CPROXY_MCP_KEYS_DB` | (empty = only self-service keys from the account mirror) | SQLite file of hand-issued, hashed MCP client keys (`deploy/mcp-keys.py`) |
 | `CPROXY_MCP_KEYS_RELOAD_SECONDS` | `60` | how often the key file is checked for changes, and how often a key file that was missing or unloadable is tried again (`0` = every request) |
 | `CPROXY_MCP_RATE_PER_MINUTE` / `CPROXY_MCP_BURST` | `60` / `20` | per-key token bucket; over it `429` + `Retry-After` |

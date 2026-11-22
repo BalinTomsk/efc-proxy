@@ -529,6 +529,17 @@ route (the prefix reaches docapi and 404s), so the image is safe to deploy befor
   regenerate — see the RabbitMQ warning above), then the usual build → push → pin digest → compose up.
   `compose.yml` must not carry the address (public repo, deployed verbatim). Steps: `docs/do-update.md`.
 
+### MCP upstream = mcp-env (0.34.0 — built 2026-11-22, not deployed)
+
+The MCP server is no longer docapi's: it is **mcp-env** (`c:\envoinx\fishfind\mcp-env`, C++23, its own
+`docs/specification.md` is the source of truth), a container beside cproxy on this droplet, reached over the
+private Docker network `fishfind-mcp` (no published port). `CPROXY_MCP_UPSTREAM=http://mcp-env:8080` routes the MCP
+path there (`select_upstream(..., mcp)`), with its own breaker `mcp_breaker` (`mcp_env` in `/health/ready`). Empty =
+the old route to docapi, which has **no** MCP endpoint from docapi 1.43.0 on. Everything below about the key, rate
+limit, TLS and X-Fish-Role / X-Fish-User is unchanged; read "docapi" there as "the MCP upstream". mcp-env reads this
+service's `/mnt/volume_cnode/cproxy/.env` + `master.key` read-only (CPROXY_DOCAPI_UPSTREAM, CPROXY_RABBITMQ_*):
+replacing that `.env` needs `docker restart mcp-env` too. Deploy order: mcp-env → cproxy 0.34.0 → docapi 1.43.0.
+
 ### MCP path + TLS listener (0.20.0 — built, NOT deployed)
 
 `CPROXY_MCP_PATH` (`/api/v1/mcp` in `compose.yml`) fronts docapi 1.20.0's read-only MCP server for Claude

@@ -121,7 +121,7 @@ int main() {
         "\"waterapi\":\"{}\",\"news_idx\":\"{}\",\"news_search\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
-        "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"tls\":\"{}\","
+        "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"mcp_upstream\":\"{}\",\"tls\":\"{}\","
         "\"external_admin\":\"{}\",\"external_frontend\":\"{}\"}}",
         CPROXY_VERSION, cfg.listen_addr, cfg.listen_port, cfg.route_prefix, cfg.docapi_upstream,
         cfg.waterapi_enabled() ? std::format("{} -> {}", cfg.waterapi_prefix, cfg.waterapi_upstream)
@@ -155,6 +155,7 @@ int main() {
                           cfg.mcp_allow_plain ? "tls + plain" : "tls only", cfg.mcp_rate_per_minute,
                           cfg.mcp_burst)
             : std::string("off"),
+        cfg.mcp_upstream_enabled() ? cfg.mcp_upstream : std::string("docapi"),
         tls_server ? std::format("{}:{}", cfg.listen_addr, cfg.tls_port) : std::string("off"),
         set_or_unset(cfg.external_admin), set_or_unset(cfg.external_frontend)));
 
