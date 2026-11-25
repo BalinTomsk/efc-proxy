@@ -9,6 +9,20 @@ tracked. Newest entries first.
 > The real values live in the gitignored `AGENTS.md` → Deployment/Reachability and in `secret/`.
 > Never paste a real address into this file. `127.0.0.1` and `0.0.0.0` are literal.
 
+- 2026-11-25: **0.35.0 (DEPLOYED 2026-11-25, digest `f8b4d138…f481`; rollback 0.34.0 `698ddb1f…e0ae`, droplet `/opt/cproxy/compose.yml.bak-0.34.0` + `.env.bak-preenv`) — a fifth upstream, env_service, for `/api/v1/env/*`** (env_service plan
+  step 6c). env_service (`efcs-backend/service/env_service`, C#, on `<second-droplet>`) serves the water, weather and
+  forecast reads out of MySQL `envdata`: stations, current conditions, daily weather, the Weather tab and the three
+  forecast documents. New `CPROXY_ENV_UPSTREAM` (its PUBLIC port only; the private health/metrics/admin port must never
+  be the origin) and `CPROXY_ENV_PREFIX` (default `/api/v1/env/`). Same rules as the other upstreams: chosen from the
+  decoded path after the dot-dot guard, every guard and the gate apply unchanged, its own circuit breaker
+  (`"env_service"` in `/health/ready`, `cproxy_env_breaker_state` in `/metrics`, never affecting readiness), and the
+  prefix must not overlap the water, news_idx or news_search prefixes nor contain the MCP path. Unset = no route (the
+  prefix reaches docapi and 404s), so the image is safe to deploy before the dotenv line. docapi's own `/forecast/*`
+  and `/river/weather/{guid}` are unchanged (from docapi 1.45.0 they call env_service over the VPC themselves); this
+  route is for the portal, mcp-env and new callers. Tests: `env_route_is_read_matched_and_validated` (config),
+  `env_paths_go_to_env_service_and_the_rest_stays_put`, `an_env_service_outage_never_trips_docapi`,
+  `without_an_env_upstream_the_prefix_reaches_docapi` (proxy); ctest 12/12 in the Docker build stage. api-guide,
+  README, `.env.example` and the Postman generator (9 requests) updated together.
 - 2026-11-22: **0.34.0 (DEPLOYED 2026-11-22, digest `698ddb1f…e0ae`; rollback 0.33.0 `54d918dd…4e17`, droplet `/opt/cproxy/compose.yml.bak-0.33.0`) — the MCP path goes to mcp-env.** The MCP server moved out of docapi
   (1.20.0–1.42.0) into its own C++23 service, mcp-env, run beside cproxy on the same droplet. New
   `CPROXY_MCP_UPSTREAM` (e.g. `http://mcp-env:8080`): when set, the MCP path is forwarded there with its own circuit

@@ -193,6 +193,12 @@ bool Config::routes_to_newssearch(const std::string& path) const {
     return p.starts_with(newssearch_prefix);
 }
 
+bool Config::routes_to_env(const std::string& path) const {
+    if (!env_enabled()) return false;
+    const std::string p = to_lower(path) + "/";
+    return p.starts_with(env_prefix);
+}
+
 bool Config::is_mcp_path(const std::string& path) const {
     return mcp_enabled() && normalize_gate_path(path) == mcp_path;
 }
@@ -245,6 +251,13 @@ Config load_config(const EnvLookup& env) {
         if (prefix.empty() || prefix.front() != '/') prefix.insert(prefix.begin(), '/');
         if (prefix.back() != '/') prefix.push_back('/');
         cfg.newssearch_prefix = prefix;
+    }
+    cfg.env_upstream = get_str(env, "CPROXY_ENV_UPSTREAM", cfg.env_upstream);
+    {
+        std::string prefix = to_lower(get_str(env, "CPROXY_ENV_PREFIX", cfg.env_prefix));
+        if (prefix.empty() || prefix.front() != '/') prefix.insert(prefix.begin(), '/');
+        if (prefix.back() != '/') prefix.push_back('/');
+        cfg.env_prefix = prefix;
     }
     {
         // Canonical form, same as the day-key paths: lower-case, leading '/', no trailing '/'. "NONE"
@@ -488,6 +501,22 @@ std::vector<std::string> validate_config(const Config& cfg) {
         if (cfg.newsidx_enabled() && overlaps(cfg.newsidx_prefix))
             errors.push_back("CPROXY_NEWSSEARCH_PREFIX and CPROXY_NEWSIDX_PREFIX must not overlap");
     }
+    if (cfg.env_enabled()) {
+        if (cfg.env_upstream.rfind("http://", 0) != 0 && cfg.env_upstream.rfind("https://", 0) != 0)
+            errors.push_back("CPROXY_ENV_UPSTREAM must be scheme://host[:port] with http or https");
+        const std::string route = to_lower(cfg.route_prefix);
+        if (!cfg.env_prefix.starts_with(route) || cfg.env_prefix.size() <= route.size())
+            errors.push_back("CPROXY_ENV_PREFIX must be a sub-path of CPROXY_ROUTE_PREFIX, e.g. /api/v1/env/");
+        const auto overlaps = [&](const std::string& other) {
+            return cfg.env_prefix.starts_with(other) || other.starts_with(cfg.env_prefix);
+        };
+        if (cfg.waterapi_enabled() && overlaps(cfg.waterapi_prefix))
+            errors.push_back("CPROXY_ENV_PREFIX and CPROXY_WATERAPI_PREFIX must not overlap");
+        if (cfg.newsidx_enabled() && overlaps(cfg.newsidx_prefix))
+            errors.push_back("CPROXY_ENV_PREFIX and CPROXY_NEWSIDX_PREFIX must not overlap");
+        if (cfg.newssearch_enabled() && overlaps(cfg.newssearch_prefix))
+            errors.push_back("CPROXY_ENV_PREFIX and CPROXY_NEWSSEARCH_PREFIX must not overlap");
+    }
     if (cfg.mcp_enabled()) {
         // Inside the route prefix, or the forwarding routes never see it; outside the water prefix,
         // or it would be sent to waterapi, which has no MCP endpoint.
@@ -500,6 +529,8 @@ std::vector<std::string> validate_config(const Config& cfg) {
             errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_NEWSIDX_PREFIX");
         if (cfg.routes_to_newssearch(cfg.mcp_path))
             errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_NEWSSEARCH_PREFIX");
+        if (cfg.routes_to_env(cfg.mcp_path))
+            errors.push_back("CPROXY_MCP_PATH must not be under CPROXY_ENV_PREFIX");
         if (cfg.mcp_upstream_enabled() && cfg.mcp_upstream.rfind("http://", 0) != 0 &&
             cfg.mcp_upstream.rfind("https://", 0) != 0)
             errors.push_back("CPROXY_MCP_UPSTREAM must start with http:// or https://");

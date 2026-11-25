@@ -118,7 +118,7 @@ int main() {
     cproxy::log_raw(std::format(
         "{{\"service\":\"cproxy\",\"version\":\"{}\",\"msg\":\"starting\","
         "\"listen\":\"{}:{}\",\"route_prefix\":\"{}\",\"docapi_upstream\":\"{}\","
-        "\"waterapi\":\"{}\",\"news_idx\":\"{}\",\"news_search\":\"{}\","
+        "\"waterapi\":\"{}\",\"news_idx\":\"{}\",\"news_search\":\"{}\",\"env_service\":\"{}\","
         "\"auth\":{},\"methods\":\"{}\",\"log_dir\":\"{}\",\"dotenv\":\"{}\","
         "\"breaker\":\"{}\",\"retry\":{},\"daykey_db\":\"{}\","
         "\"jwt\":\"{}\",\"jwt_leeway_s\":{},\"clock_sync\":\"{}\",\"mcp\":\"{}\",\"mcp_upstream\":\"{}\",\"tls\":\"{}\","
@@ -130,6 +130,7 @@ int main() {
                                : std::string("off"),
         cfg.newssearch_enabled() ? std::format("{} -> {}", cfg.newssearch_prefix, cfg.newssearch_upstream)
                                  : std::string("off"),
+        cfg.env_enabled() ? std::format("{} -> {}", cfg.env_prefix, cfg.env_upstream) : std::string("off"),
         cfg.auth_required() ? "true" : "false",
         cfg.allowed_methods.empty() ? "ALL" : "restricted",
         cfg.log_dir.empty() ? "(stdout only)" : cfg.log_dir,

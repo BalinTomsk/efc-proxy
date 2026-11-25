@@ -89,6 +89,9 @@ struct ProxyState {
     CircuitBreaker news_breaker;
     // The news_search route's own breaker (0.25.0): news_search is on csnode, beside waterapi.
     CircuitBreaker search_breaker;
+    // The env_service route's own breaker (0.35.0): env_service is on csnode too, but a separate process, so
+    // its outage must not fail-fast news search (nor docapi, which reaches env_service over the VPC itself).
+    CircuitBreaker env_breaker;
     // The MCP route's own breaker (0.34.0): mcp-env is a separate container, and its outage must not
     // fail-fast docapi traffic (nor a docapi outage fail-fast mcp-env, which then answers tool errors itself).
     CircuitBreaker mcp_breaker;
@@ -154,6 +157,7 @@ struct ProxyState {
           water_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
           news_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
           search_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
+          env_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)),
           mcp_breaker(cfg.breaker_threshold, std::chrono::milliseconds(cfg.breaker_cooldown_ms)) {
         if (shared_ranges != nullptr) cloud_ranges = shared_ranges;
         if (!cfg.daykey_db_path.empty()) {
@@ -642,6 +646,7 @@ Upstream select_upstream(const Config& cfg, ProxyState& state, const httplib::Re
     if (cfg.routes_to_waterapi(req.path)) return {"waterapi", cfg.waterapi_upstream, state.water_breaker};
     if (cfg.routes_to_newsidx(req.path)) return {"news_idx", cfg.newsidx_upstream, state.news_breaker};
     if (cfg.routes_to_newssearch(req.path)) return {"news_search", cfg.newssearch_upstream, state.search_breaker};
+    if (cfg.routes_to_env(req.path)) return {"env_service", cfg.env_upstream, state.env_breaker};
     return {"docapi", cfg.docapi_upstream, state.breaker};
 }
 
@@ -939,7 +944,7 @@ std::string regex_escape(const std::string& s) {
 
 /** Prometheus text exposition of the current counters. */
 std::string render_metrics(const ProxyState& state, bool waterapi_enabled, bool newsidx_enabled,
-                           bool newssearch_enabled) {
+                           bool newssearch_enabled, bool env_enabled) {
     std::string out;
     {
         std::lock_guard<std::mutex> lock(state.metrics.mu);
@@ -991,6 +996,12 @@ std::string render_metrics(const ProxyState& state, bool waterapi_enabled, bool 
         out += std::format("cproxy_newssearch_breaker_state {}\n",
                            static_cast<int>(state.search_breaker.state(std::chrono::steady_clock::now())));
     }
+    if (env_enabled) {
+        out += "# HELP cproxy_env_breaker_state env_service circuit breaker: 0 closed, 1 open, 2 half-open.\n";
+        out += "# TYPE cproxy_env_breaker_state gauge\n";
+        out += std::format("cproxy_env_breaker_state {}\n",
+                           static_cast<int>(state.env_breaker.state(std::chrono::steady_clock::now())));
+    }
     return out;
 }
 
@@ -1037,18 +1048,23 @@ void install_routes(httplib::Server& server, const Config& cfg, CloudRangeStore*
             cfg.newssearch_enabled()
                 ? std::format(",\"news_search\":\"{}\"", to_string(state->search_breaker.state(now)))
                 : std::string{};
+        const std::string envsvc =
+            cfg.env_enabled()
+                ? std::format(",\"env_service\":\"{}\"", to_string(state->env_breaker.state(now)))
+                : std::string{};
         const std::string mcp =
             cfg.mcp_upstream_enabled()
                 ? std::format(",\"mcp_env\":\"{}\"", to_string(state->mcp_breaker.state(now)))
                 : std::string{};
         res.set_content(
-            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"{}{}{}{}}}",
-                        ready ? "UP" : "DOWN", to_string(s), water, news, search, mcp),
+            std::format("{{\"status\":\"{}\",\"service\":\"cproxy\",\"upstream\":\"{}\"{}{}{}{}{}}}",
+                        ready ? "UP" : "DOWN", to_string(s), water, news, search, envsvc, mcp),
             "application/json");
     });
 
     server.Get("/metrics", [state, &cfg](const httplib::Request&, httplib::Response& res) {
-        res.set_content(render_metrics(*state, cfg.waterapi_enabled(), cfg.newsidx_enabled(), cfg.newssearch_enabled()),
+        res.set_content(render_metrics(*state, cfg.waterapi_enabled(), cfg.newsidx_enabled(), cfg.newssearch_enabled(),
+                                      cfg.env_enabled()),
                         "text/plain; version=0.0.4");
     });
 

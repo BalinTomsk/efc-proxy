@@ -673,6 +673,42 @@ void newssearch_route_is_read_matched_and_validated() {
                     {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"}}).empty());
 }
 
+void env_route_is_read_matched_and_validated() {
+    Config off = load_config(make_env({}));
+    CHECK(!off.env_enabled());
+    CHECK(off.env_prefix == "/api/v1/env/");
+    CHECK(!off.routes_to_env("/api/v1/env/stations/1"));
+
+    Config c = load_config(make_env({{"CPROXY_ENV_UPSTREAM", "http://127.0.0.1:8092"},
+                                     {"CPROXY_ENV_PREFIX", " /API/v1/Env "}}));
+    CHECK(c.env_prefix == "/api/v1/env/");
+    CHECK(c.routes_to_env("/api/v1/env/stations/263862"));
+    CHECK(c.routes_to_env("/API/V1/ENV/forecast/plot/1"));
+    CHECK(c.routes_to_env("/api/v1/env"));
+    CHECK(!c.routes_to_env("/api/v1/environment/x"));
+    CHECK(!c.routes_to_env("/api/v1/forecast/plot/1"));
+    CHECK(!c.routes_to_env("/api/v1/water/station/map"));
+    CHECK(validate_config(c).empty());
+
+    auto problems = [](std::map<std::string, std::string> env) {
+        return validate_config(load_config(make_env(std::move(env))));
+    };
+    CHECK(!problems({{"CPROXY_ENV_UPSTREAM", "127.0.0.1:8092"}}).empty());
+    CHECK(!problems({{"CPROXY_ENV_UPSTREAM", "http://127.0.0.1:8092"}, {"CPROXY_ENV_PREFIX", "/api/"}}).empty());
+    CHECK(!problems({{"CPROXY_ENV_UPSTREAM", "http://127.0.0.1:8092"},
+                     {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"},
+                     {"CPROXY_ENV_PREFIX", "/api/v1/water/env/"}}).empty());
+    CHECK(!problems({{"CPROXY_ENV_UPSTREAM", "http://127.0.0.1:8092"},
+                     {"CPROXY_NEWSSEARCH_UPSTREAM", "http://127.0.0.1:8091"},
+                     {"CPROXY_NEWSSEARCH_PREFIX", "/api/v1/env/news/"}}).empty());
+    CHECK(!problems({{"CPROXY_ENV_UPSTREAM", "http://127.0.0.1:8092"},
+                     {"CPROXY_MCP_PATH", "/api/v1/env/mcp"}}).empty());
+    CHECK(problems({{"CPROXY_ENV_UPSTREAM", "http://127.0.0.1:8092"},
+                    {"CPROXY_NEWSSEARCH_UPSTREAM", "http://127.0.0.1:8091"},
+                    {"CPROXY_NEWSIDX_UPSTREAM", "http://127.0.0.1:4324"},
+                    {"CPROXY_WATERAPI_UPSTREAM", "http://127.0.0.1:8090"}}).empty());
+}
+
 void mcp_and_tls_are_off_by_default() {
     Config c = load_config(make_env({}));
     CHECK(!c.mcp_enabled());
@@ -787,6 +823,7 @@ int main() {
     newsidx_route_is_off_until_an_upstream_is_set_and_matches_its_prefix();
     a_bad_newsidx_config_is_a_startup_error();
     newssearch_route_is_read_matched_and_validated();
+    env_route_is_read_matched_and_validated();
     mcp_upstream_is_read_and_validated();
     defaults_apply_when_env_is_empty();
     overrides_are_read_and_methods_restricted();
