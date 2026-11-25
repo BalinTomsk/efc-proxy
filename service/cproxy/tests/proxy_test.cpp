@@ -1574,6 +1574,91 @@ void a_newssearch_outage_never_trips_docapi() {
     CHECK(ready->body.find("\"news_search\":\"open\"") != std::string::npos);
 }
 
+// ---- Fifth upstream: env_service (0.35.0) ------------------------------------------------------
+
+void env_paths_go_to_env_service_and_the_rest_stays_put() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+    TestServer search;
+    install_tagged_upstream(search.server, "news_search");
+    search.start();
+    TestServer env;
+    install_tagged_upstream(env.server, "env_service");
+    env.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.newssearch_upstream = "http://127.0.0.1:" + std::to_string(search.port);
+    cfg.env_upstream = "http://127.0.0.1:" + std::to_string(env.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    auto e = cli.Get("/api/v1/env/forecast/plot/263862?fish=f1");
+    CHECK(e && e->status == 200);
+    CHECK(e->body == "env_service:/api/v1/env/forecast/plot/263862?fish=f1");
+    CHECK(cli.Get("/api/v1/env/stations/1/current")->body.starts_with("env_service:"));
+    // docapi keeps its own forecast routes; only the /env/ namespace moves.
+    CHECK(cli.Get("/api/v1/forecast/plot/263862?fish=f1")->body.starts_with("docapi:"));
+    CHECK(cli.Get("/api/v1/environment/x")->body.starts_with("docapi:"));
+    CHECK(cli.Get("/api/v1/newssearch/bm25?q=x")->body.starts_with("news_search:"));
+    // the dot-dot guard runs before the upstream is chosen, so /env/ cannot be escaped into docapi or back
+    auto t = cli.Get("/api/v1/env/../news/list");
+    CHECK(t && t->status == 400);
+
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->body.find("\"env_service\":\"closed\"") != std::string::npos);
+    auto m = cli.Get("/metrics");
+    CHECK(m && m->body.find("cproxy_env_breaker_state 0") != std::string::npos);
+}
+
+void an_env_service_outage_never_trips_docapi() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    cfg.env_upstream = "http://127.0.0.1:1";
+    cfg.connect_timeout_ms = 300;
+    cfg.breaker_threshold = 2;
+    cfg.breaker_cooldown_ms = 60000;
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    cli.set_read_timeout(5, 0);
+    for (int i = 0; i < 2; ++i) {
+        auto r = cli.Get("/api/v1/env/stations/1");
+        CHECK(r && r->status == 502);
+    }
+    CHECK(cli.Get("/api/v1/forecast/plot/1?fish=x")->body.starts_with("docapi:"));
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->status == 200);
+    CHECK(ready->body.find("\"env_service\":\"open\"") != std::string::npos);
+}
+
+void without_an_env_upstream_the_prefix_reaches_docapi() {
+    TestServer doc;
+    install_tagged_upstream(doc.server, "docapi");
+    doc.start();
+    Config cfg;
+    cfg.docapi_upstream = "http://127.0.0.1:" + std::to_string(doc.port);
+    TestServer proxy;
+    install_routes(proxy.server, cfg);
+    proxy.start();
+
+    httplib::Client cli("127.0.0.1", proxy.port);
+    CHECK(cli.Get("/api/v1/env/stations/1")->body.starts_with("docapi:"));
+    auto ready = cli.Get("/health/ready");
+    CHECK(ready && ready->body.find("env_service") == std::string::npos);
+    auto m = cli.Get("/metrics");
+    CHECK(m && m->body.find("cproxy_env_breaker_state") == std::string::npos);
+}
+
 
 /**
  * A 304 Not Modified with no Content-Length on a kept-alive connection -- the way Kestrel (waterapi)
@@ -2161,6 +2246,9 @@ int main() {
     a_newsidx_outage_never_trips_docapi_or_readiness();
     four_upstreams_each_get_their_own_prefix_and_breaker();
     a_newssearch_outage_never_trips_docapi();
+    env_paths_go_to_env_service_and_the_rest_stays_put();
+    an_env_service_outage_never_trips_docapi();
+    without_an_env_upstream_the_prefix_reaches_docapi();
     a_not_modified_answer_is_relayed_at_once();
     the_mcp_path_takes_its_own_key_instead_of_the_day_key();
     the_mcp_path_goes_to_mcp_env_when_configured();

@@ -23,6 +23,7 @@ frontend.service ──HTTP──►  cproxy (10.12.22.225)  ──HTTP──►
 | `GET /metrics` | Prometheus text counters (requests by status, upstream latency, failures, breaker state) |
 | `<CPROXY_WATERAPI_PREFIX>…` (default `/api/v1/water/`) | reverse-proxied to the waterapi upstream (station map) when `CPROXY_WATERAPI_UPSTREAM` is set — same guards, its own circuit breaker (0.18.0) |
 | `<CPROXY_NEWSSEARCH_PREFIX>…` (default `/api/v1/newssearch/`) | reverse-proxied to news_search (per-engine news search) when `CPROXY_NEWSSEARCH_UPSTREAM` is set — same guards, its own circuit breaker (0.25.0) |
+| `<CPROXY_ENV_PREFIX>…` (default `/api/v1/env/`) | reverse-proxied to env_service (water, weather and forecast reads) when `CPROXY_ENV_UPSTREAM` is set — same guards, its own circuit breaker (0.35.0) |
 | `<CPROXY_NEWSIDX_PREFIX>…` (default `/api/v1/newsidx/`) | reverse-proxied to the news_idx upstream (semantic news search) when `CPROXY_NEWSIDX_UPSTREAM` is set — same guards, its own circuit breaker (0.23.0) |
 | `<CPROXY_ROUTE_PREFIX>…` (default `/api/`) | reverse-proxied to the docapi upstream |
 | anything else | `404` |
@@ -65,6 +66,8 @@ probing is visible.
 | `CPROXY_NEWSSEARCH_UPSTREAM` | (empty = no news_search route) | news_search origin (`scheme://host:port`) |
 | `CPROXY_NEWSSEARCH_PREFIX` | `/api/v1/newssearch/` | sub-path of the route prefix sent to news_search instead of docapi |
 | `CPROXY_NEWSIDX_PREFIX` | `/api/v1/newsidx/` | sub-path of the route prefix sent to news_idx instead of docapi |
+| `CPROXY_ENV_UPSTREAM` | (empty = no env_service route) | env_service origin (`scheme://host:port`), its public port only |
+| `CPROXY_ENV_PREFIX` | `/api/v1/env/` | sub-path of the route prefix sent to env_service instead of docapi |
 | `CPROXY_API_KEY` | (empty) | if set, callers must send `X-API-Key: <value>` |
 | `CPROXY_ALLOWED_METHODS` | (empty = all) | CSV allow-list, e.g. `GET,HEAD` |
 | `CPROXY_DAYKEY_DB` | (empty) | path to the day-key SQLite db; empty ⇒ every gated request always `500` |

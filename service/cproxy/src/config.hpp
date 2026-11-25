@@ -24,6 +24,8 @@ namespace cproxy {
  * | CPROXY_NEWSIDX_PREFIX      | /api/v1/newsidx/             | sub-prefix of the route prefix sent to news_idx |
  * | CPROXY_NEWSSEARCH_UPSTREAM  | (empty = no news_search route) | news_search origin (scheme://host:port)  |
  * | CPROXY_NEWSSEARCH_PREFIX    | /api/v1/newssearch/          | sub-prefix of the route prefix sent to news_search |
+ * | CPROXY_ENV_UPSTREAM         | (empty = no env_service route) | env_service origin (scheme://host:port)  |
+ * | CPROXY_ENV_PREFIX           | /api/v1/env/                 | sub-prefix of the route prefix sent to env_service |
  * | CPROXY_API_KEY              | (empty)                       | if set, require header X-API-Key to match |
  * | CPROXY_ALLOWED_METHODS      | (empty = all)                 | CSV allow-list, e.g. "GET,HEAD"           |
  * | CPROXY_CONNECT_TIMEOUT_MS   | 3000                          | upstream connect timeout                  |
@@ -121,6 +123,21 @@ struct Config {
 
     /** True when `path` (the decoded request path) is served by news_search. */
     bool routes_to_newssearch(const std::string& path) const;
+
+    // --- Fifth upstream: env_service (0.35.0) ------------------------------------------------
+    // Water, weather and forecast reads (efcs-backend/service/env_service, on csnode, env_service plan
+    // step 6c): stations, current conditions, history, the Weather tab and the forecast documents, all
+    // under /api/v1/env/. Same rules as the routes above (every guard, the gate, X-Fish-Role; own
+    // breaker); must not overlap any other upstream prefix. Only env_service's public port is ever the
+    // origin: its private port (health/metrics/admin) must never be reachable through this gateway.
+    std::string env_upstream;
+    std::string env_prefix = "/api/v1/env/";
+
+    /** True when CPROXY_ENV_UPSTREAM is set, i.e. the env_service route exists. */
+    bool env_enabled() const { return !env_upstream.empty(); }
+
+    /** True when `path` (the decoded request path) is served by env_service. */
+    bool routes_to_env(const std::string& path) const;
 
     // --- MCP path (0.20.0) -------------------------------------------------------------------
     // docapi's Model Context Protocol endpoint (POST /api/v1/mcp, docapi 1.20.0), for Claude Code /
